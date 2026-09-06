@@ -4,6 +4,14 @@ Unofficial tool for exporting RUN Game Studio projects to a local filesystem.
 
 > This project is not affiliated with or endorsed by RUN, RUN.game, Series, Inc., or the maintainers of the official `rundot` CLI.
 
+## What it does
+
+- Exports the editable RUN Game Studio filesystem to a local directory
+- Preserves UTF-8 text correctly
+- Exports binary assets byte-for-byte
+- Optionally exports Studio conversation threads with raw JSON and readable Markdown
+- Supports automatic authentication through a fresh official `rundot` CLI session, with existing fallback authentication mechanisms
+
 ## Prerequisites
 
 - Windows
@@ -65,6 +73,8 @@ Notes:
 1. Run `rundot login`
 2. Rerun the exporter promptly
 3. If it still fails, allow the exporter to continue to its saved/clipboard/manual fallback methods
+
+> Never include access tokens, refresh tokens, or authentication files in bug reports.
 
 ## Development note
 

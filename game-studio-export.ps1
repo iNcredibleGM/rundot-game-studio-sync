@@ -344,13 +344,22 @@ function Test-RundotCliTokenFresh {
     $safetyWindow = [TimeSpan]::FromMinutes(5)
 
     # Prefer the session's explicit expiry timestamp.
+    #
+    # Only a positive value is a meaningful Unix-milliseconds expiry.
+    # Zero, negative, empty, or non-numeric values are not valid expiry
+    # timestamps, so fall through to the JWT exp claim rather than
+    # prematurely rejecting the token.
     if ($null -ne $ExpiresAtUnixTimeMs) {
         try {
-            $expires = [DateTimeOffset]::FromUnixTimeMilliseconds(
-                [int64]$ExpiresAtUnixTimeMs
-            )
+            $expiresMs = [int64]$ExpiresAtUnixTimeMs
 
-            return ($expires - $now) -gt $safetyWindow
+            if ($expiresMs -gt 0) {
+                $expires = [DateTimeOffset]::FromUnixTimeMilliseconds(
+                    $expiresMs
+                )
+
+                return ($expires - $now) -gt $safetyWindow
+            }
         }
         catch {
             # Fall through to the JWT exp claim.
