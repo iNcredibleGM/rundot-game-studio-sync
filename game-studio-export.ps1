@@ -18,15 +18,18 @@ $ErrorActionPreference = "Stop"
 #
 # Authentication priority:
 #
-#   1. Saved Studio Firebase refresh token (acquired via rundot login)
-#   2. Firebase bootstrap JSON found in clipboard
-#   3. Studio bearer token found in clipboard:
+#   1. Fresh official RUNdot CLI access token
+#        %APPDATA%\.rundot\prod.session.json
+#   2. Previously saved exporter Firebase refresh credentials
+#        %APPDATA%\.rundot\studio-export.auth.json
+#   3. Firebase bootstrap JSON found in clipboard
+#   4. Studio bearer token found in clipboard:
 #        - Copy as cURL (POSIX)
 #        - Copy as cURL (Windows)
 #        - authorization: Bearer ...
 #        - Bearer ...
 #        - raw JWT
-#   4. Manual secure bearer-token paste
+#   5. Manual secure bearer-token paste
 #
 # Refresh tokens are stored encrypted with Windows DPAPI.
 #
@@ -55,6 +58,8 @@ $AuthDir = Join-Path $env:APPDATA ".rundot"
 
 $AuthPath = Join-Path $AuthDir "studio-export.auth.json"
 
+$RundotCliSessionPath = Join-Path $env:APPDATA ".rundot\prod.session.json"
+
 $OutDir = [System.IO.Path]::GetFullPath($OutDir)
 
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -78,6 +83,7 @@ function Clear-SensitiveVariables {
     $script:Token = $null
     $script:RefreshToken = $null
     $script:clipboard = $null
+    $script:rundotCliSession = $null
 }
 
 
@@ -279,6 +285,119 @@ function Convert-ThreadToMarkdown {
     }
 
     return $builder.ToString()
+}
+
+
+# ============================================================================
+# RUNdot CLI session
+# ============================================================================
+
+# Safely load the official RUNdot CLI login session.
+#
+# Returns $null when the file is missing, unreadable, or does not contain a
+# usable access token. Never prints token contents and never modifies the
+# official CLI session file.
+function Get-RundotCliSession {
+    if (-not (Test-Path $RundotCliSessionPath)) {
+        return $null
+    }
+
+    try {
+        $session = Get-Content `
+            $RundotCliSessionPath `
+            -Raw |
+            ConvertFrom-Json
+
+        $accessToken = [string]$session.accessToken
+
+        if ([string]::IsNullOrWhiteSpace($accessToken)) {
+            return $null
+        }
+
+        return @{
+            AccessToken          = $accessToken
+            ExpiresAtUnixTimeMs  = $session.expiresAtUnixTimeMs
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+
+# Determine whether a RUNdot CLI access token is fresh enough to attempt.
+#
+# This is only a freshness check. It does NOT verify the token signature.
+# The Studio manifest request remains the authoritative validation.
+#
+# Prefers the session's expiresAtUnixTimeMs when valid. Falls back to
+# decoding the JWT exp claim locally when needed.
+function Test-RundotCliTokenFresh {
+    param(
+        [Parameter(Mandatory)]
+        [string]$AccessToken,
+
+        $ExpiresAtUnixTimeMs
+    )
+
+    $now = [DateTimeOffset]::UtcNow
+    $safetyWindow = [TimeSpan]::FromMinutes(5)
+
+    # Prefer the session's explicit expiry timestamp.
+    #
+    # Only a positive value is a meaningful Unix-milliseconds expiry.
+    # Zero, negative, empty, or non-numeric values are not valid expiry
+    # timestamps, so fall through to the JWT exp claim rather than
+    # prematurely rejecting the token.
+    if ($null -ne $ExpiresAtUnixTimeMs) {
+        try {
+            $expiresMs = [int64]$ExpiresAtUnixTimeMs
+
+            if ($expiresMs -gt 0) {
+                $expires = [DateTimeOffset]::FromUnixTimeMilliseconds(
+                    $expiresMs
+                )
+
+                return ($expires - $now) -gt $safetyWindow
+            }
+        }
+        catch {
+            # Fall through to the JWT exp claim.
+        }
+    }
+
+    # Fall back to decoding the JWT exp claim locally.
+    try {
+        $parts = $AccessToken.Split('.')
+
+        if ($parts.Count -lt 2) {
+            return $false
+        }
+
+        $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+
+        switch ($payload.Length % 4) {
+            2 { $payload += '==' }
+            3 { $payload += '=' }
+        }
+
+        $payloadBytes = [Convert]::FromBase64String($payload)
+        $payloadJson = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+        $claims = $payloadJson | ConvertFrom-Json
+
+        if ($null -eq $claims.exp) {
+            return $false
+        }
+
+        $expires = [DateTimeOffset]::FromUnixTimeSeconds(
+            [int64]$claims.exp
+        )
+
+        return ($expires - $now) -gt $safetyWindow
+    }
+    catch {
+        return $false
+    }
 }
 
 
@@ -605,7 +724,45 @@ $manifest = $null
 
 
 # ----------------------------------------------------------------------------
-# 1. Previously saved Firebase refresh token
+# 1. Fresh official RUNdot CLI access token
+# ----------------------------------------------------------------------------
+
+$rundotCliSession = Get-RundotCliSession
+
+if ($rundotCliSession) {
+
+    if (Test-RundotCliTokenFresh `
+            -AccessToken $rundotCliSession.AccessToken `
+            -ExpiresAtUnixTimeMs $rundotCliSession.ExpiresAtUnixTimeMs) {
+
+        Write-Host "Found RUNdot CLI session."
+        Write-Host "Testing fresh CLI authentication against Studio..."
+
+        $candidateManifest = Get-StudioManifestWithToken `
+            $rundotCliSession.AccessToken
+
+        if ($candidateManifest) {
+
+            $Token = $rundotCliSession.AccessToken
+            $manifest = $candidateManifest
+
+            Write-Host "RUNdot CLI authentication accepted."
+        }
+        else {
+            Write-Host "RUNdot CLI authentication was rejected."
+            Write-Host "Trying other authentication methods..."
+        }
+    }
+    else {
+        Write-Host "Found RUNdot CLI session, but its access token is expired or near expiry."
+        Write-Host "Run ``rundot login`` to refresh it."
+        Write-Host "Trying other authentication methods..."
+    }
+}
+
+
+# ----------------------------------------------------------------------------
+# 2. Previously saved Firebase refresh token
 # ----------------------------------------------------------------------------
 
 $savedAuth = Load-StudioAuth
@@ -664,7 +821,7 @@ if (-not $Token) {
 
 
 # ----------------------------------------------------------------------------
-# 2. Bootstrap JSON from clipboard
+# 3. Bootstrap JSON from clipboard
 #
 # Expected:
 #
@@ -719,7 +876,7 @@ if (-not $Token) {
 
 
 # ----------------------------------------------------------------------------
-# 3. Bearer token from clipboard
+# 4. Bearer token from clipboard
 # ----------------------------------------------------------------------------
 
 if (-not $Token) {
@@ -749,7 +906,7 @@ if (-not $Token) {
 
 
 # ----------------------------------------------------------------------------
-# 4. Manual bearer-token fallback
+# 5. Manual bearer-token fallback
 # ----------------------------------------------------------------------------
 
 while (-not $Token) {
