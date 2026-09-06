@@ -17,7 +17,7 @@ Stable Studio → local export.
 
 - browser bootstrap improvements
 - bookmarklet helper
-- official `rundot` CLI token/session investigation
+- official `rundot` CLI refresh-token handling (direct use of a fresh CLI access token is now supported)
 
 ### Studio writes
 
