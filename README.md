@@ -4,46 +4,32 @@ Unofficial tool for exporting RUN Game Studio projects to a local filesystem.
 
 > This project is not affiliated with or endorsed by RUN, RUN.game, Series, Inc., or the maintainers of the official `rundot` CLI.
 
-## Current status
+## Prerequisites
 
-### Supported
-
-- Export a RUN Game Studio project to a local directory
-- Preserve UTF-8 text correctly
-- Export binary assets byte-for-byte
-- Export Studio conversation threads
-- Preserve raw thread JSON
-- Generate readable Markdown thread transcripts
-- Reuse locally encrypted Studio authentication
-- Automatic use of a fresh official `rundot` CLI session
-
-### Under investigation
-
-- Easier browser authentication/bootstrap helpers
-- Bookmarklet-assisted authentication
-- Official `rundot` CLI refresh-token handling
-- Local → Studio text-file push
-- Local → Studio binary-file push
-- Remote file replacement, deletion, and rename behavior
-- Safe bidirectional synchronization
-
-## Prerequisites / tested environment
-
-The tool was developed and verified in this general environment:
-
-- Windows 11
-- Windows PowerShell 5.1 is the compatibility baseline used during development
-- Official `rundot` CLI installed
-- Authenticated RUN account for the project being exported
+- Windows
+- Windows PowerShell 5.1 compatibility baseline
+- Official `rundot` CLI ([installation / docs](https://github.com/series-ai/venus-sdk-docs/blob/main/rundot-developer-platform/getting-started.md))
+- A RUN account with access to the Game Studio project
 - Network access to RUN Game Studio
-- Git is only needed if you want to version/control your exported project; it is not required for the exporter itself
+
+Install the official CLI on Windows:
+
+```powershell
+irm https://github.com/series-ai/rundot-cli-releases/releases/latest/download/install.ps1 | iex
+```
+
+Verify and authenticate:
+
+```powershell
+rundot --help
+rundot login
+```
+
+Git is optional; it is only needed if you want to version/control your exported project.
 
 ## Quick start
 
-The simplest supported first authentication path on Windows is a fresh official `rundot` login:
-
 ```powershell
-rundot login
 .\game-studio-export.ps1 `
     -ProjectId "YOUR_PROJECT_ID" `
     -OutDir ".\dev" `
