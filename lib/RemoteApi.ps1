@@ -3,6 +3,172 @@
 # Do not add Set-* or Remove-* remote functions. Do not add Studio write
 # methods or upload helpers.
 
+function ConvertFrom-RemoteJson {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [string]$What = "remote API"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        throw [System.InvalidOperationException]::new(
+            "Unexpected non-JSON from ${What}."
+        )
+    }
+
+    $trimmed = $Text.TrimStart()
+
+    if ($trimmed -match '(?i)^<!DOCTYPE\s+html|^<html\b') {
+        throw [System.InvalidOperationException]::new(
+            "Unexpected HTML from ${What} (login page?)."
+        )
+    }
+
+    $first = $trimmed[0]
+    if ($first -ne '{' -and $first -ne '[') {
+        throw [System.InvalidOperationException]::new(
+            "Unexpected non-JSON from ${What}."
+        )
+    }
+
+    try {
+        $parsed = $Text | ConvertFrom-Json
+    }
+    catch {
+        throw [System.InvalidOperationException]::new(
+            "Unexpected non-JSON from ${What}.",
+            $_.Exception
+        )
+    }
+
+    # Keep JSON arrays as one object. A bare `return $array` unrolls and
+    # callers would see two pipeline items instead of a files payload.
+    if ($parsed -is [System.Array]) {
+        return ,$parsed
+    }
+
+    return $parsed
+}
+
+
+function New-RemoteHttpException {
+    param(
+        [Parameter(Mandatory)]
+        [int]$StatusCode,
+
+        [string]$Message,
+
+        $InnerException = $null
+    )
+
+    if ([string]::IsNullOrEmpty($Message)) {
+        $Message = "Remote GET failed with HTTP $StatusCode"
+    }
+
+    if ($null -ne $InnerException) {
+        $exception = [System.InvalidOperationException]::new($Message, $InnerException)
+    }
+    else {
+        $exception = [System.InvalidOperationException]::new($Message)
+    }
+
+    $exception.Data['HttpStatusCode'] = $StatusCode
+    return $exception
+}
+
+
+function Get-RemoteHttpStatusCode {
+    param($Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        if ($null -ne $current.Data -and $current.Data.Contains('HttpStatusCode')) {
+            return [int]$current.Data['HttpStatusCode']
+        }
+
+        if (
+            $current -is [System.Net.WebException] -and
+            $null -ne $current.Response
+        ) {
+            $httpResponse = [System.Net.HttpWebResponse]$current.Response
+            return [int]$httpResponse.StatusCode
+        }
+
+        $current = $current.InnerException
+    }
+
+    return $null
+}
+
+
+function Test-RemoteNotFoundException {
+    param($Exception)
+
+    return (Get-RemoteHttpStatusCode -Exception $Exception) -eq 404
+}
+
+
+function Read-Utf8HttpResponseBody {
+    param($HttpResponse)
+
+    $stream = $HttpResponse.GetResponseStream()
+    $memory = New-Object System.IO.MemoryStream
+
+    try {
+        $stream.CopyTo($memory)
+        $responseBytes = $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $stream.Dispose()
+    }
+
+    return [System.Text.Encoding]::UTF8.GetString($responseBytes)
+}
+
+
+function Convert-WebExceptionToRemoteHttpException {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebException]$Exception
+    )
+
+    $statusCode = $null
+    $response = $Exception.Response
+
+    if ($null -ne $response) {
+        try {
+            $httpResponse = [System.Net.HttpWebResponse]$response
+            $statusCode = [int]$httpResponse.StatusCode
+            # Drain the error body so the connection can close. Do not parse
+            # it as JSON — an HTML error page is not a file payload.
+            try {
+                [void](Read-Utf8HttpResponseBody -HttpResponse $httpResponse)
+            }
+            catch {
+                # Classification uses status only.
+            }
+        }
+        finally {
+            $response.Dispose()
+        }
+    }
+
+    if ($null -ne $statusCode) {
+        return New-RemoteHttpException `
+            -StatusCode $statusCode `
+            -InnerException $Exception
+    }
+
+    return [System.InvalidOperationException]::new(
+        "Remote GET failed.",
+        $Exception
+    )
+}
+
+
 # Read an HTTP response as raw bytes and decode it explicitly as UTF-8.
 #
 # Windows PowerShell 5.1 can decode response bodies with the wrong character
@@ -32,22 +198,15 @@ function Invoke-Utf8TextGet {
         }
     }
 
-    $httpResponse = $request.GetResponse()
+    try {
+        $httpResponse = $request.GetResponse()
+    }
+    catch [System.Net.WebException] {
+        throw (Convert-WebExceptionToRemoteHttpException -Exception $_.Exception)
+    }
 
     try {
-        $stream = $httpResponse.GetResponseStream()
-        $memory = New-Object System.IO.MemoryStream
-
-        try {
-            $stream.CopyTo($memory)
-            $responseBytes = $memory.ToArray()
-        }
-        finally {
-            $memory.Dispose()
-            $stream.Dispose()
-        }
-
-        return [System.Text.Encoding]::UTF8.GetString($responseBytes)
+        return Read-Utf8HttpResponseBody -HttpResponse $httpResponse
     }
     finally {
         $httpResponse.Dispose()
@@ -68,7 +227,9 @@ function Invoke-Utf8JsonGet {
         -Uri $Uri `
         -Headers $Headers
 
-    return $jsonText | ConvertFrom-Json
+    return ConvertFrom-RemoteJson `
+        -Text $jsonText `
+        -What $Uri
 }
 
 
