@@ -66,6 +66,8 @@ $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
 . (Join-Path $PSScriptRoot "lib\Auth.ps1")
+. (Join-Path $PSScriptRoot "lib\Paths.ps1")
+. (Join-Path $PSScriptRoot "lib\Ignore.ps1")
 
 
 # ============================================================================
@@ -272,6 +274,10 @@ $Headers = @{
 
 Write-Section "Project export"
 
+if (Test-Path -LiteralPath $OutDir) {
+    Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $OutDir
+}
+
 New-Item `
     -ItemType Directory `
     -Force `
@@ -284,6 +290,24 @@ $files = @(
             $_.type -eq "file"
         }
 )
+
+if ($files.Count -gt 0) {
+    $remotePaths = @(
+        $files |
+            ForEach-Object {
+                [string]$_.path
+            }
+    )
+
+    Assert-SafeSyncPathSet -Paths $remotePaths
+
+    foreach ($remotePathToCheck in $remotePaths) {
+        $canonicalPath = ConvertTo-CanonicalSyncPath -Path $remotePathToCheck
+        Assert-SyncPathRepresentable `
+            -WorkspaceRoot $OutDir `
+            -CanonicalPath $canonicalPath
+    }
+}
 
 
 Write-Host "Project ID:"
@@ -319,15 +343,10 @@ $textMetadataDifferences = 0
 foreach ($entry in $files) {
 
     $remotePath = [string]$entry.path
-
-    $relativePath = `
-        $remotePath.TrimStart("/") `
-        -replace '/',
-        [System.IO.Path]::DirectorySeparatorChar
-
-    $localPath = Join-Path `
-        $OutDir `
-        $relativePath
+    $canonicalPath = ConvertTo-CanonicalSyncPath -Path $remotePath
+    $localPath = ConvertTo-LocalFullPath `
+        -WorkspaceRoot $OutDir `
+        -CanonicalPath $canonicalPath
 
     $parentDir = Split-Path `
         -Parent `
