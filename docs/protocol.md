@@ -8,6 +8,10 @@ They are undocumented implementation details and may change without notice.
 
 GET /api/projects/{projectId}/files
 
+This list is not known to be atomic. Sync must capture REMOTE through
+`Get-StableRemoteSnapshot` (see [remote-snapshot.md](remote-snapshot.md))
+rather than treating a single `/files` response as truth.
+
 ## Read file
 
 GET /api/projects/{projectId}/file?path={encodedPath}
