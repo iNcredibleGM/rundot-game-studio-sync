@@ -1,10 +1,14 @@
 # GitHub labels and milestones
 
+Branching and pull-request bases are documented in [CONTRIBUTING.md](../CONTRIBUTING.md). This file is only labels and milestones.
+
 Versions live on **milestones**, never on labels (name or description).
 
 Milestone title format: `vX.Y.Z - Short name`.
 
 Do not file tracking issues that restate a milestone. Child issues on that milestone are the work.
+
+Keep the GitHub milestone **open** until the version is tagged and released from `main` ([releasing.md](releasing.md)). Closing every child issue is not a release.
 
 ## How to file
 

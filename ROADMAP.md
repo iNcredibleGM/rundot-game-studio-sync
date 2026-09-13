@@ -13,7 +13,7 @@ Stable Studio → local export.
 
 Shipped on `main`.
 
-GitHub process (labels, milestone naming) is documented in [docs/github-labels.md](docs/github-labels.md). Versions live on milestones, not labels.
+How to branch and open pull requests is in [CONTRIBUTING.md](CONTRIBUTING.md). How to ship a finished milestone is in [docs/releasing.md](docs/releasing.md). Labels and milestone naming are in [docs/github-labels.md](docs/github-labels.md). Versions live on milestones, not labels.
 
 ## v0.1.2 - Sync foundations
 
@@ -31,6 +31,8 @@ Milestone: [v0.1.2 - Sync foundations](https://github.com/iNcredibleGM/rundot-ga
 4. Stable remote snapshot with torn-read protection — [#6](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/6)
 
 Done when the exporter still works, internals are reusable and tested, and mutation grep is green.
+
+Shipped on `main`.
 
 ## v0.1.3 - Safe pull planner
 

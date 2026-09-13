@@ -76,6 +76,10 @@ Notes:
 
 > Never include access tokens, refresh tokens, or authentication files in bug reports.
 
+## Contributing
+
+How to branch, open pull requests, and work on a milestone is in [CONTRIBUTING.md](CONTRIBUTING.md). Automated agents must also read [AGENTS.md](AGENTS.md).
+
 ## Development note
 
 The original exporter and protocol investigation were iterated with OpenAI GPT-5.6 Sol/Terra/Luna while manually observing Studio network behavior. Subsequent local refactoring and the CLI-auth integration were developed in Cursor using local Ollama tooling with DeepSeek V4 Flash, with live behavior verified manually.

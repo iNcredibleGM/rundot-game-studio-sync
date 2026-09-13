@@ -64,6 +64,11 @@ $OutDir = [System.IO.Path]::GetFullPath($OutDir)
 
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
+. (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
+. (Join-Path $PSScriptRoot "lib\Auth.ps1")
+. (Join-Path $PSScriptRoot "lib\Paths.ps1")
+. (Join-Path $PSScriptRoot "lib\Ignore.ps1")
+
 
 # ============================================================================
 # Utility
@@ -82,77 +87,9 @@ function Write-Section {
 function Clear-SensitiveVariables {
     $script:Token = $null
     $script:RefreshToken = $null
+    $script:authResult = $null
     $script:clipboard = $null
     $script:rundotCliSession = $null
-}
-
-
-# Read an HTTP response as raw bytes and decode it explicitly as UTF-8.
-#
-# Windows PowerShell 5.1 can decode response bodies with the wrong character
-# set when the server omits an explicit charset. Reading the bytes ourselves
-# prevents UTF-8 emoji/symbols from turning into mojibake.
-function Invoke-Utf8TextGet {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [Parameter(Mandatory)]
-        [hashtable]$Headers
-    )
-
-    $request = [System.Net.HttpWebRequest]::Create($Uri)
-    $request.Method = "GET"
-
-    foreach ($key in $Headers.Keys) {
-        switch -Regex ($key) {
-            '^Accept$' {
-                $request.Accept = [string]$Headers[$key]
-                continue
-            }
-            default {
-                $request.Headers[$key] = [string]$Headers[$key]
-            }
-        }
-    }
-
-    $httpResponse = $request.GetResponse()
-
-    try {
-        $stream = $httpResponse.GetResponseStream()
-        $memory = New-Object System.IO.MemoryStream
-
-        try {
-            $stream.CopyTo($memory)
-            $responseBytes = $memory.ToArray()
-        }
-        finally {
-            $memory.Dispose()
-            $stream.Dispose()
-        }
-
-        return [System.Text.Encoding]::UTF8.GetString($responseBytes)
-    }
-    finally {
-        $httpResponse.Dispose()
-    }
-}
-
-
-function Invoke-Utf8JsonGet {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [Parameter(Mandatory)]
-        [hashtable]$Headers
-    )
-
-    $jsonText = Invoke-Utf8TextGet `
-        -Uri $Uri `
-        -Headers $Headers
-
-    return $jsonText | ConvertFrom-Json
 }
 
 
@@ -289,207 +226,8 @@ function Convert-ThreadToMarkdown {
 
 
 # ============================================================================
-# RUNdot CLI session
+# Forget saved authentication
 # ============================================================================
-
-# Safely load the official RUNdot CLI login session.
-#
-# Returns $null when the file is missing, unreadable, or does not contain a
-# usable access token. Never prints token contents and never modifies the
-# official CLI session file.
-function Get-RundotCliSession {
-    if (-not (Test-Path $RundotCliSessionPath)) {
-        return $null
-    }
-
-    try {
-        $session = Get-Content `
-            $RundotCliSessionPath `
-            -Raw |
-            ConvertFrom-Json
-
-        $accessToken = [string]$session.accessToken
-
-        if ([string]::IsNullOrWhiteSpace($accessToken)) {
-            return $null
-        }
-
-        return @{
-            AccessToken          = $accessToken
-            ExpiresAtUnixTimeMs  = $session.expiresAtUnixTimeMs
-        }
-    }
-    catch {
-        return $null
-    }
-}
-
-
-# Determine whether a RUNdot CLI access token is fresh enough to attempt.
-#
-# This is only a freshness check. It does NOT verify the token signature.
-# The Studio manifest request remains the authoritative validation.
-#
-# Prefers the session's expiresAtUnixTimeMs when valid. Falls back to
-# decoding the JWT exp claim locally when needed.
-function Test-RundotCliTokenFresh {
-    param(
-        [Parameter(Mandatory)]
-        [string]$AccessToken,
-
-        $ExpiresAtUnixTimeMs
-    )
-
-    $now = [DateTimeOffset]::UtcNow
-    $safetyWindow = [TimeSpan]::FromMinutes(5)
-
-    # Prefer the session's explicit expiry timestamp.
-    #
-    # Only a positive value is a meaningful Unix-milliseconds expiry.
-    # Zero, negative, empty, or non-numeric values are not valid expiry
-    # timestamps, so fall through to the JWT exp claim rather than
-    # prematurely rejecting the token.
-    if ($null -ne $ExpiresAtUnixTimeMs) {
-        try {
-            $expiresMs = [int64]$ExpiresAtUnixTimeMs
-
-            if ($expiresMs -gt 0) {
-                $expires = [DateTimeOffset]::FromUnixTimeMilliseconds(
-                    $expiresMs
-                )
-
-                return ($expires - $now) -gt $safetyWindow
-            }
-        }
-        catch {
-            # Fall through to the JWT exp claim.
-        }
-    }
-
-    # Fall back to decoding the JWT exp claim locally.
-    try {
-        $parts = $AccessToken.Split('.')
-
-        if ($parts.Count -lt 2) {
-            return $false
-        }
-
-        $payload = $parts[1].Replace('-', '+').Replace('_', '/')
-
-        switch ($payload.Length % 4) {
-            2 { $payload += '==' }
-            3 { $payload += '=' }
-        }
-
-        $payloadBytes = [Convert]::FromBase64String($payload)
-        $payloadJson = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
-        $claims = $payloadJson | ConvertFrom-Json
-
-        if ($null -eq $claims.exp) {
-            return $false
-        }
-
-        $expires = [DateTimeOffset]::FromUnixTimeSeconds(
-            [int64]$claims.exp
-        )
-
-        return ($expires - $now) -gt $safetyWindow
-    }
-    catch {
-        return $false
-    }
-}
-
-
-# ============================================================================
-# Saved Studio authentication
-# ============================================================================
-
-function Save-StudioAuth {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ApiKey,
-
-        [Parameter(Mandatory)]
-        [string]$RefreshToken
-    )
-
-    New-Item `
-        -ItemType Directory `
-        -Force `
-        -Path $AuthDir | Out-Null
-
-    # ConvertFrom-SecureString without a supplied key uses Windows DPAPI.
-    # The encrypted value is tied to the current Windows user.
-    $secureRefreshToken = ConvertTo-SecureString `
-        $RefreshToken `
-        -AsPlainText `
-        -Force
-
-    $encryptedRefreshToken = ConvertFrom-SecureString `
-        $secureRefreshToken
-
-    $authObject = [ordered]@{
-        version               = 1
-        apiKey                = $ApiKey
-        encryptedRefreshToken = $encryptedRefreshToken
-    }
-
-    $json = $authObject | ConvertTo-Json
-
-    # This is not project source, so ordinary PowerShell JSON output is fine.
-    [System.IO.File]::WriteAllText(
-        $AuthPath,
-        $json,
-        $Utf8NoBom
-    )
-}
-
-
-function Load-StudioAuth {
-
-    if (-not (Test-Path $AuthPath)) {
-        return $null
-    }
-
-    try {
-        $saved = Get-Content `
-            $AuthPath `
-            -Raw |
-            ConvertFrom-Json
-
-        if (
-            -not $saved.apiKey -or
-            -not $saved.encryptedRefreshToken
-        ) {
-            return $null
-        }
-
-        $secureRefreshToken = ConvertTo-SecureString `
-            ([string]$saved.encryptedRefreshToken)
-
-        $refreshToken = [System.Net.NetworkCredential]::new(
-            "",
-            $secureRefreshToken
-        ).Password
-
-        if ([string]::IsNullOrWhiteSpace($refreshToken)) {
-            return $null
-        }
-
-        return @{
-            ApiKey       = [string]$saved.apiKey
-            RefreshToken = $refreshToken
-        }
-    }
-    catch {
-        Write-Warning "Saved Studio authentication could not be loaded."
-        Write-Warning $_.Exception.Message
-
-        return $null
-    }
-}
-
 
 if ($ForgetAuth) {
 
@@ -507,433 +245,21 @@ if ($ForgetAuth) {
 
 
 # ============================================================================
-# Firebase token refresh
-# ============================================================================
-
-function Get-FreshStudioToken {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ApiKey,
-
-        [Parameter(Mandatory)]
-        [string]$RefreshToken
-    )
-
-    try {
-        $result = Invoke-RestMethod `
-            -Uri "https://securetoken.googleapis.com/v1/token?key=$ApiKey" `
-            -Method POST `
-            -ContentType "application/x-www-form-urlencoded" `
-            -Body @{
-                grant_type    = "refresh_token"
-                refresh_token = $RefreshToken
-            } `
-            -ErrorAction Stop
-
-        if (-not $result.id_token) {
-            return $null
-        }
-
-        return @{
-            AccessToken = [string]$result.id_token
-
-            RefreshToken = if ($result.refresh_token) {
-                [string]$result.refresh_token
-            }
-            else {
-                $RefreshToken
-            }
-        }
-    }
-    catch {
-        return $null
-    }
-}
-
-
-# ============================================================================
-# Clipboard authentication parsing
-# ============================================================================
-
-function Get-TokenFromText {
-    param(
-        [string]$Text
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return $null
-    }
-
-
-    # Handles:
-    #
-    #   authorization: Bearer eyJ...
-    #
-    # POSIX cURL:
-    #
-    #   -H 'authorization: Bearer eyJ...'
-    #
-    # Windows cURL:
-    #
-    #   -H "authorization: Bearer eyJ..."
-    #
-    $authorizationMatch = [regex]::Match(
-        $Text,
-        '(?i)authorization\s*:\s*Bearer\s+([A-Za-z0-9._~-]+)'
-    )
-
-    if ($authorizationMatch.Success) {
-        return $authorizationMatch.Groups[1].Value
-    }
-
-
-    # Handles:
-    #
-    #   Bearer eyJ...
-    #
-    $bearerMatch = [regex]::Match(
-        $Text,
-        '(?i)\bBearer\s+([A-Za-z0-9._~-]+)'
-    )
-
-    if ($bearerMatch.Success) {
-        return $bearerMatch.Groups[1].Value
-    }
-
-
-    # Handles raw JWT only.
-    $jwtMatch = [regex]::Match(
-        $Text.Trim(),
-        '^([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$'
-    )
-
-    if ($jwtMatch.Success) {
-        return $jwtMatch.Groups[1].Value
-    }
-
-
-    return $null
-}
-
-
-function Get-BootstrapAuthFromText {
-    param(
-        [string]$Text
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return $null
-    }
-
-    try {
-        $parsed = $Text.Trim() | ConvertFrom-Json
-
-        if (
-            $parsed.apiKey -and
-            $parsed.refreshToken
-        ) {
-            return @{
-                ApiKey       = [string]$parsed.apiKey
-                RefreshToken = [string]$parsed.refreshToken
-            }
-        }
-    }
-    catch {
-        # Clipboard simply wasn't bootstrap JSON.
-    }
-
-    return $null
-}
-
-
-# ============================================================================
-# Studio token validation
-# ============================================================================
-
-function Get-StudioManifestWithToken {
-    param(
-        [Parameter(Mandatory)]
-        [string]$AccessToken
-    )
-
-    $headers = @{
-        Authorization = "Bearer $AccessToken"
-        Accept        = "*/*"
-    }
-
-    try {
-        return Invoke-Utf8JsonGet `
-            -Uri "$BaseUrl/files" `
-            -Headers $headers
-    }
-    catch {
-        return $null
-    }
-}
-
-
-# ============================================================================
-# Manual bearer fallback
-# ============================================================================
-
-function Read-ManualBearerToken {
-
-    Write-Host ""
-    Write-Host "No usable automatic Studio authentication was found."
-    Write-Host ""
-    Write-Host "You can paste a fresh Studio bearer token."
-    Write-Host "The token will not be displayed."
-    Write-Host ""
-
-    $secureToken = Read-Host `
-        "Bearer token" `
-        -AsSecureString
-
-    if ($null -eq $secureToken) {
-        return $null
-    }
-
-    $plainText = [System.Net.NetworkCredential]::new(
-        "",
-        $secureToken
-    ).Password
-
-    if ([string]::IsNullOrWhiteSpace($plainText)) {
-        return $null
-    }
-
-    $parsedToken = Get-TokenFromText $plainText
-
-    if ($parsedToken) {
-        return $parsedToken
-    }
-
-    return $plainText.Trim()
-}
-
-
-# ============================================================================
 # Resolve authentication
 # ============================================================================
 
 Write-Section "RUN Studio authentication"
 
-$Token = $null
-$RefreshToken = $null
-$manifest = $null
+$authResult = Get-RundotAccessToken `
+    -StudioOrigin $StudioOrigin `
+    -ProjectId $ProjectId `
+    -AuthDir $AuthDir `
+    -AuthPath $AuthPath `
+    -RundotCliSessionPath $RundotCliSessionPath
 
-
-# ----------------------------------------------------------------------------
-# 1. Fresh official RUNdot CLI access token
-# ----------------------------------------------------------------------------
-
-$rundotCliSession = Get-RundotCliSession
-
-if ($rundotCliSession) {
-
-    if (Test-RundotCliTokenFresh `
-            -AccessToken $rundotCliSession.AccessToken `
-            -ExpiresAtUnixTimeMs $rundotCliSession.ExpiresAtUnixTimeMs) {
-
-        Write-Host "Found RUNdot CLI session."
-        Write-Host "Testing fresh CLI authentication against Studio..."
-
-        $candidateManifest = Get-StudioManifestWithToken `
-            $rundotCliSession.AccessToken
-
-        if ($candidateManifest) {
-
-            $Token = $rundotCliSession.AccessToken
-            $manifest = $candidateManifest
-
-            Write-Host "RUNdot CLI authentication accepted."
-        }
-        else {
-            Write-Host "RUNdot CLI authentication was rejected."
-            Write-Host "Trying other authentication methods..."
-        }
-    }
-    else {
-        Write-Host "Found RUNdot CLI session, but its access token is expired or near expiry."
-        Write-Host "Run ``rundot login`` to refresh it."
-        Write-Host "Trying other authentication methods..."
-    }
-}
-
-
-# ----------------------------------------------------------------------------
-# 2. Previously saved Firebase refresh token
-# ----------------------------------------------------------------------------
-
-$savedAuth = Load-StudioAuth
-
-if ($savedAuth) {
-
-    Write-Host "Found saved RUN Studio authentication."
-    Write-Host "Refreshing Studio token..."
-
-    $refreshed = Get-FreshStudioToken `
-        -ApiKey $savedAuth.ApiKey `
-        -RefreshToken $savedAuth.RefreshToken
-
-    if ($refreshed) {
-
-        $candidateManifest = Get-StudioManifestWithToken `
-            $refreshed.AccessToken
-
-        if ($candidateManifest) {
-
-            $Token = $refreshed.AccessToken
-            $RefreshToken = $refreshed.RefreshToken
-            $manifest = $candidateManifest
-
-            Save-StudioAuth `
-                -ApiKey $savedAuth.ApiKey `
-                -RefreshToken $refreshed.RefreshToken
-
-            Write-Host "Saved Studio authentication accepted."
-        }
-        else {
-            Write-Host "Saved Studio authentication was refreshed,"
-            Write-Host "but Studio rejected the resulting token."
-        }
-    }
-    else {
-        Write-Host "Saved Studio authentication could not be refreshed."
-    }
-}
-
-
-# ----------------------------------------------------------------------------
-# Read clipboard once for remaining fallbacks
-# ----------------------------------------------------------------------------
-
-$clipboard = $null
-
-if (-not $Token) {
-    try {
-        $clipboard = Get-Clipboard -Raw
-    }
-    catch {
-        $clipboard = $null
-    }
-}
-
-
-# ----------------------------------------------------------------------------
-# 3. Bootstrap JSON from clipboard
-#
-# Expected:
-#
-# {
-#   "apiKey": "...",
-#   "refreshToken": "..."
-# }
-#
-# ----------------------------------------------------------------------------
-
-if (-not $Token) {
-
-    $bootstrapAuth = Get-BootstrapAuthFromText $clipboard
-
-    if ($bootstrapAuth) {
-
-        Write-Host "Found RUN Studio bootstrap credentials in clipboard."
-        Write-Host "Refreshing Studio token..."
-
-        $refreshed = Get-FreshStudioToken `
-            -ApiKey $bootstrapAuth.ApiKey `
-            -RefreshToken $bootstrapAuth.RefreshToken
-
-        if ($refreshed) {
-
-            $candidateManifest = Get-StudioManifestWithToken `
-                $refreshed.AccessToken
-
-            if ($candidateManifest) {
-
-                $Token = $refreshed.AccessToken
-                $RefreshToken = $refreshed.RefreshToken
-                $manifest = $candidateManifest
-
-                Save-StudioAuth `
-                    -ApiKey $bootstrapAuth.ApiKey `
-                    -RefreshToken $refreshed.RefreshToken
-
-                Write-Host "Studio bootstrap authentication accepted."
-                Write-Host "Refresh credentials saved securely for future exports."
-            }
-            else {
-                Write-Host "Bootstrap credentials produced a token,"
-                Write-Host "but Studio rejected it."
-            }
-        }
-        else {
-            Write-Host "Bootstrap refresh token could not be refreshed."
-        }
-    }
-}
-
-
-# ----------------------------------------------------------------------------
-# 4. Bearer token from clipboard
-# ----------------------------------------------------------------------------
-
-if (-not $Token) {
-
-    $clipboardToken = Get-TokenFromText $clipboard
-
-    if ($clipboardToken) {
-
-        Write-Host "Found Studio bearer token in clipboard."
-        Write-Host "Testing it against Studio..."
-
-        $candidateManifest = Get-StudioManifestWithToken `
-            $clipboardToken
-
-        if ($candidateManifest) {
-
-            $Token = $clipboardToken
-            $manifest = $candidateManifest
-
-            Write-Host "Clipboard authentication accepted."
-        }
-        else {
-            Write-Host "Clipboard bearer token was rejected or expired."
-        }
-    }
-}
-
-
-# ----------------------------------------------------------------------------
-# 5. Manual bearer-token fallback
-# ----------------------------------------------------------------------------
-
-while (-not $Token) {
-
-    $manualToken = Read-ManualBearerToken
-
-    if (-not $manualToken) {
-        throw "No Studio authentication was supplied."
-    }
-
-    Write-Host "Testing manually supplied token..."
-
-    $candidateManifest = Get-StudioManifestWithToken `
-        $manualToken
-
-    if ($candidateManifest) {
-
-        $Token = $manualToken
-        $manifest = $candidateManifest
-
-        Write-Host "Manual Studio authentication accepted."
-        break
-    }
-
-    Write-Warning "Studio rejected that bearer token."
-    Write-Warning "It may be expired. Try a fresh token."
-}
+$Token = $authResult.AccessToken
+$manifest = $authResult.Manifest
+$RefreshToken = $authResult.RefreshToken
 
 
 $Headers = @{
@@ -948,6 +274,10 @@ $Headers = @{
 
 Write-Section "Project export"
 
+if (Test-Path -LiteralPath $OutDir) {
+    Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $OutDir
+}
+
 New-Item `
     -ItemType Directory `
     -Force `
@@ -960,6 +290,24 @@ $files = @(
             $_.type -eq "file"
         }
 )
+
+if ($files.Count -gt 0) {
+    $remotePaths = @(
+        $files |
+            ForEach-Object {
+                [string]$_.path
+            }
+    )
+
+    Assert-SafeSyncPathSet -Paths $remotePaths
+
+    foreach ($remotePathToCheck in $remotePaths) {
+        $canonicalPath = ConvertTo-CanonicalSyncPath -Path $remotePathToCheck
+        Assert-SyncPathRepresentable `
+            -WorkspaceRoot $OutDir `
+            -CanonicalPath $canonicalPath
+    }
+}
 
 
 Write-Host "Project ID:"
@@ -995,15 +343,10 @@ $textMetadataDifferences = 0
 foreach ($entry in $files) {
 
     $remotePath = [string]$entry.path
-
-    $relativePath = `
-        $remotePath.TrimStart("/") `
-        -replace '/',
-        [System.IO.Path]::DirectorySeparatorChar
-
-    $localPath = Join-Path `
-        $OutDir `
-        $relativePath
+    $canonicalPath = ConvertTo-CanonicalSyncPath -Path $remotePath
+    $localPath = ConvertTo-LocalFullPath `
+        -WorkspaceRoot $OutDir `
+        -CanonicalPath $canonicalPath
 
     $parentDir = Split-Path `
         -Parent `
@@ -1021,12 +364,10 @@ foreach ($entry in $files) {
 
         Write-Host "GET $remotePath"
 
-        $encodedPath = [System.Uri]::EscapeDataString(
-            $remotePath
-        )
-
-        $response = Invoke-Utf8JsonGet `
-            -Uri "$BaseUrl/file?path=$encodedPath" `
+        $response = Get-RemoteProjectFile `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Path $remotePath `
             -Headers $Headers
 
 
