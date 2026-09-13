@@ -6,18 +6,6 @@ $script:InvalidFileNameCharPattern = '[<>:"|?*]'
 $script:Win32MaxPath = 259
 $script:FileAttributeRecallOnOpen = 0x40000
 $script:FileAttributeRecallOnDataAccess = 0x400000
-$script:IgnoredScanDirectoryNames = @(
-    '.git',
-    '.rundot-sync',
-    'node_modules',
-    'dist',
-    'build',
-    'out',
-    '.vs',
-    '.idea',
-    '.vscode',
-    '.rundot-studio-export'
-)
 
 function Test-EmbeddedNul {
     param([string]$Text)
@@ -309,14 +297,6 @@ function Test-ShouldSkipLocalScanItem {
         [string]$Name,
         [bool]$IsDirectory
     )
-
-    if ($IsDirectory) {
-        foreach ($ignoredName in $script:IgnoredScanDirectoryNames) {
-            if ([string]::Equals($Name, $ignoredName, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $true
-            }
-        }
-    }
 
     if (Get-Command Test-IgnoredSyncPath -ErrorAction SilentlyContinue) {
         if (Test-IgnoredSyncPath -CanonicalPath $CanonicalPath) {
