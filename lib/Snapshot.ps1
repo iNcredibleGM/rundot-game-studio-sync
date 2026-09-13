@@ -295,11 +295,124 @@ function ConvertFrom-RemoteFileContent {
 }
 
 
+$script:RemoteSnapshotMaxAttempts = 3
+$script:RemoteSnapshotIdleMessage = @(
+    'The remote project changed while being read. No plan was generated.',
+    'Try again when the project is idle.'
+) -join "`n"
+
+
+function Get-RemoteSnapshotTempRoot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot
+    )
+
+    return Join-Path `
+        (Get-RundotSyncRoot -WorkspaceRoot $WorkspaceRoot) `
+        "temp\remote-snapshot"
+}
+
 function Clear-RemoteSnapshotTemp {
     param(
         [Parameter(Mandatory)]
         [string]$WorkspaceRoot
     )
+
+    $root = Get-RemoteSnapshotTempRoot -WorkspaceRoot $WorkspaceRoot
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force
+    }
+}
+
+function Test-RemoteSnapshotRetryableException {
+    param($Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        if (Test-RemoteNotFoundException -Exception $current) {
+            return $true
+        }
+
+        $text = [string]$current.Message
+        if ($text -match '(?i)Malformed base64') {
+            return $true
+        }
+
+        $current = $current.InnerException
+    }
+
+    return $false
+}
+
+function Write-RemoteSnapshotStagingFile {
+    param(
+        [string]$StagingRoot,
+        [string]$CanonicalPath,
+        [byte[]]$Bytes
+    )
+
+    $full = ConvertTo-LocalFullPath `
+        -WorkspaceRoot $StagingRoot `
+        -CanonicalPath $CanonicalPath
+    $parent = Split-Path -Parent $full
+    if ($parent) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+
+    if ($null -eq $Bytes) {
+        $Bytes = [byte[]]@()
+    }
+
+    [System.IO.File]::WriteAllBytes($full, $Bytes)
+    return $full
+}
+
+function Get-RemoteSnapshotFileMap {
+    param(
+        $Manifest,
+        [string]$StagingRoot,
+        [string]$StudioOrigin,
+        [string]$ProjectId,
+        [hashtable]$Headers
+    )
+
+    $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $rows = Get-RemoteManifestFileRows -Manifest $Manifest
+
+    foreach ($row in $rows) {
+        Assert-SyncPathRepresentable `
+            -WorkspaceRoot $StagingRoot `
+            -CanonicalPath $row.CanonicalPath
+
+        $originalPath = [string](Get-RemoteEntryProperty -Entry $row.Entry -Names @('path', 'Path'))
+        $response = Get-RemoteProjectFile `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Path $originalPath `
+            -Headers $Headers
+
+        $bytes = ConvertFrom-RemoteFileContent -Response $response
+        $stagingPath = Write-RemoteSnapshotStagingFile `
+            -StagingRoot $StagingRoot `
+            -CanonicalPath $row.CanonicalPath `
+            -Bytes $bytes
+        $identity = Get-LocalFileIdentity -LiteralPath $stagingPath
+        $encoding = Get-RemoteEntryProperty -Entry $response -Names @('encoding', 'Encoding')
+
+        $files[$row.CanonicalPath] = [pscustomobject]@{
+            Sha256            = $identity.Sha256
+            Size              = $identity.Size
+            LocalDetectedKind = $identity.LocalDetectedKind
+            LineEnding        = $identity.LineEnding
+            HasBom            = $identity.HasBom
+            RemoteKind        = ConvertTo-RemoteKind -Encoding $encoding
+            Encoding          = $encoding
+            StagingPath       = $stagingPath
+        }
+    }
+
+    return ,$files
 }
 
 function Get-StableRemoteSnapshot {
@@ -315,6 +428,66 @@ function Get-StableRemoteSnapshot {
 
         [Parameter(Mandatory)]
         [hashtable]$Headers
+    )
+
+    Initialize-RundotSyncLayout -WorkspaceRoot $WorkspaceRoot
+    Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+
+    $attempt = 0
+    while ($attempt -lt $script:RemoteSnapshotMaxAttempts) {
+        $attempt++
+        Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+
+        $stagingRoot = Join-Path `
+            (Get-RemoteSnapshotTempRoot -WorkspaceRoot $WorkspaceRoot) `
+            ([string]$attempt)
+        New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+
+        try {
+            $before = Get-RemoteProjectFileList `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers
+            $hashBefore = Get-RemoteManifestFingerprint -Manifest $before
+
+            $files = Get-RemoteSnapshotFileMap `
+                -Manifest $before `
+                -StagingRoot $stagingRoot `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers
+
+            $after = Get-RemoteProjectFileList `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers
+            $hashAfter = Get-RemoteManifestFingerprint -Manifest $after
+
+            if ($hashBefore -ne $hashAfter) {
+                continue
+            }
+
+            return [pscustomobject]@{
+                Files                    = $files
+                RemoteManifestHashBefore = $hashBefore
+                RemoteManifestHashAfter  = $hashAfter
+                AttemptCount             = $attempt
+                StagingRoot              = $stagingRoot
+            }
+        }
+        catch {
+            if (Test-RemoteSnapshotRetryableException -Exception $_.Exception) {
+                continue
+            }
+
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+            throw
+        }
+    }
+
+    Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+    throw [System.InvalidOperationException]::new(
+        $script:RemoteSnapshotIdleMessage
     )
 }
 
