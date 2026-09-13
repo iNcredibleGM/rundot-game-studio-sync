@@ -4,9 +4,9 @@ Before changing this repository, **read [CONTRIBUTING.md](CONTRIBUTING.md) and f
 
 ## Must follow
 
-- Branch from the current **milestone integration branch** (`v0.1.2` for issues #3–#6), never from `main` while that milestone is in progress.
+- Branch from the current **milestone integration branch** (`v0.1.3` for issues #7–#11), never from `main` while that milestone is in progress.
 - Name issue branches `issue/<number>-<short-slug>`. Open pull requests against the integration branch, not `main`.
-- Ship a milestone with one PR: `vX.Y.Z` → `main`. Do not land unfinished milestone work on `main`.
+- Ship a completed milestone per [docs/releasing.md](docs/releasing.md): one PR `vX.Y.Z` → `main`, then tag, GitHub Release, close the milestone, cut the next integration branch. Do not land unfinished milestone work on `main`. Do not tag `main` before the ship PR merges.
 - Windows PowerShell 5.1 is the compatibility baseline.
 - Never print, write, or commit access tokens, refresh tokens, clipboard secrets, or `%APPDATA%\.rundot\` auth files. Do not put them in manifests, plans, journals, logs, or PR text.
 - Do not add Studio write APIs (`PUT`, `DELETE`, `upload-url`, `upload-adopt`) until the roadmap’s push milestone. Token refresh via Google `securetoken` POST is allowed.

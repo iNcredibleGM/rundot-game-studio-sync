@@ -2,7 +2,7 @@
 
 This is the source of truth for how work lands in this repository. Read it before opening a pull request.
 
-Issue labels and milestone naming are in [docs/github-labels.md](docs/github-labels.md). Product direction is in [ROADMAP.md](ROADMAP.md).
+Issue labels and milestone naming are in [docs/github-labels.md](docs/github-labels.md). Product direction is in [ROADMAP.md](ROADMAP.md). Closing out a finished milestone (ship PR, tag, GitHub Release, next integration branch) is in [docs/releasing.md](docs/releasing.md).
 
 ## Platform
 
@@ -20,15 +20,15 @@ Issue branches are cut from the current integration branch, not from `main`:
 
 ```text
 main
-v0.1.2
-  └── issue/3-extract-auth-api
+v0.1.3
+  └── issue/7-init-from-remote
 ```
 
-Naming: `issue/<number>-<short-slug>` (example: `issue/3-extract-auth-api`).
+Naming: `issue/<number>-<short-slug>` (example: `issue/7-init-from-remote`).
 
-Open each issue pull request with **base = the integration branch** (for v0.1.2 work, that is `v0.1.2`). When every issue on the milestone is merged and the milestone is ready to ship, open **one** pull request: integration branch → `main`.
+Open each issue pull request with **base = the integration branch** (for v0.1.3 work, that is `v0.1.3`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
 
-Current foundations work (#3–#6) uses integration branch `v0.1.2`. Do not land those issues on `main` until that ship PR.
+Current pull-planner work (#7–#11) uses integration branch `v0.1.3`. Cut that branch from `main` after v0.1.2 ships. Do not land those issues on `main` until the v0.1.3 ship PR.
 
 ## Tests
 
