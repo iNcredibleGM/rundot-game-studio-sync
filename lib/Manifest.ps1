@@ -1,4 +1,4 @@
-# Local sync inventory contracts.
+# Local inventory for sync manifests.
 # Behavior is defined by tests/Manifest.Tests.ps1.
 
 function Get-LocalManifest {
