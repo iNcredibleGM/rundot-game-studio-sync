@@ -293,3 +293,28 @@ function ConvertFrom-RemoteFileContent {
         "Unknown encoding '$encoding'."
     )
 }
+
+
+function Clear-RemoteSnapshotTemp {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot
+    )
+}
+
+function Get-StableRemoteSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+}
+
