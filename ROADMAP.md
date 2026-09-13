@@ -13,7 +13,7 @@ Stable Studio → local export.
 
 Shipped on `main`.
 
-GitHub process (labels, milestone naming) is documented in [docs/github-labels.md](docs/github-labels.md). Versions live on milestones, not labels.
+How to branch and open pull requests is in [CONTRIBUTING.md](CONTRIBUTING.md). Labels and milestone naming are in [docs/github-labels.md](docs/github-labels.md). Versions live on milestones, not labels.
 
 ## v0.1.2 - Sync foundations
 
