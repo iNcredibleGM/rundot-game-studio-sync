@@ -4,6 +4,20 @@
 $script:Win32ReservedNamePattern = '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..+)?$'
 $script:InvalidFileNameCharPattern = '[<>:"|?*]'
 $script:Win32MaxPath = 259
+$script:FileAttributeRecallOnOpen = 0x40000
+$script:FileAttributeRecallOnDataAccess = 0x400000
+$script:IgnoredScanDirectoryNames = @(
+    '.git',
+    '.rundot-sync',
+    'node_modules',
+    'dist',
+    'build',
+    'out',
+    '.vs',
+    '.idea',
+    '.vscode',
+    '.rundot-studio-export'
+)
 
 function Test-EmbeddedNul {
     param([string]$Text)
@@ -278,7 +292,80 @@ function Test-UnsafeSyncFileAttributes {
         $Attributes
     )
 
+    $value = [int]$Attributes
+    $mask = (
+        [int][System.IO.FileAttributes]::ReparsePoint -bor
+        [int][System.IO.FileAttributes]::Offline -bor
+        $script:FileAttributeRecallOnOpen -bor
+        $script:FileAttributeRecallOnDataAccess
+    )
+
+    return ($value -band $mask) -ne 0
+}
+
+function Test-ShouldSkipLocalScanItem {
+    param(
+        [string]$CanonicalPath,
+        [string]$Name,
+        [bool]$IsDirectory
+    )
+
+    if ($IsDirectory) {
+        foreach ($ignoredName in $script:IgnoredScanDirectoryNames) {
+            if ([string]::Equals($Name, $ignoredName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+
+    if (Get-Command Test-IgnoredSyncPath -ErrorAction SilentlyContinue) {
+        if (Test-IgnoredSyncPath -CanonicalPath $CanonicalPath) {
+            return $true
+        }
+
+        if ($IsDirectory -and (Test-IgnoredSyncPath -CanonicalPath "$CanonicalPath/")) {
+            return $true
+        }
+    }
+
     return $false
+}
+
+function Invoke-AssertLocalTreeSafeDirectory {
+    param(
+        [System.IO.DirectoryInfo]$Directory,
+        [string]$RelativePath
+    )
+
+    foreach ($item in $Directory.GetFileSystemInfos()) {
+        $childRelative = $item.Name
+        if ($RelativePath) {
+            $childRelative = "$RelativePath/$($item.Name)"
+        }
+
+        $isDirectory = (
+            ([int]$item.Attributes -band [int][System.IO.FileAttributes]::Directory) -ne 0
+        )
+
+        if (
+            Test-ShouldSkipLocalScanItem `
+                -CanonicalPath $childRelative `
+                -Name $item.Name `
+                -IsDirectory $isDirectory
+        ) {
+            continue
+        }
+
+        if (Test-UnsafeSyncFileAttributes -Attributes $item.Attributes) {
+            Assert-UnsafeSyncPath "Path '$childRelative' is a reparse point, symlink, or cloud placeholder."
+        }
+
+        if ($isDirectory) {
+            Invoke-AssertLocalTreeSafeDirectory `
+                -Directory $item `
+                -RelativePath $childRelative
+        }
+    }
 }
 
 function Assert-LocalWorkspaceTreeSafe {
@@ -286,4 +373,19 @@ function Assert-LocalWorkspaceTreeSafe {
         [Parameter(Mandatory)]
         [string]$WorkspaceRoot
     )
+
+    $rootPath = Get-NormalizedWorkspaceRoot -WorkspaceRoot $WorkspaceRoot
+    $rootInfo = New-Object System.IO.DirectoryInfo $rootPath
+
+    if (-not $rootInfo.Exists) {
+        Assert-UnsafeSyncPath "Workspace root '$WorkspaceRoot' does not exist."
+    }
+
+    if (Test-UnsafeSyncFileAttributes -Attributes $rootInfo.Attributes) {
+        Assert-UnsafeSyncPath "Workspace root is a reparse point, symlink, or cloud placeholder."
+    }
+
+    Invoke-AssertLocalTreeSafeDirectory `
+        -Directory $rootInfo `
+        -RelativePath ''
 }
