@@ -1,5 +1,7 @@
 # GitHub labels and milestones
 
+Branching and pull-request bases are documented in [CONTRIBUTING.md](../CONTRIBUTING.md). This file is only labels and milestones.
+
 Versions live on **milestones**, never on labels (name or description).
 
 Milestone title format: `vX.Y.Z - Short name`.
