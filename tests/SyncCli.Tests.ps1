@@ -88,17 +88,52 @@ foreach ($requiredLibrary in @(
 
 # The gate must run before authentication so a missing BASE never prompts
 # for a token.
-$gateIndex = $syncCliSource.IndexOf('Resolve-RundotSyncPlanBase')
-$authIndex = $syncCliSource.IndexOf('Get-RundotAccessToken')
+#
+# Plan and Init each authenticate, so ordering is asserted inside the
+# function that does the work rather than across the whole file: a file-wide
+# "first occurrence" comparison would silently pass or fail depending on
+# which function happens to be defined first.
+function Get-SyncCliFunctionText {
+    param(
+        [string]$Source,
+        [string]$FunctionName
+    )
+
+    $start = $Source.IndexOf("function $FunctionName ")
+    if ($start -lt 0) {
+        return ""
+    }
+
+    $next = $Source.IndexOf("`nfunction ", $start + 1)
+    if ($next -lt 0) {
+        return $Source.Substring($start)
+    }
+
+    return $Source.Substring($start, $next - $start)
+}
+
+$planFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncPlanCommand'
 Assert-True `
-    ($gateIndex -ge 0 -and $authIndex -ge 0 -and $gateIndex -lt $authIndex) `
+    (-not [string]::IsNullOrEmpty($planFunctionText)) `
+    "the CLI must define Invoke-SyncPlanCommand for Plan and Status"
+
+$planGateIndex = $planFunctionText.IndexOf('Resolve-RundotSyncPlanBase')
+$planAuthIndex = $planFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($planGateIndex -ge 0 -and $planAuthIndex -ge 0 -and $planGateIndex -lt $planAuthIndex) `
     "the no-BASE gate should be consulted before requesting Studio authentication"
 
 # A destination that cannot succeed must be refused before authenticating too,
 # or a doomed run still prompts for credentials (and can block on a paste).
-$preflightIndex = $syncCliSource.IndexOf('Assert-RundotSyncInitDestination')
+$initFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncInit'
 Assert-True `
-    ($preflightIndex -ge 0 -and $authIndex -ge 0 -and $preflightIndex -lt $authIndex) `
+    (-not [string]::IsNullOrEmpty($initFunctionText)) `
+    "the CLI must define Invoke-SyncInit"
+
+$preflightIndex = $initFunctionText.IndexOf('Assert-RundotSyncInitDestination')
+$initAuthIndex = $initFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($preflightIndex -ge 0 -and $initAuthIndex -ge 0 -and $preflightIndex -lt $initAuthIndex) `
     "the Init destination pre-flight should run before requesting authentication"
 
 
