@@ -117,5 +117,7 @@ only the complete live file and returns `$null` when that file is missing.
 Local inventory (`Get-LocalManifest`) records `localDetectedKind` from
 bytes. The API `encoding` maps to `remoteKind` (`utf8` or `base64` →
 `binary`) separately. Same-path text ↔ binary is an unsupported kind
-change, not a normal upload. The classifier that consumes that helper
-lands in a later issue.
+change, not a normal upload: the classifier
+([classifier.md](classifier.md)) reports a text ↔ binary change with
+differing content as `conflict` with `KindChange = $true`, and keeps a
+hash-equal one as a no-op with a metadata warning.
