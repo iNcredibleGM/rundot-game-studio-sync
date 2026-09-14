@@ -1,5 +1,6 @@
 # Fail if product PowerShell grows Studio write helpers.
-# Scan only game-studio-export.ps1 and lib/**/*.ps1 — never this file or markdown.
+# Scan only game-studio-sync.ps1, game-studio-export.ps1, and lib/**/*.ps1 —
+# never this file or markdown.
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 
@@ -10,6 +11,13 @@ Assert-True (Test-Path $exporterPath) "game-studio-export.ps1 must exist"
 
 if (Test-Path $exporterPath) {
     $productFiles += Get-Item $exporterPath
+}
+
+$syncCliPath = Join-Path $repoRoot "game-studio-sync.ps1"
+Assert-True (Test-Path $syncCliPath) "game-studio-sync.ps1 must exist"
+
+if (Test-Path $syncCliPath) {
+    $productFiles += Get-Item $syncCliPath
 }
 
 $libRoot = Join-Path $repoRoot "lib"

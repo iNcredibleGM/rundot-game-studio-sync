@@ -661,6 +661,25 @@ function Format-RundotSyncAdoptReport {
     return ($lines.ToArray() -join "`n")
 }
 
+function Assert-RundotSyncAdoptDestination {
+    # Adopt must not silently replace an existing verified BASE with a weaker
+    # one built from an unproven tree.
+    param(
+        [Parameter(Mandatory)]
+        [string]$LocalDir
+    )
+
+    $existingBase = Read-BaseManifest -WorkspaceRoot $LocalDir
+    if ($null -ne $existingBase) {
+        throw [System.InvalidOperationException]::new(
+            "Init -InitMode Adopt requires a tree that is not already initialized.`n" +
+            "This workspace already has a BASE manifest. Adopting again would " +
+            "replace its verified shared state with a weaker one.`n`n" +
+            "Use -Command Plan to inspect this workspace instead."
+        )
+    }
+}
+
 function Initialize-RundotSyncByAdopt {
     param(
         [Parameter(Mandatory)]
@@ -676,16 +695,7 @@ function Initialize-RundotSyncByAdopt {
         [hashtable]$Headers
     )
 
-    # Adopt must not silently replace an existing verified BASE with a weaker
-    # one built from an unproven tree.
-    $existingBase = Read-BaseManifest -WorkspaceRoot $LocalDir
-    if ($null -ne $existingBase) {
-        throw [System.InvalidOperationException]::new(
-            "Init -InitMode Adopt requires a tree that is not already initialized.`n" +
-            "This workspace already has a BASE manifest. Adopting again would " +
-            "replace its verified shared state with a weaker one."
-        )
-    }
+    Assert-RundotSyncAdoptDestination -LocalDir $LocalDir
 
     Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $LocalDir
 
