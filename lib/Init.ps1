@@ -5,7 +5,7 @@
 # is GET-only: nothing in this file mutates Studio.
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
-# RemoteApi.ps1, and Snapshot.ps1 first.
+# Manifest.ps1, RemoteApi.ps1, and Snapshot.ps1 first.
 
 function Get-RundotSyncInitAllowedRootMetadata {
     # The only top-level entries an otherwise-empty destination may contain.
@@ -438,4 +438,306 @@ function Initialize-RundotSyncFromRemote {
         -LocalDir $LocalDir `
         -ProjectId $ProjectId `
         -Snapshot $snapshot
+}
+
+# ----------------------------------------------------------------------------
+# Adopt
+#
+# Attach sync metadata to a tree that already exists. Adopt cannot know which
+# side a difference came from, so only exact path+hash agreement becomes BASE.
+# Everything else is unresolved and is reported, never recorded: a BASE entry
+# is a claim that LOCAL and REMOTE agree, and Adopt has not proven that.
+# ----------------------------------------------------------------------------
+
+$script:RundotSyncAdoptIdentical = 'Identical'
+$script:RundotSyncAdoptConflict = 'Conflict'
+$script:RundotSyncAdoptLocalOnly = 'LocalOnly'
+$script:RundotSyncAdoptRemoteOnly = 'RemoteOnly'
+$script:RundotSyncAdoptIgnoredRemote = 'IgnoredRemote'
+
+function Get-RundotSyncAdoptComparisons {
+    param(
+        [Parameter(Mandatory)]
+        $LocalManifest,
+
+        [Parameter(Mandatory)]
+        $Snapshot
+    )
+
+    if ($LocalManifest -isnot [System.Collections.IDictionary]) {
+        throw [System.InvalidOperationException]::new(
+            "Local manifest is missing; Adopt cannot compare LOCAL and REMOTE."
+        )
+    }
+
+    $remoteFiles = $Snapshot.Files
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,bool]' (
+        [System.StringComparer]::Ordinal
+    )
+
+    # LOCAL side first, so the ordering is stable and local diagnostics win.
+    foreach ($path in @($LocalManifest.Keys)) {
+        $canonical = [string]$path
+        $seen[$canonical] = $true
+
+        $localEntry = $LocalManifest[$path]
+        $localSha = [string]$localEntry.Sha256
+
+        if (-not $remoteFiles.Contains($canonical)) {
+            $rows.Add([pscustomobject]@{
+                Path         = $canonical
+                Status       = $script:RundotSyncAdoptLocalOnly
+                LocalSha256  = $localSha
+                RemoteSha256 = $null
+                LocalEntry   = $localEntry
+                RemoteEntry  = $null
+            })
+            continue
+        }
+
+        $remoteEntry = $remoteFiles[$canonical]
+        $remoteSha = [string](Get-BaseFileEntryProperty `
+            -Entry $remoteEntry `
+            -Names @('Sha256', 'sha256'))
+
+        $status = $script:RundotSyncAdoptConflict
+        if ([string]::Equals($localSha, $remoteSha, [System.StringComparison]::Ordinal)) {
+            $status = $script:RundotSyncAdoptIdentical
+        }
+
+        $rows.Add([pscustomobject]@{
+            Path         = $canonical
+            Status       = $status
+            LocalSha256  = $localSha
+            RemoteSha256 = $remoteSha
+            LocalEntry   = $localEntry
+            RemoteEntry  = $remoteEntry
+        })
+    }
+
+    # REMOTE side. An ignored or sync-state path is never a download
+    # candidate, so it is reported as ignored rather than as a missing local
+    # file the user should fetch.
+    foreach ($path in @(Get-RundotSyncSnapshotFilePaths -Snapshot $Snapshot)) {
+        if ($seen.ContainsKey($path)) {
+            continue
+        }
+
+        $remoteEntry = $remoteFiles[$path]
+        $remoteSha = [string](Get-BaseFileEntryProperty `
+            -Entry $remoteEntry `
+            -Names @('Sha256', 'sha256'))
+
+        $status = $script:RundotSyncAdoptRemoteOnly
+        if (Test-IgnoredSyncPath -CanonicalPath $path) {
+            $status = $script:RundotSyncAdoptIgnoredRemote
+        }
+
+        $rows.Add([pscustomobject]@{
+            Path         = $path
+            Status       = $status
+            LocalSha256  = $null
+            RemoteSha256 = $remoteSha
+            LocalEntry   = $null
+            RemoteEntry  = $remoteEntry
+        })
+    }
+
+    return $rows.ToArray()
+}
+
+function Format-RundotSyncShortHash {
+    param($Value)
+
+    $text = [string]$Value
+    if ([string]::IsNullOrEmpty($text)) {
+        return '<none>'
+    }
+
+    if ($text.Length -le 16) {
+        return $text
+    }
+
+    return ($text.Substring(0, 8) + '...' + $text.Substring($text.Length - 4))
+}
+
+function Format-RundotSyncAdoptReport {
+    param(
+        [Parameter(Mandatory)]
+        $Comparisons,
+
+        [Parameter(Mandatory)]
+        [int]$BaseFileCount
+    )
+
+    $identical = New-Object 'System.Collections.Generic.List[object]'
+    $conflicts = New-Object 'System.Collections.Generic.List[object]'
+    $localOnly = New-Object 'System.Collections.Generic.List[object]'
+    $remoteOnly = New-Object 'System.Collections.Generic.List[object]'
+    $ignored = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($row in @($Comparisons)) {
+        switch ([string]$row.Status) {
+            $script:RundotSyncAdoptIdentical { [void]$identical.Add($row) }
+            $script:RundotSyncAdoptConflict { [void]$conflicts.Add($row) }
+            $script:RundotSyncAdoptLocalOnly { [void]$localOnly.Add($row) }
+            $script:RundotSyncAdoptRemoteOnly { [void]$remoteOnly.Add($row) }
+            $script:RundotSyncAdoptIgnoredRemote { [void]$ignored.Add($row) }
+        }
+    }
+
+    $total = @($Comparisons).Count
+    $unresolved = $conflicts.Count + $localOnly.Count + $remoteOnly.Count + $ignored.Count
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('Init Adopt unresolved paths')
+    [void]$lines.Add('===========================')
+    [void]$lines.Add(
+        ('IDENTICAL (BASE): {0}      CONFLICT: {1}      LOCAL-ONLY: {2}' -f `
+            $identical.Count, $conflicts.Count, $localOnly.Count)
+    )
+    [void]$lines.Add(
+        ('REMOTE-ONLY: {0}            IGNORED: {1}' -f $remoteOnly.Count, $ignored.Count)
+    )
+
+    if ($conflicts.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('CONFLICT')
+        foreach ($row in $conflicts) {
+            [void]$lines.Add(
+                ('  {0}  local={1}  remote={2}' -f `
+                    $row.Path,
+                    (Format-RundotSyncShortHash -Value $row.LocalSha256),
+                    (Format-RundotSyncShortHash -Value $row.RemoteSha256))
+            )
+        }
+    }
+
+    if ($localOnly.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('LOCAL-ONLY')
+        foreach ($row in $localOnly) {
+            [void]$lines.Add(
+                ('  {0}  local={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.LocalSha256))
+            )
+        }
+    }
+
+    if ($remoteOnly.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('REMOTE-ONLY')
+        foreach ($row in $remoteOnly) {
+            [void]$lines.Add(
+                ('  {0}  remote={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.RemoteSha256))
+            )
+        }
+    }
+
+    if ($ignored.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('IGNORED (matches the default ignore set)')
+        foreach ($row in $ignored) {
+            [void]$lines.Add(('  {0}' -f $row.Path))
+        }
+    }
+
+    [void]$lines.Add('')
+    [void]$lines.Add(
+        ('BASE records only path+hash-identical entries: {0} of {1} paths.' -f `
+            $BaseFileCount, $total)
+    )
+
+    if ($unresolved -gt 0) {
+        [void]$lines.Add('Every path listed above is unresolved; it is not evidence of a safe sync direction.')
+    }
+
+    if ($BaseFileCount -eq 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('WARNING: no proven-identical paths. Synchronization direction is untrusted for every path.')
+    }
+
+    return ($lines.ToArray() -join "`n")
+}
+
+function Initialize-RundotSyncByAdopt {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LocalDir,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+
+    # Adopt must not silently replace an existing verified BASE with a weaker
+    # one built from an unproven tree.
+    $existingBase = Read-BaseManifest -WorkspaceRoot $LocalDir
+    if ($null -ne $existingBase) {
+        throw [System.InvalidOperationException]::new(
+            "Init -InitMode Adopt requires a tree that is not already initialized.`n" +
+            "This workspace already has a BASE manifest. Adopting again would " +
+            "replace its verified shared state with a weaker one."
+        )
+    }
+
+    Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $LocalDir
+
+    $localManifest = Get-LocalManifest -WorkspaceRoot $LocalDir
+
+    $snapshot = Get-StableRemoteSnapshot `
+        -WorkspaceRoot $LocalDir `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers
+
+    $comparisons = @(
+        Get-RundotSyncAdoptComparisons `
+            -LocalManifest $localManifest `
+            -Snapshot $snapshot
+    )
+
+    # BASE entries come from the LOCAL identity, because the identical hash
+    # means LOCAL and REMOTE agree, and local diagnostics are byte-derived.
+    $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    foreach ($row in $comparisons) {
+        if ([string]$row.Status -ne $script:RundotSyncAdoptIdentical) {
+            continue
+        }
+
+        $localEntry = $row.LocalEntry
+        $files[[string]$row.Path] = [pscustomobject]@{
+            Sha256            = [string]$localEntry.Sha256
+            Size              = $localEntry.Size
+            LocalDetectedKind = $localEntry.LocalDetectedKind
+            LineEnding        = $localEntry.LineEnding
+            HasBom            = $localEntry.HasBom
+        }
+    }
+
+    $report = Format-RundotSyncAdoptReport `
+        -Comparisons $comparisons `
+        -BaseFileCount $files.Count
+
+    Save-BaseManifest `
+        -WorkspaceRoot $LocalDir `
+        -ProjectId $ProjectId `
+        -Files $files
+
+    Clear-RemoteSnapshotTemp -WorkspaceRoot $LocalDir
+
+    $unresolvedCount = @($comparisons).Count - $files.Count
+
+    return [pscustomobject]@{
+        BaseFileCount   = $files.Count
+        UnresolvedCount = $unresolvedCount
+        Comparisons     = $comparisons
+        Report          = $report
+    }
 }

@@ -15,6 +15,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
+. (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Init.ps1")
@@ -902,6 +903,344 @@ try {
 finally {
     if (Test-Path -LiteralPath $fromRemoteRoot) {
         Remove-Item -LiteralPath $fromRemoteRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# --------------------------------------------------------------------------
+# Init Adopt: attach metadata without claiming unproven agreement
+#
+# Only path+hash-identical entries may enter BASE. Everything else is
+# unresolved and is reported, never recorded as a safe sync direction.
+# --------------------------------------------------------------------------
+
+function New-FakeLocalManifestEntry {
+    param(
+        [string]$LiteralPath,
+        [string]$Kind = 'utf8'
+    )
+
+    $identity = Get-LocalFileIdentity -LiteralPath $LiteralPath
+    return [pscustomobject]@{
+        Sha256            = $identity.Sha256
+        Size              = $identity.Size
+        LocalDetectedKind = $identity.LocalDetectedKind
+        LineEnding        = $identity.LineEnding
+        HasBom            = $identity.HasBom
+    }
+}
+
+function Get-AdoptStatusFor {
+    param(
+        [object[]]$Comparisons,
+        [string]$Path
+    )
+
+    foreach ($row in @($Comparisons)) {
+        if ([string]::Equals([string]$row.Path, $Path, [System.StringComparison]::Ordinal)) {
+            return [string]$row.Status
+        }
+    }
+
+    return $null
+}
+
+$adoptRoot = Join-Path $env:TEMP ("rundot-init-adopt-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $adoptRoot | Out-Null
+
+try {
+    # ----------------------------------------------------------------------
+    # Comparison unit cases: the four required outcomes
+    # ----------------------------------------------------------------------
+
+    $unitDir = Join-Path $adoptRoot "unit"
+    New-Item -ItemType Directory -Path (Join-Path $unitDir "src") -Force | Out-Null
+    $sameFile = Join-Path $unitDir "src\same.ts"
+    $editedFile = Join-Path $unitDir "src\edited.ts"
+    $localOnlyFile = Join-Path $unitDir "notes.md"
+    [System.IO.File]::WriteAllBytes($sameFile, $initUtf8.GetBytes('aaa'))
+    [System.IO.File]::WriteAllBytes($editedFile, $initUtf8.GetBytes('local'))
+    [System.IO.File]::WriteAllBytes($localOnlyFile, $initUtf8.GetBytes('local-only'))
+
+    $unitLocal = @{
+        'src/same.ts'   = New-FakeLocalManifestEntry -LiteralPath $sameFile
+        'src/edited.ts' = New-FakeLocalManifestEntry -LiteralPath $editedFile
+        'notes.md'      = New-FakeLocalManifestEntry -LiteralPath $localOnlyFile
+    }
+
+    # Build a remote-side map with the same shape the snapshot produces.
+    function New-FakeRemoteIdentityEntry {
+        param(
+            [string]$StagingPath,
+            [string]$Encoding = 'utf8'
+        )
+
+        $identity = Get-LocalFileIdentity -LiteralPath $StagingPath
+        return New-FakeSnapshotEntry `
+            -StagingPath $StagingPath `
+            -Sha256 $identity.Sha256 `
+            -Size $identity.Size `
+            -Kind $identity.LocalDetectedKind `
+            -Encoding $Encoding
+    }
+
+    $unitStaging = Join-Path $adoptRoot "unit-staging"
+    New-Item -ItemType Directory -Path (Join-Path $unitStaging "src") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $unitStaging "dist") -Force | Out-Null
+    $remoteSame = Join-Path $unitStaging "src\same.ts"
+    $remoteEdited = Join-Path $unitStaging "src\edited.ts"
+    $remoteOnly = Join-Path $unitStaging "src\new.ts"
+    $remoteIgnored = Join-Path $unitStaging "dist\bundle.js"
+    $remoteSyncState = Join-Path $unitStaging "dist\shadow.ts"
+    [System.IO.File]::WriteAllBytes($remoteSame, $initUtf8.GetBytes('aaa'))
+    [System.IO.File]::WriteAllBytes($remoteEdited, $initUtf8.GetBytes('remote'))
+    [System.IO.File]::WriteAllBytes($remoteOnly, $initUtf8.GetBytes('remote-only'))
+    [System.IO.File]::WriteAllBytes($remoteIgnored, $initUtf8.GetBytes('ignored'))
+    [System.IO.File]::WriteAllBytes($remoteSyncState, $initUtf8.GetBytes('shadow'))
+
+    $unitRemote = @{
+        'src/same.ts'      = New-FakeRemoteIdentityEntry -StagingPath $remoteSame
+        'src/edited.ts'    = New-FakeRemoteIdentityEntry -StagingPath $remoteEdited
+        'src/new.ts'       = New-FakeRemoteIdentityEntry -StagingPath $remoteOnly
+        'dist/bundle.js'   = New-FakeRemoteIdentityEntry -StagingPath $remoteIgnored
+        '.rundot-sync/shadow.ts' = New-FakeRemoteIdentityEntry -StagingPath $remoteSyncState
+    }
+
+    $unitComparisons = @(
+        Get-RundotSyncAdoptComparisons `
+            -LocalManifest $unitLocal `
+            -Snapshot (New-FakeSnapshot -StagingRoot $unitStaging -Files $unitRemote)
+    )
+
+    Assert-Equal `
+        'Identical' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path 'src/same.ts') `
+        "identical path+hash must classify as Identical"
+    Assert-Equal `
+        'Conflict' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path 'src/edited.ts') `
+        "differing contents must classify as Conflict"
+    Assert-Equal `
+        'LocalOnly' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path 'notes.md') `
+        "a local-only path must classify as LocalOnly"
+    Assert-Equal `
+        'RemoteOnly' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path 'src/new.ts') `
+        "a remote-only path must classify as RemoteOnly"
+    Assert-Equal `
+        'IgnoredRemote' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path 'dist/bundle.js') `
+        "a remote path matching the default ignore set must not be RemoteOnly"
+    Assert-Equal `
+        'IgnoredRemote' `
+        (Get-AdoptStatusFor -Comparisons $unitComparisons -Path '.rundot-sync/shadow.ts') `
+        "a remote path inside .rundot-sync must never be a download candidate"
+
+    # LOCAL (3) union REMOTE (5), sharing src/same.ts and src/edited.ts -> 6.
+    Assert-Equal `
+        6 `
+        @($unitComparisons).Count `
+        "every path in LOCAL union REMOTE should get exactly one comparison row"
+
+    # A conflict row must carry both hashes so the report can show them.
+    $conflictRow = $null
+    foreach ($row in @($unitComparisons)) {
+        if ([string]$row.Path -eq 'src/edited.ts') { $conflictRow = $row }
+    }
+    Assert-True ($null -ne $conflictRow) "the conflict row should be present"
+    if ($null -ne $conflictRow) {
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $editedFile) `
+            $conflictRow.LocalSha256 `
+            "a conflict row should carry the local hash"
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $remoteEdited) `
+            $conflictRow.RemoteSha256 `
+            "a conflict row should carry the remote hash"
+        Assert-True `
+            ($conflictRow.LocalSha256 -ne $conflictRow.RemoteSha256) `
+            "a conflict must have genuinely different hashes"
+    }
+
+    # Identical is the only status that may enter BASE.
+    $baseCandidateCount = 0
+    foreach ($row in @($unitComparisons)) {
+        if ([string]$row.Status -eq 'Identical') { $baseCandidateCount++ }
+    }
+    Assert-Equal 1 $baseCandidateCount "only Identical rows may become BASE entries"
+
+    # ----------------------------------------------------------------------
+    # End-to-end Adopt against a real tree
+    # ----------------------------------------------------------------------
+
+    $adoptDir = Join-Path $adoptRoot "tree"
+    New-Item -ItemType Directory -Path (Join-Path $adoptDir "src") -Force | Out-Null
+    $adoptSame = Join-Path $adoptDir "src\same.ts"
+    $adoptEdited = Join-Path $adoptDir "src\edited.ts"
+    $adoptLocalOnly = Join-Path $adoptDir "notes.md"
+    [System.IO.File]::WriteAllBytes($adoptSame, $initUtf8.GetBytes("same`r`n"))
+    [System.IO.File]::WriteAllBytes($adoptEdited, $initUtf8.GetBytes('local'))
+    [System.IO.File]::WriteAllBytes($adoptLocalOnly, $initUtf8.GetBytes('notes'))
+
+    $adoptSameEntry = New-FakeRemoteListEntry @{
+        path = 'src/same.ts'; type = 'file'; size = 6; encoding = 'utf8'
+    }
+    $adoptEditedEntry = New-FakeRemoteListEntry @{
+        path = 'src/edited.ts'; type = 'file'; size = 6; encoding = 'utf8'
+    }
+    $adoptNewEntry = New-FakeRemoteListEntry @{
+        path = 'src/new.ts'; type = 'file'; size = 4; encoding = 'utf8'
+    }
+    $adoptIgnoredEntry = New-FakeRemoteListEntry @{
+        path = 'dist/bundle.js'; type = 'file'; size = 7; encoding = 'utf8'
+    }
+    $adoptManifest = New-FakeRemoteManifest -Files @(
+        $adoptSameEntry,
+        $adoptEditedEntry,
+        $adoptNewEntry,
+        $adoptIgnoredEntry
+    )
+
+    Reset-FakeRemote `
+        -Lists @($adoptManifest, $adoptManifest) `
+        -Files @{
+            'src/same.ts'    = [pscustomobject]@{ encoding = 'utf8'; content = "same`r`n" }
+            'src/edited.ts'  = [pscustomobject]@{ encoding = 'utf8'; content = 'remote' }
+            'src/new.ts'     = [pscustomobject]@{ encoding = 'utf8'; content = 'new!' }
+            'dist/bundle.js' = [pscustomobject]@{ encoding = 'utf8'; content = 'ignored' }
+        }
+
+    $adoptResult = Initialize-RundotSyncByAdopt `
+        -LocalDir $adoptDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 1 $adoptResult.BaseFileCount "Adopt should record only the identical path in BASE"
+    Assert-Equal 4 $adoptResult.UnresolvedCount "Adopt should report every unresolved path"
+
+    $adoptBase = Read-BaseManifest -WorkspaceRoot $adoptDir
+    Assert-True ($null -ne $adoptBase) "Adopt must write BASE"
+    if ($null -ne $adoptBase) {
+        Assert-BaseOwnership `
+            -Base $adoptBase `
+            -ProjectId 'proj-test-1' `
+            -WorkspaceRoot $adoptDir
+        Assert-True `
+            ($null -ne $adoptBase.files.'src/same.ts') `
+            "the identical path must be in BASE"
+        Assert-Null `
+            $adoptBase.files.'src/edited.ts' `
+            "a conflicting path must not be in BASE"
+        Assert-Null `
+            $adoptBase.files.'notes.md' `
+            "a local-only path must not be in BASE"
+        Assert-Null `
+            $adoptBase.files.'src/new.ts' `
+            "a remote-only path must not be in BASE"
+        Assert-Null `
+            $adoptBase.files.'dist/bundle.js' `
+            "an ignored remote path must not be in BASE"
+        Assert-Equal `
+            1 `
+            @($adoptBase.files.PSObject.Properties).Count `
+            "BASE must contain exactly the proven-identical entries"
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $adoptSame) `
+            $adoptBase.files.'src/same.ts'.sha256 `
+            "the Adopt BASE entry should hash the local bytes that were proven identical"
+        Assert-Equal `
+            'crlf' `
+            $adoptBase.files.'src/same.ts'.lineEnding `
+            "the Adopt BASE entry should keep byte-derived diagnostics"
+    }
+
+    # The report must name the unresolved paths so the user can act on them.
+    $report = [string]$adoptResult.Report
+    Assert-True ($report -match [regex]::Escape('src/edited.ts')) "the report should name a conflicting path"
+    Assert-True ($report -match [regex]::Escape('notes.md')) "the report should name a local-only path"
+    Assert-True ($report -match [regex]::Escape('src/new.ts')) "the report should name a remote-only path"
+    Assert-True ($report -match [regex]::Escape('dist/bundle.js')) "the report should name an ignored path"
+    Assert-True ($report -match '(?i)conflict') "the report should label conflicts"
+    Assert-True ($report -match '(?i)local-only') "the report should label local-only paths"
+    Assert-True ($report -match '(?i)remote-only') "the report should label remote-only paths"
+    Assert-True `
+        ($report -notmatch '(?i)bearer|test-token') `
+        "the Adopt report must never contain tokens"
+
+    # Adopt must not modify the local tree it attaches to.
+    Assert-Equal `
+        $initUtf8.GetBytes('local') `
+        ([System.IO.File]::ReadAllBytes($adoptEdited)) `
+        "Adopt must not rewrite a locally-edited file"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $adoptDir "src\new.ts"))) `
+        "Adopt must not download remote-only files into the tree"
+
+    # ----------------------------------------------------------------------
+    # Adopt with nothing provably identical is still honest, not silent
+    # ----------------------------------------------------------------------
+
+    $noMatchDir = Join-Path $adoptRoot "no-match"
+    New-Item -ItemType Directory -Path $noMatchDir -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $noMatchDir "only-local.ts"), $initUtf8.GetBytes('local'))
+    Reset-FakeRemote -Lists @($emptyManifest, $emptyManifest) -Files @{}
+
+    $noMatchResult = Initialize-RundotSyncByAdopt `
+        -LocalDir $noMatchDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 0 $noMatchResult.BaseFileCount "Adopt with no identical paths must record no BASE entries"
+    Assert-True `
+        ([string]$noMatchResult.Report -match '(?i)untrusted|no proven') `
+        "an all-unresolved Adopt must warn that direction is untrusted"
+
+    $noMatchBase = Read-BaseManifest -WorkspaceRoot $noMatchDir
+    Assert-True ($null -ne $noMatchBase) "Adopt should still write BASE when nothing is identical"
+    if ($null -ne $noMatchBase) {
+        Assert-Equal `
+            0 `
+            @($noMatchBase.files.PSObject.Properties).Count `
+            "an all-unresolved Adopt must produce a zero-entry BASE, not guesses"
+    }
+
+    # ----------------------------------------------------------------------
+    # Adopt refuses to discard an existing verified BASE
+    # ----------------------------------------------------------------------
+
+    $existingThrown = $null
+    try {
+        Initialize-RundotSyncByAdopt `
+            -LocalDir $adoptDir `
+            -ProjectId 'proj-test-1' `
+            -StudioOrigin 'https://example.test' `
+            -Headers $initHeaders | Out-Null
+    }
+    catch {
+        $existingThrown = $_.Exception
+    }
+    Assert-True ($null -ne $existingThrown) "Adopt must refuse a tree that already has a BASE"
+    if ($null -ne $existingThrown) {
+        Assert-True `
+            ($existingThrown.Message -match '(?i)already') `
+            "the existing-BASE refusal should say the workspace is already initialized"
+    }
+    $stillThere = Read-BaseManifest -WorkspaceRoot $adoptDir
+    if ($null -ne $stillThere) {
+        Assert-True `
+            ($null -ne $stillThere.files.'src/same.ts') `
+            "a refused Adopt must leave the existing BASE intact"
+    }
+    else {
+        Assert-True $false "a refused Adopt must leave the existing BASE intact"
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $adoptRoot) {
+        Remove-Item -LiteralPath $adoptRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
