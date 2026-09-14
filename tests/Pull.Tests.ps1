@@ -23,6 +23,8 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
+. (Join-Path $repoRoot "lib\Backup.ps1")
+. (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\Pull.ps1")
 
 $pullTestShaA = 'a' * 64
@@ -514,5 +516,645 @@ try {
 finally {
     if (Test-Path -LiteralPath $purityRoot) {
         Remove-Item -LiteralPath $purityRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# ==========================================================================
+# Apply, verify, and rollback
+#
+# These cases use real files on disk and a real stable-snapshot fixture, so a
+# local write is exercised end to end without any network access.
+# ==========================================================================
+
+$pullApplyUtf8 = New-Object System.Text.UTF8Encoding $false
+
+function New-PullTestWorkspace {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Root
+    )
+
+    $workspace = Join-Path $Root ("ws-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+    return $workspace
+}
+
+function Write-PullTestBytes {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [byte[]]$Bytes
+    )
+
+    $parent = Split-Path -Parent $LiteralPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+
+    [System.IO.File]::WriteAllBytes($LiteralPath, $Bytes)
+}
+
+function Get-PullTestBytes {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    return [System.IO.File]::ReadAllBytes($LiteralPath)
+}
+
+function New-PullTestLocalManifestEntry {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $identity = Get-LocalFileIdentity -LiteralPath $LiteralPath
+    return [pscustomobject]@{
+        Sha256            = $identity.Sha256
+        Size              = $identity.Size
+        LocalDetectedKind = $identity.LocalDetectedKind
+        LineEnding        = $identity.LineEnding
+        HasBom            = $identity.HasBom
+    }
+}
+
+function New-PullTestRemoteIdentityEntry {
+    param(
+        [Parameter(Mandatory)][string]$StagingPath,
+        [Parameter(Mandatory)][string]$WorkspaceStagingRoot,
+        [Parameter(Mandatory)][string]$CanonicalPath
+    )
+
+    $identity = Get-LocalFileIdentity -LiteralPath $StagingPath
+    return [pscustomobject]@{
+        Sha256            = $identity.Sha256
+        Size              = $identity.Size
+        LocalDetectedKind = $identity.LocalDetectedKind
+        LineEnding        = $identity.LineEnding
+        HasBom            = $identity.HasBom
+        RemoteKind        = $identity.LocalDetectedKind
+        Encoding          = $(if ($identity.LocalDetectedKind -eq 'binary') { 'base64' } else { 'utf8' })
+        StagingPath       = $StagingPath
+    }
+}
+
+function New-PullTestSnapshotFixture {
+    # A stable-snapshot-shaped object whose staged bytes are the REMOTE truth.
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceRoot,
+        [Parameter(Mandatory)][hashtable]$RemoteEntries
+    )
+
+    $stagingRoot = Join-Path $WorkspaceRoot ".rundot-sync\temp\remote-snapshot\1"
+    New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+
+    foreach ($path in @($RemoteEntries.Keys)) {
+        $staged = Join-Path $stagingRoot ($path.Replace('/', '\'))
+        $source = [string]$RemoteEntries[$path].StagingPath
+        $parent = Split-Path -Parent $staged
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        [System.IO.File]::Copy($source, $staged, $true)
+        $RemoteEntries[$path].StagingPath = $staged
+    }
+
+    return [pscustomobject]@{
+        Files                    = $RemoteEntries
+        RemoteManifestHashBefore = 'before'
+        RemoteManifestHashAfter  = 'after'
+        AttemptCount             = 1
+        StagingRoot              = $stagingRoot
+    }
+}
+
+function Get-PullTestBaseEntryForLocal {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $identity = Get-LocalFileIdentity -LiteralPath $LiteralPath
+    $entry = [pscustomobject]@{
+        sha256 = $identity.Sha256
+        size   = $identity.Size
+        kind   = $identity.LocalDetectedKind
+    }
+
+    if ($identity.LocalDetectedKind -eq 'utf8') {
+        $entry | Add-Member -NotePropertyName lineEnding -NotePropertyValue $identity.LineEnding
+        $entry | Add-Member -NotePropertyName hasBom -NotePropertyValue $identity.HasBom
+    }
+
+    return $entry
+}
+
+$pullApplyRoot = Join-Path $env:TEMP ("rundot-pull-apply-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $pullApplyRoot | Out-Null
+
+try {
+    # ----------------------------------------------------------------------
+    # Clean pull: remote-only change lands byte-for-byte, backed up first
+    # ----------------------------------------------------------------------
+
+    $cleanWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $cleanLocalBytes = $pullApplyUtf8.GetBytes("local text`n")
+    $cleanRemoteBytes = $pullApplyUtf8.GetBytes("remote text`n")
+    $cleanPath = Join-Path $cleanWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $cleanPath -Bytes $cleanLocalBytes
+
+    $cleanStagingSource = Join-Path $pullApplyRoot "clean-remote.ts"
+    Write-PullTestBytes -LiteralPath $cleanStagingSource -Bytes $cleanRemoteBytes
+
+    $cleanLocal = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $cleanPath) }
+    $cleanBase = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $cleanPath) }
+    $cleanRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry `
+            -StagingPath $cleanStagingSource `
+            -WorkspaceStagingRoot $cleanWorkspace `
+            -CanonicalPath 'src/a.ts')
+    }
+    $cleanSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $cleanWorkspace -RemoteEntries $cleanRemoteMap
+    $cleanSelection = Get-SyncPullSelection -Base $cleanBase -Local $cleanLocal -Remote $cleanSnapshot.Files
+
+    Assert-Equal 1 @($cleanSelection.Actions).Count "the clean fixture must yield one action"
+
+    $cleanResult = Invoke-RundotSyncPullApply `
+        -WorkspaceRoot $cleanWorkspace `
+        -Actions $cleanSelection.Actions `
+        -Local $cleanLocal `
+        -Remote $cleanSnapshot.Files `
+        -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $cleanWorkspace)
+
+    Assert-Equal 1 $cleanResult.Applied "a clean pull must apply its one action"
+    Assert-Equal `
+        $cleanRemoteBytes `
+        (Get-PullTestBytes -LiteralPath $cleanPath) `
+        "a clean pull must write the remote bytes exactly"
+    Assert-True `
+        (Test-Path -LiteralPath $cleanResult.BackupSet.Path -PathType Container) `
+        "a clean pull that overwrites must create a backup set"
+
+    $cleanBackedUp = Join-Path $cleanResult.BackupSet.Path "src\a.ts"
+    Assert-Equal `
+        $cleanLocalBytes `
+        (Get-PullTestBytes -LiteralPath $cleanBackedUp) `
+        "the overwritten original must be recoverable from the backup set"
+
+    # ----------------------------------------------------------------------
+    # Binary and zero-byte payloads are ordinary writes
+    # ----------------------------------------------------------------------
+
+    $binaryWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $binaryRemoteBytes = [byte[]](0xFF, 0xD8, 0xFF, 0x00, 0x01, 0x02)
+    $binaryStagingSource = Join-Path $pullApplyRoot "remote.png"
+    Write-PullTestBytes -LiteralPath $binaryStagingSource -Bytes $binaryRemoteBytes
+
+    $zeroLocalPath = Join-Path $binaryWorkspace "empty.ts"
+    Write-PullTestBytes -LiteralPath $zeroLocalPath -Bytes ($pullApplyUtf8.GetBytes('x'))
+    $zeroStagingSource = Join-Path $pullApplyRoot "remote-empty.ts"
+    Write-PullTestBytes -LiteralPath $zeroStagingSource -Bytes ([byte[]]@())
+
+    $binaryLocalMap = @{ 'empty.ts' = (New-PullTestLocalManifestEntry -LiteralPath $zeroLocalPath) }
+    # BASE must agree with LOCAL so the zero-byte file is a clean download
+    # rather than a conflict. The binary path is a genuine create.
+    $binaryBaseMap = @{ 'empty.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $zeroLocalPath) }
+    $binaryRemoteMap = @{
+        'public/logo.png' = (New-PullTestRemoteIdentityEntry -StagingPath $binaryStagingSource -WorkspaceStagingRoot $binaryWorkspace -CanonicalPath 'public/logo.png')
+        'empty.ts'        = (New-PullTestRemoteIdentityEntry -StagingPath $zeroStagingSource -WorkspaceStagingRoot $binaryWorkspace -CanonicalPath 'empty.ts')
+    }
+    $binarySnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $binaryWorkspace -RemoteEntries $binaryRemoteMap
+    $binarySelection = Get-SyncPullSelection -Base $binaryBaseMap -Local $binaryLocalMap -Remote $binarySnapshot.Files
+
+    $binaryResult = Invoke-RundotSyncPullApply `
+        -WorkspaceRoot $binaryWorkspace `
+        -Actions $binarySelection.Actions `
+        -Local $binaryLocalMap `
+        -Remote $binarySnapshot.Files `
+        -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $binaryWorkspace)
+
+    Assert-Equal 2 $binaryResult.Applied "a binary and a zero-byte file must both be applied"
+    Assert-Equal 1 $binaryResult.Created "the binary file is a create"
+    Assert-Equal 1 $binaryResult.Overwritten "the zero-byte file replaces an existing file"
+    Assert-Equal `
+        $binaryRemoteBytes `
+        (Get-PullTestBytes -LiteralPath (Join-Path $binaryWorkspace "public\logo.png")) `
+        "a binary payload must be written byte-for-byte"
+    Assert-Equal `
+        0 `
+        (Get-PullTestBytes -LiteralPath (Join-Path $binaryWorkspace "empty.ts")).Length `
+        "a zero-byte remote file must write zero bytes"
+
+    # ----------------------------------------------------------------------
+    # A pull with no actions writes nothing and creates no backup set
+    # ----------------------------------------------------------------------
+
+    $noopWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $noopResult = Invoke-RundotSyncPullApply `
+        -WorkspaceRoot $noopWorkspace `
+        -Actions @() `
+        -Local @{} `
+        -Remote @{} `
+        -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $noopWorkspace)
+
+    Assert-Equal 0 $noopResult.Applied "an empty action list must apply nothing"
+    Assert-Null $noopResult.BackupSet "an empty action list must not create a backup set"
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $noopWorkspace).Count `
+        "a no-op pull must not leave a backup set behind"
+
+    # ----------------------------------------------------------------------
+    # Backup ordering: the original is preserved before the destination changes
+    # ----------------------------------------------------------------------
+
+    $orderWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $orderOriginalBytes = $pullApplyUtf8.GetBytes("original`n")
+    $orderRemoteBytes = $pullApplyUtf8.GetBytes("pulled`n")
+    $orderPath = Join-Path $orderWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $orderPath -Bytes $orderOriginalBytes
+
+    $orderStagingSource = Join-Path $pullApplyRoot "order-remote.ts"
+    Write-PullTestBytes -LiteralPath $orderStagingSource -Bytes $orderRemoteBytes
+
+    $orderLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $orderPath) }
+    $orderBaseMap = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $orderPath) }
+    $orderRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $orderStagingSource -WorkspaceStagingRoot $orderWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $orderSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $orderWorkspace -RemoteEntries $orderRemoteMap
+    $orderSelection = Get-SyncPullSelection -Base $orderBaseMap -Local $orderLocalMap -Remote $orderSnapshot.Files
+
+    # Watch the destination: when the write happens, the backup must already
+    # hold the original bytes.
+    $script:PullTestBackupObservedBytes = $null
+    $realWrite = ${function:Invoke-RundotSyncPullWriteAction}
+    function Invoke-RundotSyncPullWriteAction {
+        param($Action, $WorkspaceRoot, $LocalFullPath, $RemoteMap)
+
+        foreach ($candidateSet in @(Get-RundotSyncBackupSets -WorkspaceRoot $WorkspaceRoot)) {
+            $observedBackup = Join-Path $candidateSet.Path ($Action.Path.Replace('/', '\'))
+            if (Test-Path -LiteralPath $observedBackup -PathType Leaf) {
+                $script:PullTestBackupObservedBytes = [System.IO.File]::ReadAllBytes($observedBackup)
+            }
+        }
+
+        & $realWrite `
+            -Action $Action `
+            -WorkspaceRoot $WorkspaceRoot `
+            -LocalFullPath $LocalFullPath `
+            -RemoteMap $RemoteMap
+    }
+
+    try {
+        [void](Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $orderWorkspace `
+            -Actions $orderSelection.Actions `
+            -Local $orderLocalMap `
+            -Remote $orderSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $orderWorkspace))
+    }
+    finally {
+        Set-Item -Path function:Invoke-RundotSyncPullWriteAction -Value $realWrite
+    }
+
+    Assert-Equal `
+        $orderOriginalBytes `
+        $script:PullTestBackupObservedBytes `
+        "the original must be backed up before the destination is overwritten"
+    Assert-Equal `
+        $orderRemoteBytes `
+        (Get-PullTestBytes -LiteralPath $orderPath) `
+        "the write must still land the remote bytes"
+
+    # ----------------------------------------------------------------------
+    # Backup failure aborts before any overwrite
+    # ----------------------------------------------------------------------
+
+    $backupFailWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $backupFailOriginalBytes = $pullApplyUtf8.GetBytes("must survive`n")
+    $backupFailPath = Join-Path $backupFailWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $backupFailPath -Bytes $backupFailOriginalBytes
+
+    $backupFailStaging = Join-Path $pullApplyRoot "backup-fail-remote.ts"
+    Write-PullTestBytes -LiteralPath $backupFailStaging -Bytes ($pullApplyUtf8.GetBytes("would overwrite`n"))
+
+    $backupFailLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $backupFailPath) }
+    $backupFailBaseMap = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $backupFailPath) }
+    $backupFailRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $backupFailStaging -WorkspaceStagingRoot $backupFailWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $backupFailSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $backupFailWorkspace -RemoteEntries $backupFailRemoteMap
+    $backupFailSelection = Get-SyncPullSelection -Base $backupFailBaseMap -Local $backupFailLocalMap -Remote $backupFailSnapshot.Files
+
+    $realBackupCopy = ${function:Copy-RundotSyncBackupFile}
+    function Copy-RundotSyncBackupFile {
+        param($SourcePath, $DestinationPath)
+        throw [System.InvalidOperationException]::new("Injected backup failure.")
+    }
+
+    $backupFailThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $backupFailWorkspace `
+            -Actions $backupFailSelection.Actions `
+            -Local $backupFailLocalMap `
+            -Remote $backupFailSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $backupFailWorkspace) | Out-Null
+    }
+    catch {
+        $backupFailThrew = $_.Exception
+    }
+    finally {
+        Set-Item -Path function:Copy-RundotSyncBackupFile -Value $realBackupCopy
+    }
+
+    Assert-True ($null -ne $backupFailThrew) "a backup failure must abort the pull"
+    Assert-Equal `
+        $backupFailOriginalBytes `
+        (Get-PullTestBytes -LiteralPath $backupFailPath) `
+        "a backup failure must leave the local file untouched"
+    Assert-True `
+        ((Get-Command Copy-RundotSyncBackupFile -CommandType Function).Definition -match 'Invoke-RundotSyncVerifiedCopy') `
+        "Pull.Tests must restore the real Copy-RundotSyncBackupFile after injecting a failure"
+
+    # ----------------------------------------------------------------------
+    # Partial write rolls back: overwritten files restored, created files gone
+    # ----------------------------------------------------------------------
+
+    $rollbackWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $rollAOriginal = $pullApplyUtf8.GetBytes("keep A`n")
+    $rollBOriginal = $pullApplyUtf8.GetBytes("keep B`n")
+    $rollAPath = Join-Path $rollbackWorkspace "src\a.ts"
+    $rollBPath = Join-Path $rollbackWorkspace "src\b.ts"
+    Write-PullTestBytes -LiteralPath $rollAPath -Bytes $rollAOriginal
+    Write-PullTestBytes -LiteralPath $rollBPath -Bytes $rollBOriginal
+
+    $rollAStaging = Join-Path $pullApplyRoot "roll-a-remote.ts"
+    $rollBStaging = Join-Path $pullApplyRoot "roll-b-remote.ts"
+    $rollNewStaging = Join-Path $pullApplyRoot "roll-new-remote.ts"
+    Write-PullTestBytes -LiteralPath $rollAStaging -Bytes ($pullApplyUtf8.GetBytes("new A`n"))
+    Write-PullTestBytes -LiteralPath $rollBStaging -Bytes ($pullApplyUtf8.GetBytes("new B`n"))
+    Write-PullTestBytes -LiteralPath $rollNewStaging -Bytes ($pullApplyUtf8.GetBytes("brand new`n"))
+
+    $rollLocalMap = @{
+        'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $rollAPath)
+        'src/b.ts' = (New-PullTestLocalManifestEntry -LiteralPath $rollBPath)
+    }
+    # BASE agrees with LOCAL for the two existing files so they are clean
+    # downloads (overwrites). src/new/c.ts has no local file, so it is a create.
+    $rollBaseMap = @{
+        'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $rollAPath)
+        'src/b.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $rollBPath)
+    }
+    $rollRemoteMap = @{
+        'src/a.ts'     = (New-PullTestRemoteIdentityEntry -StagingPath $rollAStaging -WorkspaceStagingRoot $rollbackWorkspace -CanonicalPath 'src/a.ts')
+        'src/b.ts'     = (New-PullTestRemoteIdentityEntry -StagingPath $rollBStaging -WorkspaceStagingRoot $rollbackWorkspace -CanonicalPath 'src/b.ts')
+        'src/new/c.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $rollNewStaging -WorkspaceStagingRoot $rollbackWorkspace -CanonicalPath 'src/new/c.ts')
+    }
+    $rollSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $rollbackWorkspace -RemoteEntries $rollRemoteMap
+    $rollSelection = Get-SyncPullSelection -Base $rollBaseMap -Local $rollLocalMap -Remote $rollSnapshot.Files
+    Assert-Equal 3 @($rollSelection.Actions).Count "the rollback fixture must yield three actions"
+
+    # Fail the second write, so one overwrite has already happened.
+    $script:PullTestWriteCalls = 0
+    $realWriteForRollback = ${function:Invoke-RundotSyncPullWriteAction}
+    function Invoke-RundotSyncPullWriteAction {
+        param($Action, $WorkspaceRoot, $LocalFullPath, $RemoteMap)
+
+        $script:PullTestWriteCalls++
+        if ($script:PullTestWriteCalls -eq 2) {
+            throw [System.InvalidOperationException]::new("Injected write failure.")
+        }
+
+        & $realWriteForRollback `
+            -Action $Action `
+            -WorkspaceRoot $WorkspaceRoot `
+            -LocalFullPath $LocalFullPath `
+            -RemoteMap $RemoteMap
+    }
+
+    $rollThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $rollbackWorkspace `
+            -Actions $rollSelection.Actions `
+            -Local $rollLocalMap `
+            -Remote $rollSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $rollbackWorkspace) | Out-Null
+    }
+    catch {
+        $rollThrew = $_.Exception
+    }
+    finally {
+        Set-Item -Path function:Invoke-RundotSyncPullWriteAction -Value $realWriteForRollback
+    }
+
+    Assert-True ($null -ne $rollThrew) "a write failure must abort the pull"
+    Assert-Equal `
+        $rollAOriginal `
+        (Get-PullTestBytes -LiteralPath $rollAPath) `
+        "a partial write must restore the overwritten file A"
+    Assert-Equal `
+        $rollBOriginal `
+        (Get-PullTestBytes -LiteralPath $rollBPath) `
+        "a partial write must leave the not-yet-written file B untouched"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $rollbackWorkspace "src\new\c.ts"))) `
+        "a partial write must not leave a half-created file"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $rollbackWorkspace "src\new"))) `
+        "a partial write must prune a directory it created"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $rollbackWorkspace "src") -PathType Container) `
+        "rollback must not delete a pre-existing directory"
+    Assert-Equal `
+        ($pullApplyUtf8.GetBytes("new A`n")) `
+        (Get-PullTestBytes -LiteralPath $rollAStaging) `
+        "rollback must not consume or alter the staged remote source"
+    Assert-Equal `
+        $rollBOriginal `
+        (Get-PullTestBytes -LiteralPath $rollBPath) `
+        "rollback verification: file B must still hold its original bytes"
+
+    $rollBackupSets = @(Get-RundotSyncBackupSets -WorkspaceRoot $rollbackWorkspace)
+    Assert-Equal 1 $rollBackupSets.Count "a rolled-back pull still keeps the backup set it made"
+    Assert-Equal `
+        $rollAOriginal `
+        (Get-PullTestBytes -LiteralPath (Join-Path $rollBackupSets[0].Path "src\a.ts")) `
+        "the backup set must still hold the overwritten original after a rollback"
+
+    # ----------------------------------------------------------------------
+    # Verify failure: wrong bytes for the action must abort and roll back
+    # ----------------------------------------------------------------------
+
+    $verifyWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $verifyOriginal = $pullApplyUtf8.GetBytes("verify original`n")
+    $verifyPath = Join-Path $verifyWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $verifyPath -Bytes $verifyOriginal
+
+    $verifyStaging = Join-Path $pullApplyRoot "verify-remote.ts"
+    Write-PullTestBytes -LiteralPath $verifyStaging -Bytes ($pullApplyUtf8.GetBytes("verify remote`n"))
+
+    $verifyLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $verifyPath) }
+    $verifyBaseMap = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $verifyPath) }
+    $verifyRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $verifyStaging -WorkspaceStagingRoot $verifyWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $verifySnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $verifyWorkspace -RemoteEntries $verifyRemoteMap
+    $verifySelection = Get-SyncPullSelection -Base $verifyBaseMap -Local $verifyLocalMap -Remote $verifySnapshot.Files
+
+    # Corrupt the action's expected hash so the post-write verification fails.
+    $verifyTampered = @(
+        [pscustomobject]@{
+            Path              = [string]$verifySelection.Actions[0].Path
+            Status            = [string]$verifySelection.Actions[0].Status
+            Kind              = [string]$verifySelection.Actions[0].Kind
+            LocalSha256       = $verifySelection.Actions[0].LocalSha256
+            RemoteSha256      = $pullTestShaC
+            RemoteStagingPath = [string]$verifySelection.Actions[0].RemoteStagingPath
+            IsOverwrite       = [bool]$verifySelection.Actions[0].IsOverwrite
+        }
+    )
+
+    $verifyThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $verifyWorkspace `
+            -Actions $verifyTampered `
+            -Local $verifyLocalMap `
+            -Remote $verifySnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $verifyWorkspace) | Out-Null
+    }
+    catch {
+        $verifyThrew = $_.Exception
+    }
+
+    Assert-True ($null -ne $verifyThrew) "a verification mismatch must abort the pull"
+    Assert-Equal `
+        $verifyOriginal `
+        (Get-PullTestBytes -LiteralPath $verifyPath) `
+        "a verification failure must restore the original bytes"
+
+    # ----------------------------------------------------------------------
+    # Concurrent edit: a file changed after the manifest was captured aborts
+    # ----------------------------------------------------------------------
+
+    $raceWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $raceOriginal = $pullApplyUtf8.GetBytes("race original`n")
+    $racePath = Join-Path $raceWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $racePath -Bytes $raceOriginal
+
+    $raceStaging = Join-Path $pullApplyRoot "race-remote.ts"
+    Write-PullTestBytes -LiteralPath $raceStaging -Bytes ($pullApplyUtf8.GetBytes("race remote`n"))
+
+    $raceLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $racePath) }
+    $raceBaseMap = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $racePath) }
+    $raceRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $raceStaging -WorkspaceStagingRoot $raceWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $raceSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $raceWorkspace -RemoteEntries $raceRemoteMap
+    $raceSelection = Get-SyncPullSelection -Base $raceBaseMap -Local $raceLocalMap -Remote $raceSnapshot.Files
+
+    # The user edits the file between the manifest capture and the pull.
+    $raceEditedBytes = $pullApplyUtf8.GetBytes("edited after scan`n")
+    Write-PullTestBytes -LiteralPath $racePath -Bytes $raceEditedBytes
+
+    $raceThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $raceWorkspace `
+            -Actions $raceSelection.Actions `
+            -Local $raceLocalMap `
+            -Remote $raceSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $raceWorkspace) | Out-Null
+    }
+    catch {
+        $raceThrew = $_.Exception
+    }
+
+    Assert-True ($null -ne $raceThrew) "a concurrent local edit must abort the pull"
+    if ($null -ne $raceThrew) {
+        Assert-True `
+            (([string]$raceThrew.Message) -match '(?i)changed since') `
+            "the concurrent-edit refusal should say the local file changed since it was scanned"
+    }
+    Assert-Equal `
+        $raceEditedBytes `
+        (Get-PullTestBytes -LiteralPath $racePath) `
+        "a concurrent edit must never be overwritten by a pull"
+
+    # Force never disables the concurrent-edit guard.
+    $raceForcedThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $raceWorkspace `
+            -Actions $raceSelection.Actions `
+            -Local $raceLocalMap `
+            -Remote $raceSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $raceWorkspace) | Out-Null
+    }
+    catch {
+        $raceForcedThrew = $_.Exception
+    }
+    Assert-True ($null -ne $raceForcedThrew) "the concurrent-edit guard must not be skippable by force"
+    Assert-Equal `
+        $raceEditedBytes `
+        (Get-PullTestBytes -LiteralPath $racePath) `
+        "force must not overwrite a concurrently edited file"
+
+    # ----------------------------------------------------------------------
+    # Writes are atomic and never leave a destination tmp
+    # ----------------------------------------------------------------------
+
+    $atomicWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $atomicStaging = Join-Path $pullApplyRoot "atomic-remote.ts"
+    Write-PullTestBytes -LiteralPath $atomicStaging -Bytes ($pullApplyUtf8.GetBytes("atomic`n"))
+    $atomicRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $atomicStaging -WorkspaceStagingRoot $atomicWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $atomicSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $atomicWorkspace -RemoteEntries $atomicRemoteMap
+    $atomicSelection = Get-SyncPullSelection -Base @{} -Local @{} -Remote $atomicSnapshot.Files
+
+    [void](Invoke-RundotSyncPullApply `
+        -WorkspaceRoot $atomicWorkspace `
+        -Actions $atomicSelection.Actions `
+        -Local @{} `
+        -Remote $atomicSnapshot.Files `
+        -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $atomicWorkspace))
+
+    $atomicPath = Join-Path $atomicWorkspace "src\a.ts"
+    Assert-True (Test-Path -LiteralPath $atomicPath -PathType Leaf) "an atomic write must land the destination"
+    Assert-True `
+        (-not (Test-Path -LiteralPath ($atomicPath + '.tmp'))) `
+        "an atomic write must leave no destination temp file"
+
+    # A pull that cannot represent a path aborts before writing anything.
+    $representWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $representStaging = Join-Path $pullApplyRoot "represent-remote.ts"
+    Write-PullTestBytes -LiteralPath $representStaging -Bytes ($pullApplyUtf8.GetBytes("x`n"))
+    $representActions = @(
+        [pscustomobject]@{
+            Path              = 'a<b>.ts'
+            Status            = 'download'
+            Kind              = 'utf8'
+            LocalSha256       = $null
+            RemoteSha256      = (Get-FileSha256Hex -LiteralPath $representStaging)
+            RemoteStagingPath = $representStaging
+            IsOverwrite       = $false
+        }
+    )
+
+    $representThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $representWorkspace `
+            -Actions $representActions `
+            -Local @{} `
+            -Remote @{} `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $representWorkspace) | Out-Null
+    }
+    catch {
+        $representThrew = $_.Exception
+    }
+    Assert-True ($null -ne $representThrew) "an unrepresentable path must abort before any write"
+}
+finally {
+    if (Test-Path -LiteralPath $pullApplyRoot) {
+        Remove-Item -LiteralPath $pullApplyRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
