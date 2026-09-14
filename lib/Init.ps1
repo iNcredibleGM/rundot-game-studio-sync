@@ -348,7 +348,6 @@ function Import-RundotRemoteSnapshot {
         # snapshot. This is the step that makes staging == REMOTE a checked
         # claim rather than an assumption.
         $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-        $lineEndingByName = @{}
 
         foreach ($path in $paths) {
             $localPath = ConvertTo-LocalFullPath `

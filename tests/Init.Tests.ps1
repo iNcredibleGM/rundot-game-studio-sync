@@ -160,6 +160,33 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $leftoverSync ".rundot-sync\temp") -Force | Out-Null
     Assert-RundotSyncInitDestination -LocalDir $leftoverSync
 
+    # The tolerance is name-based, so a .rundot-sync that is a *file* rather
+    # than a directory is also skipped rather than reported as unexpected dirt.
+    $syncAsFile = Join-Path $initRoot "sync-as-file"
+    New-Item -ItemType Directory -Path $syncAsFile -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $syncAsFile ".rundot-sync"), [byte[]](0x61))
+    Assert-RundotSyncInitDestination -LocalDir $syncAsFile
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncInitUnexpectedEntries -LocalDir $syncAsFile).Count `
+        "a .rundot-sync file must be skipped, not reported as unexpected"
+
+    # A relative LocalDir is resolved and accepted, since the CLI passes what
+    # the user typed.
+    $relativeDir = "rundot-relative-dest-" + [Guid]::NewGuid().ToString("N")
+    $relativeFull = Join-Path (Get-Location).Path $relativeDir
+    try {
+        Assert-RundotSyncInitDestination -LocalDir $relativeDir
+        Assert-True `
+            (Test-Path -LiteralPath $relativeFull -PathType Container) `
+            "a relative init destination should be created at the resolved path"
+    }
+    finally {
+        if (Test-Path -LiteralPath $relativeFull) {
+            Remove-Item -LiteralPath $relativeFull -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Unexpected project content refuses, names the offender, and points at Adopt.
     $dirtyDir = Join-Path $initRoot "dirty"
     New-Item -ItemType Directory -Path (Join-Path $dirtyDir "src") -Force | Out-Null
@@ -899,6 +926,87 @@ try {
     Assert-True `
         ((Get-Command Save-BaseManifest -CommandType Function).Definition -match 'base-manifest\.json\.tmp') `
         "Init.Tests must restore the real Save-BaseManifest after injecting a failure"
+
+    # ----------------------------------------------------------------------
+    # Reserved-path precision: refuse only what would actually be clobbered
+    #
+    # The collision check keys on the leading segment of a remote path and on
+    # which metadata actually exists locally. These two cases are a matched
+    # pair proving it is neither too broad nor too narrow.
+    # ----------------------------------------------------------------------
+
+    # A remote .gitignore into a destination that has none is ordinary project
+    # content, and must be promoted.
+    $noIgnoreDir = Join-Path $fromRemoteRoot "promote-gitignore"
+    $noIgnoreStaging = New-FakeStagingRoot -LocalDir $noIgnoreDir
+    $noIgnoreStaged = Join-Path $noIgnoreStaging ".gitignore"
+    [System.IO.File]::WriteAllBytes($noIgnoreStaged, [byte[]](0x61))
+    $noIgnoreSnapshot = New-FakeSnapshot -StagingRoot $noIgnoreStaging -Files @{
+        '.gitignore' = New-FakeSnapshotEntry `
+            -StagingPath $noIgnoreStaged `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $noIgnoreStaged) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $noIgnoreResult = Import-RundotRemoteSnapshot `
+        -LocalDir $noIgnoreDir `
+        -ProjectId 'proj-test-1' `
+        -Snapshot $noIgnoreSnapshot
+
+    Assert-Equal 1 $noIgnoreResult.FileCount "a remote .gitignore must be promoted when no local one exists"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $noIgnoreDir ".gitignore")) `
+        "the promoted .gitignore should exist in LocalDir"
+    Assert-True `
+        ($null -ne (Read-BaseManifest -WorkspaceRoot $noIgnoreDir)) `
+        "promoting a remote .gitignore should still write BASE"
+
+    # A remote path under a retained .git directory must refuse, not just
+    # .gitignore: the check walks the leading segment for any retained name.
+    $gitDirCollide = Join-Path $fromRemoteRoot "git-dir-collision"
+    New-Item -ItemType Directory -Path (Join-Path $gitDirCollide ".git") -Force | Out-Null
+    $gitDirStaging = New-FakeStagingRoot -LocalDir $gitDirCollide
+    New-Item -ItemType Directory -Path (Join-Path $gitDirStaging ".git") -Force | Out-Null
+    $gitDirStaged = Join-Path $gitDirStaging ".git\config"
+    [System.IO.File]::WriteAllBytes($gitDirStaged, [byte[]](0x61))
+    $gitDirSnapshot = New-FakeSnapshot -StagingRoot $gitDirStaging -Files @{
+        '.git/config' = New-FakeSnapshotEntry `
+            -StagingPath $gitDirStaged `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $gitDirStaged) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $gitDirThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $gitDirCollide `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $gitDirSnapshot | Out-Null
+    }
+    catch {
+        $gitDirThrown = $_.Exception
+    }
+    Assert-True ($null -ne $gitDirThrown) "a remote path under a retained .git must refuse"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $gitDirCollide) `
+        "a .git collision must not write BASE"
+
+    # A malformed snapshot must be rejected before any promotion.
+    $badSnapshotDir = Join-Path $fromRemoteRoot "bad-snapshot"
+    Assert-RundotSyncInitDestination -LocalDir $badSnapshotDir
+    Assert-Throws {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $badSnapshotDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot ([pscustomobject]@{ Files = @(); StagingRoot = 'unused' })
+    } "a snapshot whose Files is not a file map must refuse rather than promote nothing"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $badSnapshotDir) `
+        "a malformed snapshot must not write BASE"
 }
 finally {
     if (Test-Path -LiteralPath $fromRemoteRoot) {
