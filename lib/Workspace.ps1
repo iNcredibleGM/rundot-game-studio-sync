@@ -302,3 +302,77 @@ function Assert-BaseOwnership {
         )
     }
 }
+
+# ----------------------------------------------------------------------------
+# No-BASE gate
+#
+# A missing BASE is a normal first-run state, not an error condition. Plan
+# must refuse it rather than infer a direction: without BASE there is no
+# verified shared state, and treating every path as new would be a guess.
+#
+# -AllowNoBase is an advanced escape hatch. It returns Untrusted, and callers
+# must surface Get-RundotSyncNoBaseUntrustedBanner before producing output.
+# ----------------------------------------------------------------------------
+
+function Get-RundotSyncMissingBaseRefusalMessage {
+    return @(
+        'This workspace has no BASE manifest, so there is no verified shared state.',
+        '',
+        'Initialize it first:',
+        '  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode FromRemote',
+        '  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode Adopt',
+        '',
+        'Init -InitMode FromRemote builds a trusted workspace from REMOTE.',
+        'Init -InitMode Adopt attaches sync metadata to an existing tree.',
+        '',
+        'Advanced: -AllowNoBase plans without BASE. Synchronization direction is then untrusted.'
+    ) -join "`n"
+}
+
+function Get-RundotSyncNoBaseUntrustedBanner {
+    return @(
+        'WARNING: No BASE manifest. Synchronization direction is untrusted.',
+        'LOCAL and REMOTE agreement has not been proven, so every path is a guess.'
+    ) -join "`n"
+}
+
+function Resolve-RundotSyncPlanBase {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [switch]$AllowNoBase
+    )
+
+    $base = Read-BaseManifest -WorkspaceRoot $WorkspaceRoot
+
+    if ($null -eq $base) {
+        if (-not $AllowNoBase) {
+            throw [System.InvalidOperationException]::new(
+                (Get-RundotSyncMissingBaseRefusalMessage)
+            )
+        }
+
+        return [pscustomobject]@{
+            Base        = $null
+            BasePresent = $false
+            Untrusted   = $true
+        }
+    }
+
+    # A present BASE is never trusted on sight: it must belong to this
+    # project and this folder before Plan may read it.
+    Assert-BaseOwnership `
+        -Base $base `
+        -ProjectId $ProjectId `
+        -WorkspaceRoot $WorkspaceRoot
+
+    return [pscustomobject]@{
+        Base        = $base
+        BasePresent = $true
+        Untrusted   = $false
+    }
+}
