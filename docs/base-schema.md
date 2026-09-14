@@ -7,8 +7,9 @@ bytes. `mtime` never decides direction.
 This schema is hashes and metadata only. It does not store file contents,
 access tokens, refresh tokens, or `%APPDATA%\.rundot\` auth paths.
 
-Plan and Pull must call `Assert-BaseOwnership` before using a BASE. Those
-commands land in a later issue. This library is the gate they must call.
+`Plan` and `Pull` must call `Assert-BaseOwnership` before using a BASE. `Plan`
+does so through `Resolve-RundotSyncPlanBase`, which also applies the no-BASE
+gate ([plan.md](plan.md)). `Pull` lands in a later issue.
 
 ## Writers
 
@@ -19,6 +20,10 @@ commands land in a later issue. This library is the gate they must call.
   exactly on LOCAL and REMOTE, so an Adopted BASE may be a partial one. A
   differing, local-only, or remote-only path is unresolved and never becomes
   a BASE claim.
+
+`Plan` reads BASE but never writes it. It persists only
+`.rundot-sync/last-plan.json` ([plan.md](plan.md)), so a plan can never change
+recorded shared state.
 
 ## Layout
 
@@ -34,7 +39,8 @@ Workspace state lives under `<LocalDir>/.rundot-sync/`:
 ```
 
 `Initialize-RundotSyncLayout` creates `backups/` and `temp/` only. It does
-not plant `last-plan.json` or `journal.jsonl`. `.rundot-sync/` is in the
+not plant `last-plan.json` or `journal.jsonl`; `Plan` creates `last-plan.json`
+when it runs ([plan.md](plan.md)). `.rundot-sync/` is in the
 default ignore set, so it is never a local inventory or upload candidate.
 
 ## `base-manifest.json`

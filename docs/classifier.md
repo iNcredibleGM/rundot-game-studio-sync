@@ -10,8 +10,13 @@ state. Any ambiguity is a conflict rather than a guess.
 The classifier is a pure function over three in-memory maps. It performs no
 network access and no filesystem access of its own, and it never mutates BASE
 or any input map. `Plan`/`Status` ([#9](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/9))
-composes it; `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
+compose it ([plan.md](plan.md)); `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
 filters its rows for applicable work.
+
+`Applicable` is the classifier's own view of a path. `Plan` is stricter: it
+forces `applicable: false` on every remote-mutating status, so a plan never
+implies write permission ([plan.md](plan.md)). A text upload the classifier
+calls applicable is still blocked in the plan artifact.
 
 ## Inputs
 

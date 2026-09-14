@@ -164,5 +164,7 @@ verification.
 
 ## Next
 
-Once BASE exists, `Plan` and `Status` are the read commands. They land in a
-later issue.
+Once BASE exists, `Plan` and `Status` are the read commands
+([plan.md](plan.md)). `Plan` generates the dry-run report and persists
+`.rundot-sync/last-plan.json`; `Status` runs the same engine and writes
+nothing. Neither mutates Studio, and `Init` remains the only writer of BASE.
