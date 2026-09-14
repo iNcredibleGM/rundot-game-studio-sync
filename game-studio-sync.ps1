@@ -28,15 +28,18 @@ $ErrorActionPreference = "Stop"
 # authoritative: BASE is the last verified shared state, and any ambiguity is
 # a conflict rather than a guess.
 #
-# Init is the only first-run command and the only writer of BASE.
+# Init is the only first-run command and the only writer of BASE. Plan and
+# Status are read-only: Plan writes a dry-run plan artifact, Status writes
+# nothing, and neither touches Studio.
 #
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode FromRemote
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode Adopt
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status
 #
-# Plan and Status arrive in a later issue. Until then they apply the BASE gate
-# and stop, so a first run is told to Init instead of guessing.
+# Plan and Status are dry runs. They show what a future Apply would consider,
+# but no operation is applicable in this milestone and no plan is permission
+# to write. Add -Verbose to also list unchanged paths.
 #
 # This script is GET-only. It does not create, replace, rename, or delete
 # anything on Studio.
@@ -65,6 +68,8 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
 . (Join-Path $PSScriptRoot "lib\Auth.ps1")
 . (Join-Path $PSScriptRoot "lib\Snapshot.ps1")
+. (Join-Path $PSScriptRoot "lib\Classifier.ps1")
+. (Join-Path $PSScriptRoot "lib\Plan.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
 
@@ -141,18 +146,53 @@ function Get-ResolvedInitMode {
 # ============================================================================
 # Plan / Status
 #
-# Deliberately handled before any authentication: a missing BASE is a normal
-# first-run state, and the answer must not depend on holding a token.
+# The BASE gate is deliberately consulted before any authentication: a missing
+# BASE is a normal first-run state, and the answer must not depend on holding
+# a token. Authentication happens only once the run can actually proceed.
+#
+# Both commands run the same engine. Plan persists a dry-run plan artifact;
+# Status persists nothing. Neither mutates Studio, and no operation in this
+# milestone is applicable.
 # ============================================================================
+
+function Get-RundotSyncVerboseRequested {
+    # -Verbose cannot be declared in this script's param block: it collides
+    # with the common parameter of the same name. Read it from the bound
+    # parameters instead. `powershell -File` passes it as a bare switch, whose
+    # bound value is a SwitchParameter; `-Verbose:$false` cannot be expressed
+    # that way and is rejected by the host before the body runs.
+    param($BoundParameters)
+
+    if ($null -eq $BoundParameters -or -not $BoundParameters.ContainsKey('Verbose')) {
+        return $false
+    }
+
+    $value = $BoundParameters['Verbose']
+    if ($value -is [System.Management.Automation.SwitchParameter]) {
+        return [bool]$value.IsPresent
+    }
+
+    if ($value -is [bool]) {
+        return [bool]$value
+    }
+
+    return $false
+}
 
 function Invoke-SyncPlanCommand {
     param(
         [string]$SyncCommand,
         [string]$WorkspaceRoot,
         [string]$StudioProjectId,
-        [bool]$AllowWithoutBase
+        [bool]$AllowWithoutBase,
+        [bool]$IncludeUnchanged,
+        [string]$Origin,
+        [string]$SyncAuthDir,
+        [string]$SyncAuthPath,
+        [string]$CliSessionPath
     )
 
+    # 1. BASE gate, before authentication.
     $resolution = $null
 
     try {
@@ -169,24 +209,88 @@ function Invoke-SyncPlanCommand {
         exit 1
     }
 
-    Write-Section "$SyncCommand"
+    # 2. Authenticate. GET-only: every call below reads.
+    Write-Section "$SyncCommand - RUN Studio authentication"
 
-    if ($resolution.Untrusted) {
-        Write-Host (Get-RundotSyncNoBaseUntrustedBanner)
-        Write-Host ""
+    $authResult = Get-RundotAccessToken `
+        -StudioOrigin $Origin `
+        -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir `
+        -AuthPath $SyncAuthPath `
+        -RundotCliSessionPath $CliSessionPath
+
+    $script:Token = $authResult.AccessToken
+    $script:RefreshToken = $authResult.RefreshToken
+
+    $Headers = @{
+        Authorization = "Bearer $script:Token"
+        Accept        = "*/*"
     }
-    else {
-        Write-Host "BASE manifest verified for this project and workspace."
-        Write-Host "  capturedAt: $($resolution.Base.capturedAt)"
-        Write-Host "  tracked:    $(@($resolution.Base.files.PSObject.Properties).Count) file(s)"
+
+    $script:Headers = $Headers
+
+    try {
+        # 3. LOCAL tree, then a stable REMOTE snapshot. The snapshot is torn-read
+        #    protected and staged under .rundot-sync/temp.
+        Write-Section "$SyncCommand - LOCAL and REMOTE"
+
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+
+        $snapshot = Get-StableRemoteSnapshot `
+            -WorkspaceRoot $WorkspaceRoot `
+            -StudioOrigin $Origin `
+            -ProjectId $StudioProjectId `
+            -Headers $Headers
+
+        Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
+        Write-Host "  before: $($snapshot.RemoteManifestHashBefore)"
+        Write-Host "  after:  $($snapshot.RemoteManifestHashAfter)"
+
+        # 4. Classify and build the dry-run analysis. Only Plan persists.
+        $analysis = New-RundotSyncPlanAnalysis `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId `
+            -Resolution $resolution `
+            -Local $localManifest `
+            -Remote $snapshot.Files `
+            -Snapshot $snapshot `
+            -Command $SyncCommand `
+            -IncludeUnchanged:$IncludeUnchanged `
+            -PersistArtifact:($SyncCommand -eq 'Plan')
+
         Write-Host ""
+        Write-Host $analysis.Report
+        Write-Host ""
+
+        # 5. A dry run leaves no staging tree behind.
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Staging lives under .rundot-sync/temp, which is never sync
+            # content, so a cleanup failure must not fail the plan.
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Cleanup is best effort.
+        }
+        Clear-SensitiveVariables
+        exit 1
+    }
+    finally {
+        $Headers.Authorization = $null
+        Clear-SensitiveVariables
     }
 
-    Write-Host "The $SyncCommand engine lands in a later issue (#9)."
-    Write-Host "No plan was generated and nothing was modified."
-
-    Clear-SensitiveVariables
-    exit 1
+    exit 0
 }
 
 
@@ -325,4 +429,9 @@ Invoke-SyncPlanCommand `
     -SyncCommand $Command `
     -WorkspaceRoot $LocalDir `
     -StudioProjectId $ProjectId `
-    -AllowWithoutBase ([bool]$AllowNoBase)
+    -AllowWithoutBase ([bool]$AllowNoBase) `
+    -IncludeUnchanged (Get-RundotSyncVerboseRequested -BoundParameters $PSBoundParameters) `
+    -Origin $StudioOrigin `
+    -SyncAuthDir $AuthDir `
+    -SyncAuthPath $AuthPath `
+    -CliSessionPath $RundotCliSessionPath

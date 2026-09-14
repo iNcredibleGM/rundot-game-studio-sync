@@ -79,6 +79,8 @@ foreach ($requiredLibrary in @(
     'RemoteApi.ps1',
     'Auth.ps1',
     'Snapshot.ps1',
+    'Classifier.ps1',
+    'Plan.ps1',
     'Init.ps1'
 )) {
     Assert-True `
@@ -88,18 +90,159 @@ foreach ($requiredLibrary in @(
 
 # The gate must run before authentication so a missing BASE never prompts
 # for a token.
-$gateIndex = $syncCliSource.IndexOf('Resolve-RundotSyncPlanBase')
-$authIndex = $syncCliSource.IndexOf('Get-RundotAccessToken')
+#
+# Plan and Init each authenticate, so ordering is asserted inside the
+# function that does the work rather than across the whole file: a file-wide
+# "first occurrence" comparison would silently pass or fail depending on
+# which function happens to be defined first.
+function Get-SyncCliFunctionText {
+    param(
+        [string]$Source,
+        [string]$FunctionName
+    )
+
+    $start = $Source.IndexOf("function $FunctionName ")
+    if ($start -lt 0) {
+        return ""
+    }
+
+    $next = $Source.IndexOf("`nfunction ", $start + 1)
+    if ($next -lt 0) {
+        return $Source.Substring($start)
+    }
+
+    return $Source.Substring($start, $next - $start)
+}
+
+$planFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncPlanCommand'
 Assert-True `
-    ($gateIndex -ge 0 -and $authIndex -ge 0 -and $gateIndex -lt $authIndex) `
+    (-not [string]::IsNullOrEmpty($planFunctionText)) `
+    "the CLI must define Invoke-SyncPlanCommand for Plan and Status"
+
+$planGateIndex = $planFunctionText.IndexOf('Resolve-RundotSyncPlanBase')
+$planAuthIndex = $planFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($planGateIndex -ge 0 -and $planAuthIndex -ge 0 -and $planGateIndex -lt $planAuthIndex) `
     "the no-BASE gate should be consulted before requesting Studio authentication"
 
 # A destination that cannot succeed must be refused before authenticating too,
 # or a doomed run still prompts for credentials (and can block on a paste).
-$preflightIndex = $syncCliSource.IndexOf('Assert-RundotSyncInitDestination')
+$initFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncInit'
 Assert-True `
-    ($preflightIndex -ge 0 -and $authIndex -ge 0 -and $preflightIndex -lt $authIndex) `
+    (-not [string]::IsNullOrEmpty($initFunctionText)) `
+    "the CLI must define Invoke-SyncInit"
+
+$preflightIndex = $initFunctionText.IndexOf('Assert-RundotSyncInitDestination')
+$initAuthIndex = $initFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($preflightIndex -ge 0 -and $initAuthIndex -ge 0 -and $preflightIndex -lt $initAuthIndex) `
     "the Init destination pre-flight should run before requesting authentication"
+
+
+# --------------------------------------------------------------------------
+# Plan / Status wiring: the CLI composes the dry-run engine
+# --------------------------------------------------------------------------
+
+foreach ($planFunction in @(
+    'New-RundotSyncPlanAnalysis',
+    'Get-LocalManifest',
+    'Get-StableRemoteSnapshot',
+    'Clear-RemoteSnapshotTemp'
+)) {
+    Assert-True `
+        ($planFunctionText -match [regex]::Escape($planFunction)) `
+        "Invoke-SyncPlanCommand should call $planFunction"
+}
+
+# The CLI composes at the analysis boundary: classification and diagnostics
+# are the engine's job, so their call sites must live in lib/Plan.ps1 and not
+# be reimplemented here.
+Assert-True `
+    ($planFunctionText -match [regex]::Escape('$analysis.Report')) `
+    "Plan and Status must print the engine report, so the dry-run lines always appear"
+
+# The engine owns persistence; the CLI only decides whether to ask for it.
+# Status must never persist, so the flag is gated on the command.
+Assert-True `
+    ($planFunctionText -match [regex]::Escape('-PersistArtifact:($SyncCommand -eq ''Plan'')')) `
+    "only Plan may ask the engine to persist the plan artifact"
+
+Assert-True `
+    ($planFunctionText -match [regex]::Escape('-IncludeUnchanged:$IncludeUnchanged')) `
+    "the CLI should pass the -Verbose-derived flag into the engine"
+
+Assert-True `
+    ($planFunctionText -match '\[bool\]\$AllowWithoutBase') `
+    "Invoke-SyncPlanCommand should accept the -AllowNoBase decision"
+
+# The dispatch forwards the escape hatch into the gate; the call site is in
+# the dispatch block rather than the function body.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('-AllowWithoutBase ([bool]$AllowNoBase)')) `
+    "the dispatch should pass the -AllowNoBase escape hatch into the gate"
+
+# A plan is read-only: it must not write BASE or reach a Studio write route.
+Assert-True `
+    ($planFunctionText -notmatch 'Save-BaseManifest') `
+    "Plan and Status must never write BASE"
+Assert-True `
+    ($planFunctionText -notmatch '(?i)upload-url|upload-adopt') `
+    "Plan and Status must never reference a Studio upload endpoint"
+
+# Ordering: LOCAL + REMOTE are captured before they are classified, and the
+# staging tree is cleared only after the analysis is built.
+$planLocalIndex = $planFunctionText.IndexOf('Get-LocalManifest')
+$planSnapshotIndex = $planFunctionText.IndexOf('Get-StableRemoteSnapshot')
+$planAnalysisIndex = $planFunctionText.IndexOf('New-RundotSyncPlanAnalysis')
+$planCleanupIndex = $planFunctionText.IndexOf('Clear-RemoteSnapshotTemp')
+
+Assert-True `
+    ($planLocalIndex -ge 0 -and $planAnalysisIndex -ge 0 -and $planLocalIndex -lt $planAnalysisIndex) `
+    "the LOCAL manifest should be captured before classification"
+Assert-True `
+    ($planSnapshotIndex -ge 0 -and $planAnalysisIndex -ge 0 -and $planSnapshotIndex -lt $planAnalysisIndex) `
+    "the REMOTE snapshot should be captured before classification"
+Assert-True `
+    ($planCleanupIndex -ge 0 -and $planAnalysisIndex -ge 0 -and $planCleanupIndex -gt $planAnalysisIndex) `
+    "snapshot staging should be cleared only after the analysis is built"
+
+
+# --------------------------------------------------------------------------
+# -Verbose: read from bound parameters, never re-declared
+#
+# Declaring [switch]$Verbose in the param block is a startup error, because it
+# collides with the common parameter of the same name. The switch is
+# therefore read from $PSBoundParameters.
+# --------------------------------------------------------------------------
+
+$paramBlockEnd = $syncCliSource.IndexOf("`n)")
+$syncCliParamBlock = $syncCliSource
+if ($paramBlockEnd -ge 0) {
+    $syncCliParamBlock = $syncCliSource.Substring(0, $paramBlockEnd)
+}
+
+Assert-True `
+    ($syncCliParamBlock -notmatch '\$Verbose') `
+    "the CLI must not declare -Verbose, which collides with the common parameter"
+Assert-True `
+    ($syncCliParamBlock -notmatch '(?i)\[switch\]\s*\$(Force|Overwrite|Write|Push|Apply|Upload)\b') `
+    "the CLI must not expose any remote-write switch"
+Assert-True `
+    ($syncCliParamBlock -notmatch '(?i)\$PersistArtifact|\$NoPersist|\$DryRun') `
+    "the CLI must not expose an artifact-persistence switch"
+
+$verboseHelperText = Get-SyncCliFunctionText `
+    -Source $syncCliSource `
+    -FunctionName 'Get-RundotSyncVerboseRequested'
+Assert-True `
+    (-not [string]::IsNullOrEmpty($verboseHelperText)) `
+    "the CLI must define Get-RundotSyncVerboseRequested to read -Verbose safely"
+Assert-True `
+    ($verboseHelperText -match [regex]::Escape("ContainsKey('Verbose')")) `
+    "the -Verbose helper must read the bound Verbose switch rather than a local variable"
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Get-RundotSyncVerboseRequested -BoundParameters $PSBoundParameters')) `
+    "the dispatch should pass the bound parameters into the -Verbose helper"
 
 
 # --------------------------------------------------------------------------
@@ -129,3 +272,18 @@ Assert-True `
 Assert-True `
     ($syncCliSource -notmatch '(?i)Write-(Host|Warning|Output).*\$Token\b') `
     "the CLI must not print the access token"
+
+# Every dry-run report ends with the three closing lines, and the engine owns
+# that text so Plan and Status cannot drift apart.
+$planLibrarySource = [System.IO.File]::ReadAllText(
+    (Join-Path $repoRoot "lib\Plan.ps1")
+)
+foreach ($closingLine in @(
+    'Dry run only. No remote files were modified.'
+    'This plan is a point-in-time observation, not permission to write.'
+    'WARNING: This tool uses unofficial remote API routes that may change.'
+)) {
+    Assert-True `
+        ($planLibrarySource -match [regex]::Escape($closingLine)) `
+        "the plan engine must emit the dry-run closing line: $closingLine"
+}

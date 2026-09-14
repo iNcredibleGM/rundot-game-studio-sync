@@ -69,8 +69,8 @@ Notes:
 ## Sync (work in progress)
 
 `game-studio-sync.ps1` is a separate entrypoint for syncing a Studio project
-with a local directory. **Only `Init` is implemented today**; `Plan`, `Status`,
-and `Pull` land in later v0.1.3 issues. Run `-Command Init` and nothing else.
+with a local directory. `Init`, `Plan`, and `Status` are implemented; `Pull`
+lands in a later v0.1.3 issue.
 
 Sync is read-oriented. Neither LOCAL nor REMOTE is authoritative: BASE records
 the last verified shared state. This milestone has no remote mutation - there
@@ -93,12 +93,33 @@ Initialize a workspace:
   exactly, and prints an unresolved-path report for everything else. It never
   claims agreement that was not proven.
 
-See [docs/init.md](docs/init.md) for the full behavior, including the failure
-table and the `Plan`-without-BASE refusal.
+Inspect the workspace with a dry run:
 
-`Plan` and `Status` require a BASE and will refuse without one, pointing at
-`Init`. Until those commands ship, they apply that check and stop rather than
-producing a plan.
+```powershell
+# Report what a future Apply would consider, and save the plan artifact
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Plan
+
+# The same report without writing .rundot-sync/last-plan.json
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Status
+```
+
+- Both require a BASE and refuse without one, pointing at `Init`.
+- `Plan` persists `.rundot-sync/last-plan.json`; `Status` writes nothing.
+- Neither changes a local file or Studio. **No operation is applicable in this
+  milestone**, so a plan is never permission to write.
+- Add `-Verbose` to also list unchanged paths.
+
+Every dry run ends with:
+
+```text
+Dry run only. No remote files were modified.
+This plan is a point-in-time observation, not permission to write.
+WARNING: This tool uses unofficial remote API routes that may change.
+```
+
+See [docs/init.md](docs/init.md) for the Init failure table and the
+`Plan`-without-BASE refusal, and [docs/plan.md](docs/plan.md) for the plan
+artifact schema and console layout.
 
 > Sync uses unofficial remote API routes that may change without notice.
 
