@@ -255,6 +255,658 @@ finally {
 
 
 # --------------------------------------------------------------------------
+# Init FromRemote: verify staging, promote, re-verify, atomic BASE
+#
+# Any failure must leave NO BASE. A partial promotion is never trusted.
+# --------------------------------------------------------------------------
+
+function New-FakeRemoteListEntry {
+    param([hashtable]$Properties)
+
+    $entry = New-Object PSObject
+    foreach ($key in $Properties.Keys) {
+        $entry | Add-Member -NotePropertyName $key -NotePropertyValue $Properties[$key]
+    }
+
+    return $entry
+}
+
+function New-FakeRemoteManifest {
+    param([object[]]$Files)
+
+    return [pscustomobject]@{ files = $Files }
+}
+
+function New-FakeSnapshotEntry {
+    param(
+        [string]$StagingPath,
+        [string]$Sha256,
+        [int64]$Size,
+        [string]$Kind,
+        [string]$Encoding,
+        $LineEnding = $null,
+        $HasBom = $null
+    )
+
+    return [pscustomobject]@{
+        Sha256            = $Sha256
+        Size              = $Size
+        LocalDetectedKind = $Kind
+        LineEnding        = $LineEnding
+        HasBom            = $HasBom
+        RemoteKind        = (ConvertTo-RemoteKind -Encoding $Encoding)
+        Encoding          = $Encoding
+        StagingPath       = $StagingPath
+    }
+}
+
+function New-FakeSnapshot {
+    param(
+        [string]$StagingRoot,
+        [hashtable]$Files
+    )
+
+    return [pscustomobject]@{
+        Files                    = $Files
+        RemoteManifestHashBefore = 'before'
+        RemoteManifestHashAfter  = 'after'
+        AttemptCount             = 1
+        StagingRoot              = $StagingRoot
+    }
+}
+
+function New-FakeStagingRoot {
+    param([string]$LocalDir)
+
+    $stagingRoot = Join-Path $LocalDir ".rundot-sync\temp\remote-snapshot\1"
+    New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+    return $stagingRoot
+}
+
+function Get-TestTopLevelEntries {
+    param([string]$Dir)
+
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
+        return @()
+    }
+
+    return @(
+        Get-ChildItem -LiteralPath $Dir -Force |
+            Where-Object { $_.Name -ne '.rundot-sync' } |
+            ForEach-Object { $_.Name }
+    )
+}
+
+$fromRemoteRoot = Join-Path $env:TEMP ("rundot-init-remote-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $fromRemoteRoot | Out-Null
+
+$initUtf8 = New-Object System.Text.UTF8Encoding $false
+$initHeaders = @{
+    Authorization = 'Bearer test-token'
+    Accept        = '*/*'
+}
+
+try {
+    # ----------------------------------------------------------------------
+    # Happy path: empty directory becomes a trusted workspace
+    # ----------------------------------------------------------------------
+
+    $happyDir = Join-Path $fromRemoteRoot "happy"
+    $textEntry = New-FakeRemoteListEntry @{
+        path     = 'src/a.ts'
+        type     = 'file'
+        size     = 4
+        encoding = 'utf8'
+    }
+    $binaryEntry = New-FakeRemoteListEntry @{
+        path     = 'public/logo.png'
+        type     = 'file'
+        size     = 2
+        encoding = 'base64'
+    }
+    $happyManifest = New-FakeRemoteManifest -Files @($textEntry, $binaryEntry)
+
+    # 'hi' + CRLF makes the line-ending diagnostic meaningful, and 0xFF 0xFE is
+    # invalid UTF-8 so the binary path is exercised rather than assumed.
+    $textPayload = "hi`r`n"
+    Reset-FakeRemote `
+        -Lists @($happyManifest, $happyManifest) `
+        -Files @{
+            'src/a.ts'        = [pscustomobject]@{ encoding = 'utf8'; content = $textPayload }
+            'public/logo.png' = [pscustomobject]@{ encoding = 'base64'; content = '//4=' }
+        }
+
+    $happyResult = Initialize-RundotSyncFromRemote `
+        -LocalDir $happyDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 2 $happyResult.FileCount "FromRemote should report the promoted file count"
+
+    $promotedText = Join-Path $happyDir "src\a.ts"
+    $promotedBinary = Join-Path $happyDir "public\logo.png"
+    Assert-True (Test-Path -LiteralPath $promotedText) "utf8 content should be promoted into LocalDir"
+    Assert-True (Test-Path -LiteralPath $promotedBinary) "binary content should be promoted into LocalDir"
+    Assert-Equal `
+        $initUtf8.GetBytes($textPayload) `
+        ([System.IO.File]::ReadAllBytes($promotedText)) `
+        "promoted utf8 bytes must match the remote payload exactly"
+    Assert-Equal `
+        ([byte[]](0xFF, 0xFE)) `
+        ([System.IO.File]::ReadAllBytes($promotedBinary)) `
+        "promoted binary bytes must match the remote payload exactly"
+
+    $happyBase = Read-BaseManifest -WorkspaceRoot $happyDir
+    Assert-True ($null -ne $happyBase) "FromRemote must write BASE on success"
+    if ($null -ne $happyBase) {
+        Assert-BaseOwnership `
+            -Base $happyBase `
+            -ProjectId 'proj-test-1' `
+            -WorkspaceRoot $happyDir
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $promotedText) `
+            $happyBase.files.'src/a.ts'.sha256 `
+            "BASE must record the hash of the bytes now on disk"
+        Assert-Equal "utf8" $happyBase.files.'src/a.ts'.kind "BASE should record a byte-derived text kind"
+        Assert-Equal "crlf" $happyBase.files.'src/a.ts'.lineEnding "BASE should record line endings for text"
+        Assert-Equal 4 $happyBase.files.'src/a.ts'.size "BASE should record the byte-derived size"
+        Assert-Equal "binary" $happyBase.files.'public/logo.png'.kind "BASE should record a binary kind"
+        Assert-Null `
+            $happyBase.files.'public/logo.png'.lineEnding `
+            "binary BASE entries must omit lineEnding"
+        Assert-Equal 2 $happyBase.files.'public/logo.png'.size "binary BASE should record the byte-derived size"
+    }
+
+    $leftoverStaging = Join-Path $happyDir ".rundot-sync\temp\remote-snapshot"
+    Assert-True `
+        (-not (Test-Path -LiteralPath $leftoverStaging)) `
+        "a successful promotion should clear the snapshot staging folder"
+
+    # ----------------------------------------------------------------------
+    # Empty remote project: a zero-file BASE is still a success
+    # ----------------------------------------------------------------------
+
+    $emptyProjectDir = Join-Path $fromRemoteRoot "empty-project"
+    $emptyManifest = New-FakeRemoteManifest -Files @()
+    Reset-FakeRemote -Lists @($emptyManifest, $emptyManifest) -Files @{}
+
+    $emptyResult = Initialize-RundotSyncFromRemote `
+        -LocalDir $emptyProjectDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 0 $emptyResult.FileCount "an empty remote project should promote no files"
+    $emptyBase = Read-BaseManifest -WorkspaceRoot $emptyProjectDir
+    Assert-True ($null -ne $emptyBase) "an empty remote project should still write BASE"
+    if ($null -ne $emptyBase) {
+        Assert-Equal `
+            0 `
+            @($emptyBase.files.PSObject.Properties).Count `
+            "an empty remote project should produce a zero-entry BASE"
+    }
+
+    # ----------------------------------------------------------------------
+    # Zero-byte remote file: a valid hash, not a special case
+    # ----------------------------------------------------------------------
+
+    $zeroDir = Join-Path $fromRemoteRoot "zero-byte"
+    $zeroEntry = New-FakeRemoteListEntry @{
+        path     = 'empty.ts'
+        type     = 'file'
+        size     = 0
+        encoding = 'utf8'
+    }
+    $zeroManifest = New-FakeRemoteManifest -Files @($zeroEntry)
+    Reset-FakeRemote `
+        -Lists @($zeroManifest, $zeroManifest) `
+        -Files @{ 'empty.ts' = [pscustomobject]@{ encoding = 'utf8'; content = '' } }
+
+    $zeroResult = Initialize-RundotSyncFromRemote `
+        -LocalDir $zeroDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 1 $zeroResult.FileCount "a zero-byte remote file should still be promoted"
+    $zeroBase = Read-BaseManifest -WorkspaceRoot $zeroDir
+    if ($null -ne $zeroBase) {
+        Assert-Equal `
+            'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' `
+            $zeroBase.files.'empty.ts'.sha256 `
+            "a zero-byte file should record the empty SHA-256"
+        Assert-Equal 0 $zeroBase.files.'empty.ts'.size "a zero-byte file should record size 0"
+    }
+    else {
+        Assert-True $false "a zero-byte remote file should still write BASE"
+    }
+
+    # ----------------------------------------------------------------------
+    # Unstable snapshot: the #6 idle abort propagates and writes no BASE
+    # ----------------------------------------------------------------------
+
+    $unstableDir = Join-Path $fromRemoteRoot "unstable"
+    # A distinct path set is what makes Before != After. Adding an etag alone
+    # would be folded into the fingerprint as well, but a changed path set
+    # exercises the retry for the reason a real edit would.
+    $unstableOther = New-FakeRemoteManifest -Files @(
+        $textEntry,
+        (New-FakeRemoteListEntry @{
+            path     = 'src/added.ts'
+            type     = 'file'
+            size     = 1
+            encoding = 'utf8'
+        })
+    )
+    Reset-FakeRemote `
+        -Lists @(
+            $happyManifest, $unstableOther,
+            $happyManifest, $unstableOther,
+            $happyManifest, $unstableOther
+        ) `
+        -Files @{
+            'src/a.ts'        = [pscustomobject]@{ encoding = 'utf8'; content = $textPayload }
+            'public/logo.png' = [pscustomobject]@{ encoding = 'base64'; content = '//4=' }
+        }
+
+    $unstableThrown = $null
+    try {
+        Initialize-RundotSyncFromRemote `
+            -LocalDir $unstableDir `
+            -ProjectId 'proj-test-1' `
+            -StudioOrigin 'https://example.test' `
+            -Headers $initHeaders | Out-Null
+    }
+    catch {
+        $unstableThrown = $_.Exception
+    }
+    Assert-True ($null -ne $unstableThrown) "an unstable snapshot must abort FromRemote"
+    if ($null -ne $unstableThrown) {
+        Assert-True `
+            ($unstableThrown.Message -match [regex]::Escape('The remote project changed while being read')) `
+            "an unstable snapshot should surface the #6 idle message"
+    }
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $unstableDir) `
+        "an unstable snapshot must not write BASE"
+    Assert-Equal `
+        0 `
+        @(Get-TestTopLevelEntries -Dir $unstableDir).Count `
+        "an unstable snapshot must promote nothing"
+
+    # ----------------------------------------------------------------------
+    # Failed download: a listed path that 404s writes no BASE
+    # ----------------------------------------------------------------------
+
+    $failedDownloadDir = Join-Path $fromRemoteRoot "failed-download"
+    Reset-FakeRemote `
+        -Lists @(
+            $happyManifest, $happyManifest,
+            $happyManifest, $happyManifest,
+            $happyManifest, $happyManifest
+        ) `
+        -Files @{ 'public/logo.png' = [pscustomobject]@{ encoding = 'base64'; content = '//4=' } } `
+        -FileErrors @{ 'src/a.ts' = (New-RemoteHttpException -StatusCode 404) }
+
+    $downloadThrown = $null
+    try {
+        Initialize-RundotSyncFromRemote `
+            -LocalDir $failedDownloadDir `
+            -ProjectId 'proj-test-1' `
+            -StudioOrigin 'https://example.test' `
+            -Headers $initHeaders | Out-Null
+    }
+    catch {
+        $downloadThrown = $_.Exception
+    }
+    Assert-True ($null -ne $downloadThrown) "a 404 during download must abort FromRemote"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $failedDownloadDir) `
+        "a failed download must not write BASE"
+    Assert-Equal `
+        0 `
+        @(Get-TestTopLevelEntries -Dir $failedDownloadDir).Count `
+        "a failed download must promote nothing"
+
+    # ----------------------------------------------------------------------
+    # Fabricated snapshot: staged bytes disagree with the recorded hash
+    # ----------------------------------------------------------------------
+
+    $mismatchDir = Join-Path $fromRemoteRoot "staging-mismatch"
+    $mismatchStaging = New-FakeStagingRoot -LocalDir $mismatchDir
+    New-Item -ItemType Directory -Path (Join-Path $mismatchStaging "src") -Force | Out-Null
+    $mismatchFile = Join-Path $mismatchStaging "src\a.ts"
+    [System.IO.File]::WriteAllBytes($mismatchFile, [byte[]](0x61, 0x62))
+    $mismatchSnapshot = New-FakeSnapshot -StagingRoot $mismatchStaging -Files @{
+        'src/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $mismatchFile `
+            -Sha256 ('0' * 64) `
+            -Size 2 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $mismatchThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $mismatchDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $mismatchSnapshot | Out-Null
+    }
+    catch {
+        $mismatchThrown = $_.Exception
+    }
+    Assert-True ($null -ne $mismatchThrown) "a staging hash mismatch must abort"
+    if ($null -ne $mismatchThrown) {
+        Assert-True `
+            ($mismatchThrown.Message -match '(?i)snapshot hash|do not match') `
+            "a staging hash mismatch should say the bytes disagree with the snapshot"
+    }
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $mismatchDir) `
+        "a staging hash mismatch must not write BASE"
+    Assert-Equal `
+        0 `
+        @(Get-TestTopLevelEntries -Dir $mismatchDir).Count `
+        "a staging hash mismatch must promote nothing"
+
+    # ----------------------------------------------------------------------
+    # Fabricated snapshot: staging holds a file the snapshot never listed
+    # ----------------------------------------------------------------------
+
+    $extraDir = Join-Path $fromRemoteRoot "staging-extra"
+    $extraStaging = New-FakeStagingRoot -LocalDir $extraDir
+    New-Item -ItemType Directory -Path (Join-Path $extraStaging "src") -Force | Out-Null
+    $extraListed = Join-Path $extraStaging "src\a.ts"
+    [System.IO.File]::WriteAllBytes($extraListed, [byte[]](0x61, 0x62))
+    [System.IO.File]::WriteAllBytes((Join-Path $extraStaging "src\smuggled.ts"), [byte[]](0x63))
+    $extraSnapshot = New-FakeSnapshot -StagingRoot $extraStaging -Files @{
+        'src/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $extraListed `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $extraListed) `
+            -Size 2 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    Assert-Throws {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $extraDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $extraSnapshot
+    } "staging must not contain files the snapshot does not list"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $extraDir) `
+        "an unexpected staging file must not write BASE"
+
+    # ----------------------------------------------------------------------
+    # Fabricated snapshot: remote path would overwrite retained .gitignore
+    # ----------------------------------------------------------------------
+
+    $collideDir = Join-Path $fromRemoteRoot "metadata-collision"
+    New-Item -ItemType Directory -Path $collideDir -Force | Out-Null
+    $localIgnore = Join-Path $collideDir ".gitignore"
+    [System.IO.File]::WriteAllBytes($localIgnore, [byte[]](0x4B))
+    $collideStaging = New-FakeStagingRoot -LocalDir $collideDir
+    $collideStagedIgnore = Join-Path $collideStaging ".gitignore"
+    [System.IO.File]::WriteAllBytes($collideStagedIgnore, [byte[]](0x52))
+    $collideSnapshot = New-FakeSnapshot -StagingRoot $collideStaging -Files @{
+        '.gitignore' = New-FakeSnapshotEntry `
+            -StagingPath $collideStagedIgnore `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $collideStagedIgnore) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $collideThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $collideDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $collideSnapshot | Out-Null
+    }
+    catch {
+        $collideThrown = $_.Exception
+    }
+    Assert-True ($null -ne $collideThrown) "a remote path colliding with retained metadata must refuse"
+    if ($null -ne $collideThrown) {
+        Assert-True `
+            ($collideThrown.Message -match '(?i)metadata') `
+            "the collision refusal should explain that retained metadata would be overwritten"
+    }
+    Assert-Equal `
+        ([byte[]](0x4B)) `
+        ([System.IO.File]::ReadAllBytes($localIgnore)) `
+        "a metadata collision must not overwrite the existing .gitignore"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $collideDir) `
+        "a metadata collision must not write BASE"
+
+    # ----------------------------------------------------------------------
+    # Fabricated snapshot: a remote path would land inside .rundot-sync
+    #
+    # A remote project could legitimately list '.rundot-sync/evil.ts' and still
+    # pass the destination check, because .rundot-sync is tolerated there. If
+    # that were promoted it would write into sync state.
+    # ----------------------------------------------------------------------
+
+    $syncCollideDir = Join-Path $fromRemoteRoot "sync-state-collision"
+    $syncCollideStaging = New-FakeStagingRoot -LocalDir $syncCollideDir
+    # Mirror the canonical path, as the real snapshot staging does, so this
+    # exercises the collision refusal rather than the integrity check.
+    New-Item -ItemType Directory -Path (Join-Path $syncCollideStaging ".rundot-sync") -Force | Out-Null
+    $syncCollideStaged = Join-Path $syncCollideStaging ".rundot-sync\evil.ts"
+    [System.IO.File]::WriteAllBytes($syncCollideStaged, [byte[]](0x61))
+    $syncCollideSnapshot = New-FakeSnapshot -StagingRoot $syncCollideStaging -Files @{
+        '.rundot-sync/evil.ts' = New-FakeSnapshotEntry `
+            -StagingPath $syncCollideStaged `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $syncCollideStaged) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $syncCollideThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $syncCollideDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $syncCollideSnapshot | Out-Null
+    }
+    catch {
+        $syncCollideThrown = $_.Exception
+    }
+    Assert-True ($null -ne $syncCollideThrown) "a remote path inside .rundot-sync must refuse"
+    if ($null -ne $syncCollideThrown) {
+        Assert-True `
+            ($syncCollideThrown.Message -match [regex]::Escape('.rundot-sync')) `
+            "the sync-state refusal should name .rundot-sync"
+    }
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $syncCollideDir ".rundot-sync\evil.ts"))) `
+        "a refused remote path must not be written into sync state"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $syncCollideDir) `
+        "a sync-state collision must not write BASE"
+
+    # ----------------------------------------------------------------------
+    # Failure partway through promotion rolls back the entries already moved
+    # ----------------------------------------------------------------------
+
+    $partialDir = Join-Path $fromRemoteRoot "partial-move"
+    $partialStaging = New-FakeStagingRoot -LocalDir $partialDir
+    New-Item -ItemType Directory -Path (Join-Path $partialStaging "a") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $partialStaging "b") -Force | Out-Null
+    $partialA = Join-Path $partialStaging "a\a.ts"
+    $partialB = Join-Path $partialStaging "b\b.ts"
+    [System.IO.File]::WriteAllBytes($partialA, [byte[]](0x61))
+    [System.IO.File]::WriteAllBytes($partialB, [byte[]](0x62))
+    $partialSnapshot = New-FakeSnapshot -StagingRoot $partialStaging -Files @{
+        'a/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $partialA `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $partialA) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+        'b/b.ts' = New-FakeSnapshotEntry `
+            -StagingPath $partialB `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $partialB) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    # Shadow the cmdlet so the second rename fails, leaving a half-promoted
+    # tree that must be rolled back.
+    $script:InjectedMoveItemCalls = 0
+    function Move-Item {
+        param(
+            [Parameter(ValueFromPipeline)]
+            [string]$LiteralPath,
+
+            [string]$Destination,
+
+            [switch]$Force
+        )
+
+        $script:InjectedMoveItemCalls++
+        if ($script:InjectedMoveItemCalls -eq 2) {
+            throw [System.InvalidOperationException]::new("Injected rename failure.")
+        }
+
+        Microsoft.PowerShell.Management\Move-Item `
+            -LiteralPath $LiteralPath `
+            -Destination $Destination
+    }
+
+    $partialThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $partialDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $partialSnapshot | Out-Null
+    }
+    catch {
+        $partialThrown = $_.Exception
+    }
+    finally {
+        Remove-Item -Path function:Move-Item -ErrorAction SilentlyContinue
+    }
+
+    Assert-True ($null -ne $partialThrown) "a rename failure partway through promotion must propagate"
+    Assert-Equal `
+        0 `
+        @(Get-TestTopLevelEntries -Dir $partialDir).Count `
+        "a failed promotion must not leave a half-promoted tree in LocalDir"
+    Assert-True `
+        ((Test-Path -LiteralPath $partialA) -or (Test-Path -LiteralPath (Join-Path $partialDir "a\a.ts"))) `
+        "a failed promotion must preserve the staged data instead of destroying it"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $partialDir) `
+        "a failed promotion must not write BASE"
+    Assert-True `
+        ((Get-Command Move-Item -CommandType Cmdlet) -ne $null) `
+        "Init.Tests must restore the real Move-Item cmdlet"
+
+    # ----------------------------------------------------------------------
+    # Fabricated snapshot: a path the destination cannot represent
+    # ----------------------------------------------------------------------
+
+    $unsafeDir = Join-Path $fromRemoteRoot "unsafe-path"
+    $unsafeStaging = New-FakeStagingRoot -LocalDir $unsafeDir
+    $unsafeFile = Join-Path $unsafeStaging "unsafe.ts"
+    [System.IO.File]::WriteAllBytes($unsafeFile, [byte[]](0x61))
+    $unsafeSnapshot = New-FakeSnapshot -StagingRoot $unsafeStaging -Files @{
+        'a<b>.ts' = New-FakeSnapshotEntry `
+            -StagingPath $unsafeFile `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $unsafeFile) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    Assert-Throws {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $unsafeDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $unsafeSnapshot
+    } "a canonical path the destination cannot represent must abort before promoting"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $unsafeDir) `
+        "an unrepresentable path must not write BASE"
+
+    # ----------------------------------------------------------------------
+    # BASE write failure: promoted files roll back so no partial tree stands
+    # ----------------------------------------------------------------------
+
+    $baseFailDir = Join-Path $fromRemoteRoot "base-write-failure"
+    New-Item -ItemType Directory -Path $baseFailDir -Force | Out-Null
+    $baseFailStaging = New-FakeStagingRoot -LocalDir $baseFailDir
+    New-Item -ItemType Directory -Path (Join-Path $baseFailStaging "src") -Force | Out-Null
+    $baseFailFile = Join-Path $baseFailStaging "src\a.ts"
+    [System.IO.File]::WriteAllBytes($baseFailFile, [byte[]](0x61))
+    $baseFailSnapshot = New-FakeSnapshot -StagingRoot $baseFailStaging -Files @{
+        'src/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $baseFailFile `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $baseFailFile) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    $realSaveBaseManifest = ${function:Save-BaseManifest}
+    function Save-BaseManifest {
+        param([string]$WorkspaceRoot, [string]$ProjectId, $Files)
+        throw [System.InvalidOperationException]::new("Injected BASE write failure.")
+    }
+
+    $baseFailThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $baseFailDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $baseFailSnapshot | Out-Null
+    }
+    catch {
+        $baseFailThrown = $_.Exception
+    }
+    finally {
+        Set-Item -Path function:Save-BaseManifest -Value $realSaveBaseManifest
+    }
+
+    Assert-True ($null -ne $baseFailThrown) "a BASE write failure must propagate"
+    if ($null -ne $baseFailThrown) {
+        Assert-True `
+            ($baseFailThrown.Message -match '(?i)no base was written') `
+            "a BASE write failure should state that no BASE was written"
+    }
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $baseFailDir) `
+        "a BASE write failure must not leave a BASE"
+    Assert-Equal `
+        0 `
+        @(Get-TestTopLevelEntries -Dir $baseFailDir).Count `
+        "a BASE write failure must roll the promoted tree back out of LocalDir"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $baseFailStaging "src\a.ts")) `
+        "a rolled-back promotion should preserve the staged data instead of destroying it"
+
+    # The injected failure must not outlive this block, for the same
+    # shared-scope reason as the remote stubs above.
+    Assert-True `
+        ((Get-Command Save-BaseManifest -CommandType Function).Definition -match 'base-manifest\.json\.tmp') `
+        "Init.Tests must restore the real Save-BaseManifest after injecting a failure"
+}
+finally {
+    if (Test-Path -LiteralPath $fromRemoteRoot) {
+        Remove-Item -LiteralPath $fromRemoteRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# --------------------------------------------------------------------------
 # STUB REGION ENDS HERE
 #
 # Init FromRemote / Adopt tests belong above this line. Restore the real
