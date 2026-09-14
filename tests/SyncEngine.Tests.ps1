@@ -184,7 +184,10 @@ function Assert-SyncEngineStatus {
     }
 
     Assert-Equal $ExpectedStatus ([string]$row.Status) ("status for '$Path': " + $Message)
-    return $row
+
+    # No row is emitted: every caller invokes this bare, and a returned row
+    # would leak to the test log.
+    return
 }
 
 
