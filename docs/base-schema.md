@@ -10,6 +10,16 @@ access tokens, refresh tokens, or `%APPDATA%\.rundot\` auth paths.
 Plan and Pull must call `Assert-BaseOwnership` before using a BASE. Those
 commands land in a later issue. This library is the gate they must call.
 
+## Writers
+
+`Init` is the only command that writes BASE (see [init.md](init.md)):
+
+- `Init -InitMode FromRemote` records every verified remote file.
+- `Init -InitMode Adopt` records only paths whose content hash matched
+  exactly on LOCAL and REMOTE, so an Adopted BASE may be a partial one. A
+  differing, local-only, or remote-only path is unresolved and never becomes
+  a BASE claim.
+
 ## Layout
 
 Workspace state lives under `<LocalDir>/.rundot-sync/`:
@@ -32,7 +42,7 @@ default ignore set, so it is never a local inventory or upload candidate.
 ```json
 {
   "schemaVersion": 1,
-  "toolVersion": "0.1.2",
+  "toolVersion": "0.1.3",
   "projectId": "<studio project id>",
   "localRootFingerprint": "<64 lowercase hex>",
   "capturedAt": "<ISO-8601 UTC>",
@@ -53,8 +63,11 @@ default ignore set, so it is never a local inventory or upload candidate.
 }
 ```
 
-`schemaVersion` is `1`. `toolVersion` is the v0.1.2 milestone string and is
-independent of the schema number.
+`schemaVersion` is `1`. `toolVersion` names the milestone string that produced
+the manifest, and is independent of the schema number. `Init` first wrote BASE
+in v0.1.3, so no v0.1.2 manifest exists in practice. `Assert-BaseOwnership`
+checks `schemaVersion`, not `toolVersion`: a workspace written by a different
+tool version stays readable.
 
 `files` is a complete map of files that existed after the last successful
 verified pull or init. Keys are canonical `/` NFC paths. Missing paths are

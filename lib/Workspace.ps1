@@ -2,7 +2,7 @@
 # Hashes and metadata only. Callers must load Paths.ps1 first.
 
 $script:RundotSyncSchemaVersion = 1
-$script:RundotSyncToolVersion = "0.1.2"
+$script:RundotSyncToolVersion = "0.1.3"
 
 function Get-RundotSyncRoot {
     param(
