@@ -196,6 +196,34 @@ try {
     Assert-Equal 1 (Get-JournalTestPropertyValue -Record $firstRead -Name 'skipped') "the skipped count must round-trip"
     Assert-Equal $true (Get-JournalTestPropertyValue -Record $firstRead -Name 'baseUpdated') "baseUpdated must round-trip"
 
+    # A backup record names the canonical path it preserved, relative to the
+    # workspace. It never records an absolute path.
+    $pathWorkspace = New-JournalTestWorkspace -Root $journalTestRoot
+    $pathRecord = Add-RundotSyncJournalRecord `
+        -WorkspaceRoot $pathWorkspace `
+        -Event 'pull-backup' `
+        -Record @{ status = 'success'; path = 'src/a.ts'; backupSet = '20260102T030405678Z' }
+
+    Assert-Equal 'src/a.ts' ([string]$pathRecord.path) "a backup record must name the canonical path"
+    Assert-Equal 'pull-backup' ([string]$pathRecord.event) "a backup record must carry its own event name"
+
+    # An absolute path is never journaled: it is refused rather than recorded.
+    $absoluteThrew = $null
+    try {
+        Add-RundotSyncJournalRecord `
+            -WorkspaceRoot $pathWorkspace `
+            -Event 'pull-backup' `
+            -Record @{ status = 'success'; path = 'C:\Users\someone\project\src\a.ts' }
+    }
+    catch {
+        $absoluteThrew = $_.Exception
+    }
+    Assert-True ($null -ne $absoluteThrew) "an absolute path in a journal record must be refused"
+    $pathRaw = Get-JournalTestRawText -WorkspaceRoot $pathWorkspace
+    Assert-True `
+        ($pathRaw -notmatch [regex]::Escape('C:\Users')) `
+        "an absolute path must never be written to the journal"
+
     $secondRead = $records[1]
     Assert-Equal 'failed' ([string](Get-JournalTestPropertyValue -Record $secondRead -Name 'status')) "a failure record must keep its status"
     Assert-Equal $false (Get-JournalTestPropertyValue -Record $secondRead -Name 'baseUpdated') "a failure record must report baseUpdated false"

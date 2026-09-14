@@ -1560,6 +1560,473 @@ try {
     Assert-True `
         (-not (Test-Path -LiteralPath (Join-Path $deleteWorkspace "src\gone.ts.bak"))) `
         "Pull must not create delete side effects"
+
+
+    # ======================================================================
+    # Pull orchestration: confirmation, report, and journal
+    #
+    # Invoke-RundotSyncPull is the single entrypoint the CLI calls. It selects,
+    # confirms, applies, updates BASE, journals, and reports. It is the only
+    # layer that decides whether BASE moves.
+    # ======================================================================
+
+    function New-PullTestResolution {
+        param($BaseMap, [string]$CapturedAt = '2026-09-14T12:00:00.0000000Z')
+
+        $baseObject = $null
+        if ($null -ne $BaseMap) {
+            $baseObject = [pscustomobject]@{
+                capturedAt = $CapturedAt
+                files      = $BaseMap
+            }
+        }
+
+        return [pscustomobject]@{
+            Base        = $baseObject
+            BasePresent = ($null -ne $baseObject)
+            Untrusted   = $false
+        }
+    }
+
+    function New-PullTestPullFixture {
+        # A workspace with one clean download from a real BASE, ready for the
+        # entrypoint. Returns everything the caller needs to assert.
+        param(
+            [Parameter(Mandatory)][string]$Root,
+            [Parameter(Mandatory)][string]$ProjectId,
+            [string]$LocalText = "local before`n",
+            [string]$RemoteText = "remote after`n"
+        )
+
+        $workspace = New-PullTestWorkspace -Root $Root
+        $destPath = Join-Path $workspace "src\a.ts"
+        Write-PullTestBytes -LiteralPath $destPath -Bytes ($pullApplyUtf8.GetBytes($LocalText))
+
+        $baseEntry = Get-PullTestBaseEntryForLocal -LiteralPath $destPath
+        $baseFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+        $baseFiles['src/a.ts'] = $baseEntry
+        Save-BaseManifest -WorkspaceRoot $workspace -ProjectId $ProjectId -Files $baseFiles
+
+        $stagingSource = Join-Path $Root ("remote-" + [Guid]::NewGuid().ToString("N") + ".ts")
+        Write-PullTestBytes -LiteralPath $stagingSource -Bytes ($pullApplyUtf8.GetBytes($RemoteText))
+
+        $localMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $destPath) }
+        $remoteMap = @{
+            'src/a.ts' = (New-PullTestRemoteIdentityEntry `
+                -StagingPath $stagingSource `
+                -WorkspaceStagingRoot $workspace `
+                -CanonicalPath 'src/a.ts')
+        }
+        $snapshot = New-PullTestSnapshotFixture -WorkspaceRoot $workspace -RemoteEntries $remoteMap
+
+        return [pscustomobject]@{
+            WorkspaceRoot = $workspace
+            ProjectId     = $ProjectId
+            DestPath      = $destPath
+            LocalBytes    = $pullApplyUtf8.GetBytes($LocalText)
+            RemoteBytes   = $pullApplyUtf8.GetBytes($RemoteText)
+            LocalMap      = $localMap
+            Snapshot      = $snapshot
+            BaseMap       = @{ 'src/a.ts' = $baseEntry }
+            Resolution    = (New-PullTestResolution -BaseMap @{ 'src/a.ts' = $baseEntry })
+        }
+    }
+
+    # ----------------------------------------------------------------------
+    # Clean pull: applies, updates BASE, journals, and prints the backup root
+    # ----------------------------------------------------------------------
+
+    $orchFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-1'
+
+    $orchResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $orchFixture.WorkspaceRoot `
+        -ProjectId $orchFixture.ProjectId `
+        -Resolution $orchFixture.Resolution `
+        -Local $orchFixture.LocalMap `
+        -Remote $orchFixture.Snapshot.Files `
+        -Snapshot $orchFixture.Snapshot `
+        -Force
+
+    Assert-Equal $true $orchResult.BaseUpdated "a successful pull must update BASE"
+    Assert-Equal 1 $orchResult.Applied "the clean pull must apply one action"
+    Assert-Equal 1 $orchResult.Overwritten "the clean pull replaces an existing local file"
+    Assert-Equal $false $orchResult.Cancelled "a completed pull must not report as cancelled"
+    Assert-Equal `
+        $orchFixture.RemoteBytes `
+        (Get-PullTestBytes -LiteralPath $orchFixture.DestPath) `
+        "the entrypoint must write the remote bytes"
+
+    $orchBaseRead = Read-BaseManifest -WorkspaceRoot $orchFixture.WorkspaceRoot
+    if ($null -eq $orchBaseRead) {
+        Assert-True $false "the entrypoint must leave a readable BASE"
+    }
+    else {
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $orchFixture.DestPath) `
+            $orchBaseRead.files.'src/a.ts'.sha256 `
+            "the entrypoint must record the verified hash in BASE"
+    }
+
+    # The report names the backup root so a user can recover an overwrite.
+    Assert-True ($null -ne $orchResult.BackupRoot) "a mutating pull must report a backup root"
+    Assert-True `
+        ((([string]$orchResult.Report) -match [regex]::Escape([string]$orchResult.BackupRoot))) `
+        "the report must print the backup root after a mutating pull"
+    Assert-True `
+        (([string]$orchResult.Report) -match '(?i)overwrit') `
+        "the report must state what was overwritten"
+    Assert-True `
+        (([string]$orchResult.Report) -match '(?i)pull') `
+        "the report must identify the command"
+
+    # Pull is not a dry run, so it must NOT print the Plan/Status closing lines.
+    Assert-True `
+        (([string]$orchResult.Report) -notmatch [regex]::Escape('Dry run only')) `
+        "a Pull report must not claim to be a dry run"
+    Assert-True `
+        (([string]$orchResult.Report) -notmatch [regex]::Escape('not permission to write')) `
+        "a Pull report must not carry the Plan-only closing lines"
+    Assert-True `
+        (([string]$orchResult.Report) -notmatch '(?i)bearer|authoriz|token') `
+        "a Pull report must never contain a credential"
+
+    # The journal records the run and every backup, metadata only.
+    $orchJournal = @(Read-RundotSyncJournal -WorkspaceRoot $orchFixture.WorkspaceRoot)
+    Assert-True ($orchJournal.Count -ge 2) "a pull must journal the run and its backups"
+    Assert-True `
+        (@($orchJournal | Where-Object { [string]$_.event -eq 'pull' }).Count -eq 1) `
+        "a pull must write exactly one run record"
+    Assert-True `
+        (@($orchJournal | Where-Object { [string]$_.event -eq 'pull-backup' }).Count -eq 1) `
+        "a pull must write one backup record per backed-up file"
+
+    $orchRunRecord = @($orchJournal | Where-Object { [string]$_.event -eq 'pull' })[0]
+    Assert-Equal 'success' ([string]$orchRunRecord.status) "a successful run must journal a success status"
+    Assert-Equal $true $orchRunRecord.baseUpdated "a successful run must journal baseUpdated true"
+    Assert-Equal 1 $orchRunRecord.applied "the run record must report the applied count"
+    Assert-Equal $orchFixture.ProjectId ([string]$orchRunRecord.projectId) "the run record must carry the projectId"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$orchRunRecord.planId)) `
+        "the run record must carry a planId"
+
+    $orchBackupRecord = @($orchJournal | Where-Object { [string]$_.event -eq 'pull-backup' })[0]
+    Assert-Equal 'src/a.ts' ([string]$orchBackupRecord.path) "a backup record must name the backed-up path"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$orchBackupRecord.backupSet)) `
+        "a backup record must name the backup set"
+
+    $orchJournalRaw = [System.IO.File]::ReadAllText(
+        (Get-RundotSyncJournalPath -WorkspaceRoot $orchFixture.WorkspaceRoot)
+    )
+    Assert-True `
+        ($orchJournalRaw -notmatch '(?i)bearer|authoriz|accesstoken|refreshtoken|"content"') `
+        "the pull journal must never record tokens or contents"
+
+    # ----------------------------------------------------------------------
+    # Confirmation: a declined overwrite changes nothing
+    # ----------------------------------------------------------------------
+
+    $declineFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-2'
+
+    $script:PullTestConfirmCalls = 0
+    $declineResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $declineFixture.WorkspaceRoot `
+        -ProjectId $declineFixture.ProjectId `
+        -Resolution $declineFixture.Resolution `
+        -Local $declineFixture.LocalMap `
+        -Remote $declineFixture.Snapshot.Files `
+        -Snapshot $declineFixture.Snapshot `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            $script:PullTestConfirmCalls++
+            return $false
+        }
+
+    Assert-Equal 1 $script:PullTestConfirmCalls "the overwrite confirmation must be invoked once"
+    Assert-Equal $true $declineResult.Cancelled "a declined confirmation must report as cancelled"
+    Assert-Equal 0 $declineResult.Applied "a declined confirmation must apply nothing"
+    Assert-Equal $false $declineResult.BaseUpdated "a declined confirmation must not update BASE"
+    Assert-Equal `
+        $declineFixture.LocalBytes `
+        (Get-PullTestBytes -LiteralPath $declineFixture.DestPath) `
+        "a declined confirmation must leave the local file untouched"
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $declineFixture.WorkspaceRoot).Count `
+        "a declined confirmation must not create a backup set"
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $declineFixture.WorkspaceRoot).Count `
+        "a declined confirmation must not journal a run that did nothing"
+    Assert-True `
+        ((([string]$declineResult.Report) -match '(?i)cancel')) `
+        "a declined report must say the pull was cancelled"
+
+    # ----------------------------------------------------------------------
+    # Confirmation: accepting applies and backs up
+    # ----------------------------------------------------------------------
+
+    $acceptFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-3'
+
+    $acceptResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $acceptFixture.WorkspaceRoot `
+        -ProjectId $acceptFixture.ProjectId `
+        -Resolution $acceptFixture.Resolution `
+        -Local $acceptFixture.LocalMap `
+        -Remote $acceptFixture.Snapshot.Files `
+        -Snapshot $acceptFixture.Snapshot `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            return $true
+        }
+
+    Assert-Equal $false $acceptResult.Cancelled "an accepted confirmation must not report as cancelled"
+    Assert-Equal 1 $acceptResult.Applied "an accepted confirmation must apply"
+    Assert-Equal `
+        $acceptFixture.RemoteBytes `
+        (Get-PullTestBytes -LiteralPath $acceptFixture.DestPath) `
+        "an accepted confirmation must write the remote bytes"
+
+    # ----------------------------------------------------------------------
+    # Force: skips the prompt but never the backup
+    # ----------------------------------------------------------------------
+
+    $forceFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-4'
+
+    $script:PullTestForceConfirmCalls = 0
+    $forceResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $forceFixture.WorkspaceRoot `
+        -ProjectId $forceFixture.ProjectId `
+        -Resolution $forceFixture.Resolution `
+        -Local $forceFixture.LocalMap `
+        -Remote $forceFixture.Snapshot.Files `
+        -Snapshot $forceFixture.Snapshot `
+        -Force `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            $script:PullTestForceConfirmCalls++
+            return $false
+        }
+
+    Assert-Equal 0 $script:PullTestForceConfirmCalls "-ForcePull must not prompt for confirmation"
+    Assert-Equal $false $forceResult.Cancelled "-ForcePull must not report as cancelled"
+    Assert-Equal 1 $forceResult.Applied "-ForcePull must apply the action"
+    Assert-Equal `
+        1 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $forceFixture.WorkspaceRoot).Count `
+        "-ForcePull must still create the backup set"
+    $forceBackupSets = @(Get-RundotSyncBackupSets -WorkspaceRoot $forceFixture.WorkspaceRoot)
+    Assert-Equal `
+        $forceFixture.LocalBytes `
+        (Get-PullTestBytes -LiteralPath (Join-Path $forceBackupSets[0].Path "src\a.ts")) `
+        "-ForcePull must still back up the overwritten original"
+
+    # ----------------------------------------------------------------------
+    # Fail closed: an overwrite with no way to confirm writes nothing
+    # ----------------------------------------------------------------------
+
+    $failClosedFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-5'
+
+    $failClosedThrew = $null
+    try {
+        Invoke-RundotSyncPull `
+            -WorkspaceRoot $failClosedFixture.WorkspaceRoot `
+            -ProjectId $failClosedFixture.ProjectId `
+            -Resolution $failClosedFixture.Resolution `
+            -Local $failClosedFixture.LocalMap `
+            -Remote $failClosedFixture.Snapshot.Files `
+            -Snapshot $failClosedFixture.Snapshot | Out-Null
+    }
+    catch {
+        $failClosedThrew = $_.Exception
+    }
+
+    Assert-True `
+        ($null -ne $failClosedThrew) `
+        "an overwrite that cannot be confirmed must abort rather than write silently"
+    Assert-Equal `
+        $failClosedFixture.LocalBytes `
+        (Get-PullTestBytes -LiteralPath $failClosedFixture.DestPath) `
+        "a fail-closed abort must leave the local file untouched"
+
+    # A remote-only create needs no confirmation at all.
+    $createFixture = New-PullTestWorkspace -Root $pullApplyRoot
+    $createStaging = Join-Path $pullApplyRoot "create-only-remote.ts"
+    Write-PullTestBytes -LiteralPath $createStaging -Bytes ($pullApplyUtf8.GetBytes("new file`n"))
+    $createRemoteMap = @{
+        'src/new.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $createStaging -WorkspaceStagingRoot $createFixture -CanonicalPath 'src/new.ts')
+    }
+    $createSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $createFixture -RemoteEntries $createRemoteMap
+
+    $createResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $createFixture `
+        -ProjectId 'proj-pull-orch-6' `
+        -Resolution (New-PullTestResolution -BaseMap $null) `
+        -Local @{} `
+        -Remote $createSnapshot.Files `
+        -Snapshot $createSnapshot
+
+    Assert-Equal 1 $createResult.Applied "a remote-only create must be applied without confirmation"
+    Assert-Equal 0 $createResult.Overwritten "a remote-only create is not an overwrite"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $createFixture "src\new.ts") -PathType Leaf) `
+        "a remote-only create must land the file"
+
+    # ----------------------------------------------------------------------
+    # No-op pull: no BASE write, no backup set, no journal
+    # ----------------------------------------------------------------------
+
+    $upToDateFixture = New-PullTestWorkspace -Root $pullApplyRoot
+    $upToDatePath = Join-Path $upToDateFixture "src\a.ts"
+    Write-PullTestBytes -LiteralPath $upToDatePath -Bytes ($pullApplyUtf8.GetBytes("same`n"))
+    $upToDateBaseEntry = Get-PullTestBaseEntryForLocal -LiteralPath $upToDatePath
+    $upToDateBaseFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $upToDateBaseFiles['src/a.ts'] = $upToDateBaseEntry
+    Save-BaseManifest -WorkspaceRoot $upToDateFixture -ProjectId 'proj-pull-orch-7' -Files $upToDateBaseFiles
+    $upToDateBytesBefore = [System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $upToDateFixture))
+
+    # REMOTE is the on-disk bytes, so BASE/LOCAL/REMOTE all agree.
+    $upToDateRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $upToDatePath -WorkspaceStagingRoot $upToDateFixture -CanonicalPath 'src/a.ts')
+    }
+    $upToDateSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $upToDateFixture -RemoteEntries $upToDateRemoteMap
+
+    $upToDateResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $upToDateFixture `
+        -ProjectId 'proj-pull-orch-7' `
+        -Resolution (New-PullTestResolution -BaseMap @{ 'src/a.ts' = $upToDateBaseEntry }) `
+        -Local @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $upToDatePath) } `
+        -Remote $upToDateSnapshot.Files `
+        -Snapshot $upToDateSnapshot
+
+    Assert-Equal 0 $upToDateResult.Applied "an up-to-date workspace must apply nothing"
+    Assert-Equal $false $upToDateResult.BaseUpdated "an up-to-date pull must not update BASE"
+    Assert-Equal `
+        ([System.BitConverter]::ToString($upToDateBytesBefore)) `
+        ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $upToDateFixture)))) `
+        "an up-to-date pull must leave BASE byte-identical"
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $upToDateFixture).Count `
+        "an up-to-date pull must not create a backup set"
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $upToDateFixture).Count `
+        "an up-to-date pull must not journal anything"
+    Assert-True `
+        ((([string]$upToDateResult.Report) -match '(?i)up to date|nothing to pull')) `
+        "an up-to-date report must say there is nothing to pull"
+    Assert-Null `
+        $upToDateResult.BackupRoot `
+        "an up-to-date pull must not claim a backup root"
+
+    # ----------------------------------------------------------------------
+    # Failure: journaled as failed, with the previous BASE authoritative
+    # ----------------------------------------------------------------------
+
+    $orchFailFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-8'
+    $orchFailBaseBefore = [System.IO.File]::ReadAllBytes(
+        (Get-BaseManifestPath -WorkspaceRoot $orchFailFixture.WorkspaceRoot)
+    )
+
+    $realWriteForOrchestration = ${function:Invoke-RundotSyncPullWriteAction}
+    function Invoke-RundotSyncPullWriteAction {
+        param($WorkspaceRoot, $LocalFullPath, $Action, $RemoteMap)
+        throw [System.InvalidOperationException]::new("Injected orchestration write failure.")
+    }
+
+    $orchFailThrew = $null
+    try {
+        Invoke-RundotSyncPull `
+            -WorkspaceRoot $orchFailFixture.WorkspaceRoot `
+            -ProjectId $orchFailFixture.ProjectId `
+            -Resolution $orchFailFixture.Resolution `
+            -Local $orchFailFixture.LocalMap `
+            -Remote $orchFailFixture.Snapshot.Files `
+            -Snapshot $orchFailFixture.Snapshot `
+            -Force | Out-Null
+    }
+    catch {
+        $orchFailThrew = $_.Exception
+    }
+    finally {
+        Set-Item -Path function:Invoke-RundotSyncPullWriteAction -Value $realWriteForOrchestration
+    }
+
+    Assert-True ($null -ne $orchFailThrew) "a failed entrypoint run must surface the failure"
+    Assert-Equal `
+        ([System.BitConverter]::ToString($orchFailBaseBefore)) `
+        ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes(
+            (Get-BaseManifestPath -WorkspaceRoot $orchFailFixture.WorkspaceRoot)))) `
+        "a failed pull must leave the previous BASE byte-identical"
+
+    $orchFailJournal = @(
+        Read-RundotSyncJournal -WorkspaceRoot $orchFailFixture.WorkspaceRoot |
+            Where-Object { [string]$_.event -eq 'pull' }
+    )
+    Assert-Equal 1 $orchFailJournal.Count "a failed pull must journal exactly one run record"
+    if ($orchFailJournal.Count -eq 1) {
+        Assert-Equal 'failed' ([string]$orchFailJournal[0].status) "a failed run must journal a failed status"
+        Assert-Equal $false $orchFailJournal[0].baseUpdated "a failed run must journal baseUpdated false"
+        Assert-True `
+            (-not [string]::IsNullOrEmpty([string]$orchFailJournal[0].reason)) `
+            "a failed run must journal why it failed"
+    }
+
+    # ----------------------------------------------------------------------
+    # Retention runs after success and never removes the in-flight set
+    # ----------------------------------------------------------------------
+
+    $retainFixture = New-PullTestPullFixture `
+        -Root $pullApplyRoot `
+        -ProjectId 'proj-pull-orch-9'
+
+    # Seed more old sets than the retention limit.
+    $retainRoot = Get-RundotSyncBackupRoot -WorkspaceRoot $retainFixture.WorkspaceRoot
+    New-Item -ItemType Directory -Force -Path $retainRoot | Out-Null
+    $retainNow = [DateTime]::UtcNow
+    for ($i = 0; $i -lt 14; $i++) {
+        $oldSet = Join-Path $retainRoot (
+            New-RundotSyncBackupSetName -Timestamp $retainNow.AddDays(-30).AddMinutes(-$i)
+        )
+        New-Item -ItemType Directory -Force -Path $oldSet | Out-Null
+    }
+    $retainSeedCount = @(Get-RundotSyncBackupSets -WorkspaceRoot $retainFixture.WorkspaceRoot).Count
+    Assert-Equal 14 $retainSeedCount "the retention fixture must seed fourteen old sets"
+
+    $retainResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $retainFixture.WorkspaceRoot `
+        -ProjectId $retainFixture.ProjectId `
+        -Resolution $retainFixture.Resolution `
+        -Local $retainFixture.LocalMap `
+        -Remote $retainFixture.Snapshot.Files `
+        -Snapshot $retainFixture.Snapshot `
+        -Force
+
+    Assert-Equal 1 $retainResult.Applied "the retention run must apply its action"
+
+    $retainSetsAfter = @(Get-RundotSyncBackupSets -WorkspaceRoot $retainFixture.WorkspaceRoot)
+    Assert-True `
+        ($retainSetsAfter.Count -lt ($retainSeedCount + 1)) `
+        "retention must prune old sets after a successful pull"
+    Assert-True `
+        (Test-Path -LiteralPath $retainResult.BackupSetPath -PathType Container) `
+        "retention must never delete the in-flight backup set"
+    Assert-True `
+        ($retainResult.BackupSetPath -eq (Get-RundotSyncBackupSetPath -WorkspaceRoot $retainFixture.WorkspaceRoot -Name $retainResult.BackupSetName)) `
+        "the in-flight set must still be addressable after retention"
 }
 finally {
     if (Test-Path -LiteralPath $pullApplyRoot) {

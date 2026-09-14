@@ -25,6 +25,7 @@ $script:RundotSyncJournalAllowedFields = @(
     'projectId',
     'planId',
     'backupSet',
+    'path',
     'applied',
     'overwritten',
     'created',
@@ -119,10 +120,32 @@ function Format-RundotSyncJournalLine {
             continue
         }
 
+        if ($name -eq 'path') {
+            Assert-SyncJournalPathIsRelative -Path $value
+        }
+
         $ordered[$name] = $value
     }
 
     return ($ordered | ConvertTo-Json -Compress -Depth 4)
+}
+
+function Assert-SyncJournalPathIsRelative {
+    # A journal path is a canonical workspace-relative identity. An absolute
+    # path leaks the user's machine layout into a file that is meant to be
+    # shareable, so it is refused rather than recorded.
+    param([string]$Path)
+
+    $text = [string]$Path
+    if ([string]::IsNullOrEmpty($text)) {
+        return
+    }
+
+    if ($text -match '[A-Za-z]:' -or $text.StartsWith('\\') -or $text.StartsWith('/')) {
+        throw [System.InvalidOperationException]::new(
+            'Refusing to write a journal record: the path is absolute. Journal paths must be workspace-relative.'
+        )
+    }
 }
 
 function Test-RundotSyncJournalNeedsTerminator {
