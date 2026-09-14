@@ -13,15 +13,24 @@
 # A download that replaces an existing local file is flagged as an overwrite:
 # the caller counts those, confirms them, and backs each one up before writing.
 #
-# This file also owns the apply/verify/rollback path and the verified BASE
-# update. Every local write is backed up first and re-hashed afterwards, so a
-# partial run can be rolled back and can never leave a BASE that describes
-# bytes that were not just verified.
+# This file owns three layers:
+#
+#   1. selection     - which paths Pull may apply, and why the rest are not
+#   2. apply/verify  - backed-up, atomic local writes with full rollback
+#   3. BASE update   - additive, and only after every write is re-verified
+#
+# BASE is updated by Update-RundotSyncBaseAfterPull, never by the apply layer.
+# The apply layer returns the re-hashed identities it verified, so BASE records
+# bytes that were proven on disk rather than bytes that were merely intended.
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
 # Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1, and
 # Journal.ps1 first.
 
+
+# ----------------------------------------------------------------------------
+# Selection: the only automatic local write is a clean download
+# ----------------------------------------------------------------------------
 
 function Get-SyncPullSelection {
     # Split the three-way classification into the actions Pull may apply and
@@ -150,422 +159,6 @@ function Get-SyncPullOverwriteRows {
 }
 
 
-# ----------------------------------------------------------------------------
-# Apply, verify, and rollback
-#
-# Order is the safety property. Nothing is written until every action is
-# representable, every staged source exists, and every overwrite is still the
-# exact file that was scanned. Every overwrite is then backed up before the
-# first write. A write is atomic (tmp, verify, replace). Any failure restores
-# the backups, removes the files Pull created, prunes the directories Pull
-# created, and re-throws, so the caller never records success and BASE is never
-# updated.
-# ----------------------------------------------------------------------------
-
-function Get-SyncPullDirectorySet {
-    # The set of existing directories under the workspace, used to tell a
-    # directory Pull created from one that was already there.
-    param(
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot
-    )
-
-    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
-    $root = Get-NormalizedWorkspaceRoot -WorkspaceRoot $WorkspaceRoot
-
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        return $set
-    }
-
-    foreach ($dir in @(Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
-        [void]$set.Add($dir.FullName)
-    }
-
-    return $set
-}
-
-function Remove-RundotSyncCreatedDirectories {
-    # Best-effort cleanup of empty directories that did not exist before the
-    # pull. Deepest first, and only when empty, so a directory holding
-    # anything else is never removed.
-    param(
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot,
-
-        $DirectoriesBefore
-    )
-
-    $removed = 0
-    $root = Get-NormalizedWorkspaceRoot -WorkspaceRoot $WorkspaceRoot
-
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        return 0
-    }
-
-    $existing = @(Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue)
-    $ordered = @($existing | Sort-Object -Property { $_.FullName.Length } -Descending)
-
-    foreach ($dir in $ordered) {
-        if ($null -ne $DirectoriesBefore -and $DirectoriesBefore.Contains($dir.FullName)) {
-            continue
-        }
-
-        $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
-        if ($children.Count -gt 0) {
-            continue
-        }
-
-        try {
-            Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
-            $removed++
-        }
-        catch {
-            # Best effort; a stuck directory never fails a rollback.
-        }
-    }
-
-    return $removed
-}
-
-function Assert-SyncPullLocalUnchanged {
-    # The concurrent-edit guard. A file that changed between the LOCAL manifest
-    # capture and this moment is not the file the plan was computed against, so
-    # it is never overwritten. Force does not bypass this: it is not a
-    # preference, it is a correctness check.
-    param(
-        [Parameter(Mandatory)]
-        $Action,
-
-        $Local,
-
-        [Parameter(Mandatory)]
-        [string]$LocalFullPath
-    )
-
-    $path = [string]$Action.Path
-    $entry = Get-SyncMapEntry -Map $Local -Path $path
-
-    if ($null -eq $entry) {
-        throw [System.InvalidOperationException]::new(
-            "Local file '$path' changed since it was scanned: it no longer exists. Refusing to overwrite it."
-        )
-    }
-
-    if (-not (Test-Path -LiteralPath $LocalFullPath -PathType Leaf)) {
-        throw [System.InvalidOperationException]::new(
-            "Local file '$path' changed since it was scanned: it is no longer a file. Refusing to overwrite it."
-        )
-    }
-
-    $current = Get-LocalFileIdentity -LiteralPath $LocalFullPath
-    $expected = [string](Get-SyncEntrySha256 -Entry $entry)
-
-    if (-not (Test-SyncHashEqual -LeftSha256 $current.Sha256 -RightSha256 $expected)) {
-        throw [System.InvalidOperationException]::new(
-            "Local file '$path' changed since it was scanned. Refusing to overwrite it."
-        )
-    }
-}
-
-function Assert-SyncPullStagedSource {
-    param(
-        [Parameter(Mandatory)]
-        $Action
-    )
-
-    $staging = [string]$Action.RemoteStagingPath
-
-    if ([string]::IsNullOrEmpty($staging) -or -not (Test-Path -LiteralPath $staging -PathType Leaf)) {
-        throw [System.InvalidOperationException]::new(
-            "Staged remote content for '$($Action.Path)' is missing. Refusing to pull."
-        )
-    }
-}
-
-function Invoke-RundotSyncPullWriteAction {
-    # Write one action's staged remote bytes to its local path, atomically and
-    # verified. The destination is either its exact previous content or exactly
-    # the verified remote bytes; a partially written destination is impossible.
-    param(
-        [Parameter(Mandatory)]
-        $Action,
-
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot,
-
-        [Parameter(Mandatory)]
-        [string]$LocalFullPath,
-
-        # Accepted so callers (and tests) can pass the remote map through. The
-        # action already carries the staged source path, so it is not needed
-        # for the write itself.
-        $RemoteMap
-    )
-
-    $path = [string]$Action.Path
-
-    Assert-SyncPullStagedSource -Action $Action
-    $staging = [string]$Action.RemoteStagingPath
-
-    $parent = Split-Path -Parent $LocalFullPath
-    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    }
-
-    $tmp = $LocalFullPath + '.tmp'
-    if (Test-Path -LiteralPath $tmp) {
-        Remove-Item -LiteralPath $tmp -Force
-    }
-
-    try {
-        [System.IO.File]::Copy($staging, $tmp, $true)
-
-        # Verify the bytes that will land, before they land.
-        $written = Get-LocalFileIdentity -LiteralPath $tmp
-        if (-not (Test-SyncHashEqual `
-                -LeftSha256 $written.Sha256 `
-                -RightSha256 ([string]$Action.RemoteSha256))) {
-            throw [System.InvalidOperationException]::new(
-                "Written bytes for '$path' do not match the remote snapshot. Refusing to replace the local file."
-            )
-        }
-
-        if (Test-Path -LiteralPath $LocalFullPath -PathType Leaf) {
-            $replaceBackup = $LocalFullPath + '.pullbak'
-            [System.IO.File]::Replace($tmp, $LocalFullPath, $replaceBackup)
-            if (Test-Path -LiteralPath $replaceBackup) {
-                Remove-Item -LiteralPath $replaceBackup -Force
-            }
-        }
-        else {
-            [System.IO.File]::Move($tmp, $LocalFullPath)
-        }
-    }
-    catch {
-        if (Test-Path -LiteralPath $tmp) {
-            try {
-                Remove-Item -LiteralPath $tmp -Force -ErrorAction Stop
-            }
-            catch {
-                # The destination is never the tmp path, so a stuck tmp is not
-                # a partial destination. Surface the original failure.
-            }
-        }
-
-        throw
-    }
-
-    return $LocalFullPath
-}
-
-function Assert-SyncPullAppliedLocal {
-    # Final LOCAL check: every applied path must exist and hash to the remote
-    # identity, or the run is rolled back.
-    param(
-        [object[]]$AppliedActions,
-
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot
-    )
-
-    foreach ($action in @($AppliedActions)) {
-        $path = [string]$action.Path
-        $full = ConvertTo-LocalFullPath -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
-
-        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
-            throw [System.InvalidOperationException]::new(
-                "Post-write verification failed for '$path': the file is missing."
-            )
-        }
-
-        $identity = Get-LocalFileIdentity -LiteralPath $full
-        if (-not (Test-SyncHashEqual `
-                -LeftSha256 $identity.Sha256 `
-                -RightSha256 ([string]$action.RemoteSha256))) {
-            throw [System.InvalidOperationException]::new(
-                "Post-write verification failed for '$path': local bytes do not match the remote snapshot."
-            )
-        }
-    }
-}
-
-function Invoke-RundotSyncPullRollback {
-    # Undo a partially applied pull. Overwritten files come back from the
-    # backup set, files Pull created are removed, and directories Pull created
-    # are pruned when empty. Best effort throughout: the original failure is
-    # what the caller must see, and a rollback that cannot finish still leaves
-    # the backup set on disk for manual recovery.
-    param(
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot,
-
-        [object[]]$AppliedActions,
-
-        $BackupSet,
-
-        $DirectoriesBefore
-    )
-
-    $restored = 0
-    $removed = 0
-
-    foreach ($action in @($AppliedActions)) {
-        $path = [string]$action.Path
-        $full = ConvertTo-LocalFullPath -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
-
-        if ([bool]$action.IsOverwrite -and $null -ne $BackupSet) {
-            $backupPath = Join-Path $BackupSet.Path ($path.Replace('/', '\'))
-
-            if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
-                try {
-                    Restore-RundotSyncBackupFile -BackupPath $backupPath -DestinationPath $full
-                    $restored++
-                    continue
-                }
-                catch {
-                    # Fall through: leaving the pulled content is better than
-                    # deleting a file that has a backup we could not apply.
-                }
-            }
-        }
-
-        if (Test-Path -LiteralPath $full -PathType Leaf) {
-            try {
-                Remove-Item -LiteralPath $full -Force -ErrorAction Stop
-                $removed++
-            }
-            catch {
-                # Best effort.
-            }
-        }
-    }
-
-    $directoriesRemoved = Remove-RundotSyncCreatedDirectories `
-        -WorkspaceRoot $WorkspaceRoot `
-        -DirectoriesBefore $DirectoriesBefore
-
-    return [pscustomobject]@{
-        Restored           = $restored
-        Removed            = $removed
-        DirectoriesRemoved = $directoriesRemoved
-    }
-}
-
-function Invoke-RundotSyncPullApply {
-    # Apply the selected clean downloads to LOCAL. Returns counts plus the
-    # backup set. Throws on any failure, after rolling back, so the caller
-    # never records success and never updates BASE.
-    param(
-        [Parameter(Mandatory)]
-        [string]$WorkspaceRoot,
-
-        [object[]]$Actions,
-
-        $Local,
-
-        $Remote,
-
-        [string]$BackupRoot
-    )
-
-    Initialize-RundotSyncLayout -WorkspaceRoot $WorkspaceRoot
-
-    $actionRows = @($Actions | Where-Object { $null -ne $_ })
-    $overwrites = @(Get-SyncPullOverwriteRows -Actions $actionRows)
-
-    if ($actionRows.Count -eq 0) {
-        return [pscustomobject]@{
-            Applied        = 0
-            Overwritten    = 0
-            Created        = 0
-            BackupSet      = $null
-            AppliedActions = @()
-        }
-    }
-
-    # Pre-flight. No backup set and no write happens until every action is
-    # provably safe to apply against the tree as it is right now.
-    foreach ($action in $actionRows) {
-        Assert-SyncPathRepresentable `
-            -WorkspaceRoot $WorkspaceRoot `
-            -CanonicalPath ([string]$action.Path)
-        Assert-SyncPullStagedSource -Action $action
-    }
-
-    foreach ($action in $overwrites) {
-        $full = ConvertTo-LocalFullPath `
-            -WorkspaceRoot $WorkspaceRoot `
-            -CanonicalPath ([string]$action.Path)
-        Assert-SyncPullLocalUnchanged -Action $action -Local $Local -LocalFullPath $full
-    }
-
-    # Back up every original before the first write. A backup failure aborts
-    # here, with nothing overwritten.
-    $backupSet = $null
-    if ($overwrites.Count -gt 0) {
-        $backupSet = New-RundotSyncBackupSet -WorkspaceRoot $WorkspaceRoot
-
-        foreach ($action in $overwrites) {
-            $full = ConvertTo-LocalFullPath `
-                -WorkspaceRoot $WorkspaceRoot `
-                -CanonicalPath ([string]$action.Path)
-            $backupPath = Join-Path $backupSet.Path (([string]$action.Path).Replace('/', '\'))
-            Copy-RundotSyncBackupFile -SourcePath $full -DestinationPath $backupPath
-        }
-    }
-
-    $directoriesBefore = Get-SyncPullDirectorySet -WorkspaceRoot $WorkspaceRoot
-
-    $appliedActions = New-Object 'System.Collections.Generic.List[object]'
-    $overwritten = 0
-    $created = 0
-
-    try {
-        foreach ($action in $actionRows) {
-            $full = ConvertTo-LocalFullPath `
-                -WorkspaceRoot $WorkspaceRoot `
-                -CanonicalPath ([string]$action.Path)
-
-            [void](Invoke-RundotSyncPullWriteAction `
-                -Action $action `
-                -WorkspaceRoot $WorkspaceRoot `
-                -LocalFullPath $full `
-                -RemoteMap $Remote)
-
-            [void]$appliedActions.Add($action)
-
-            if ([bool]$action.IsOverwrite) {
-                $overwritten++
-            }
-            else {
-                $created++
-            }
-        }
-
-        Assert-SyncPullAppliedLocal `
-            -AppliedActions $appliedActions.ToArray() `
-            -WorkspaceRoot $WorkspaceRoot
-    }
-    catch {
-        [void](Invoke-RundotSyncPullRollback `
-            -WorkspaceRoot $WorkspaceRoot `
-            -AppliedActions $appliedActions.ToArray() `
-            -BackupSet $backupSet `
-            -DirectoriesBefore $directoriesBefore)
-
-        throw
-    }
-
-    return [pscustomobject]@{
-        Applied        = $appliedActions.Count
-        Overwritten    = $overwritten
-        Created        = $created
-        BackupSet      = $backupSet
-        AppliedActions = $appliedActions.ToArray()
-    }
-}
-
-
 # ==========================================================================
 # Apply, verify, and rollback
 #
@@ -573,6 +166,9 @@ function Invoke-RundotSyncPullApply {
 # download, the local file it replaces still matches the manifest captured
 # this run, and the bytes it wrote hash to the remote identity. Every local
 # write is backed up first, so any failure can be rolled back exactly.
+#
+# The apply layer never writes BASE. It returns the re-hashed local identities
+# it verified; the caller decides whether to record them.
 # ==========================================================================
 
 function Invoke-RundotSyncPullWriteAction {
@@ -619,8 +215,8 @@ function Invoke-RundotSyncPullWriteAction {
         )
     }
 
-    # Atomic write: tmp, then rename over the destination. A crash must never
-    # leave a truncated local file.
+    # Atomic write: tmp in the destination directory, then rename over the
+    # destination. A crash must never leave a truncated local file.
     $parent = Split-Path -Parent $LocalFullPath
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
@@ -784,6 +380,9 @@ function Invoke-RundotSyncPullApply {
     # -BackupSetPath applies to the whole run: either every action is backed up
     # into it, or none is. Tests may use an isolated path so they never depend
     # on the workspace backup root.
+    #
+    # Never writes BASE. On success it returns the verified on-disk identities
+    # in -AppliedLocals, which Update-RundotSyncBaseAfterPull consumes.
     param(
         [Parameter(Mandatory)][string]$WorkspaceRoot,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions,
@@ -796,15 +395,15 @@ function Invoke-RundotSyncPullApply {
     $actionRows = @($Actions)
     if ($actionRows.Count -eq 0) {
         return [pscustomobject]@{
-            Applied          = 0
-            Overwritten      = 0
-            Created          = 0
-            Deleted          = 0
-            BackupSet        = $null
-            BackupSetPath    = $null
-            AppliedPaths     = @()
-            AppliedActions   = @()
-            AppliedLocals    = @()
+            Applied        = 0
+            Overwritten    = 0
+            Created        = 0
+            Deleted        = 0
+            BackupSet      = $null
+            BackupSetPath  = $null
+            AppliedPaths   = @()
+            AppliedActions = @()
+            AppliedLocals  = @()
         }
     }
 
@@ -887,7 +486,6 @@ function Invoke-RundotSyncPullApply {
             $localFullPath = ConvertTo-LocalFullPath `
                 -WorkspaceRoot $WorkspaceRoot `
                 -CanonicalPath $path
-            $localEntry = Get-SyncMapEntry -Map $Local -Path $path
             $isOverwrite = [bool]$action.IsOverwrite
 
             $createdDirectories = @()
@@ -970,4 +568,125 @@ function Invoke-RundotSyncPullApply {
         AppliedActions = @($actionRows)
         AppliedLocals  = @($appliedLocals.ToArray())
     }
+}
+
+
+# ==========================================================================
+# Verified BASE update
+#
+# BASE records the last verified shared state, so it moves only after the
+# apply layer has proven every written byte. The update is additive: existing
+# entries are preserved and only applied paths are overlaid, so a deletion
+# candidate keeps its entry and no path silently drops out of BASE.
+#
+# If any required operation failed, the previous BASE remains authoritative:
+# nothing here runs, and Save-BaseManifest is never reached.
+# ==========================================================================
+
+function New-RundotSyncPullBaseFiles {
+    # Merge the re-verified applied identities over the existing BASE entries.
+    # Additive on purpose: BASE is not a tombstone log, and Pull does not
+    # delete, so an untouched entry must survive exactly as it was.
+    param(
+        $BaseFiles,
+        [object[]]$AppliedLocals
+    )
+
+    $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+
+    if ($BaseFiles -is [System.Collections.IDictionary]) {
+        foreach ($key in @($BaseFiles.Keys)) {
+            $files[[string]$key] = $BaseFiles[$key]
+        }
+    }
+    elseif ($null -ne $BaseFiles) {
+        foreach ($property in $BaseFiles.PSObject.Properties) {
+            $files[[string]$property.Name] = $property.Value
+        }
+    }
+
+    foreach ($applied in @($AppliedLocals)) {
+        if ($null -eq $applied) {
+            continue
+        }
+
+        $files[[string]$applied.Path] = [pscustomobject]@{
+            Sha256            = [string]$applied.Sha256
+            Size              = $applied.Size
+            LocalDetectedKind = [string]$applied.LocalDetectedKind
+            LineEnding        = $applied.LineEnding
+            HasBom            = $applied.HasBom
+        }
+    }
+
+    return $files
+}
+
+function Assert-SyncPullBaseUpdatePreconditions {
+    # The gate in front of the BASE write. It re-reads LOCAL and requires every
+    # applied path to still match REMOTE, so BASE can only ever describe bytes
+    # that are present and verified right now.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [object[]]$AppliedActions
+    )
+
+    $actionRows = @($AppliedActions | Where-Object { $null -ne $_ })
+
+    foreach ($action in $actionRows) {
+        $path = [string]$action.Path
+        $full = ConvertTo-LocalFullPath -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            throw [System.InvalidOperationException]::new(
+                "Refusing to update BASE: '$path' is not present in LOCAL."
+            )
+        }
+
+        $identity = Get-LocalFileIdentity -LiteralPath $full
+        if (-not (Test-SyncHashEqual `
+                -LeftSha256 $identity.Sha256 `
+                -RightSha256 ([string]$action.RemoteSha256))) {
+            throw [System.InvalidOperationException]::new(
+                "Refusing to update BASE: '$path' no longer matches the remote snapshot."
+            )
+        }
+    }
+}
+
+function Update-RundotSyncBaseAfterPull {
+    # The only BASE writer for Pull. Call it after a successful apply. It
+    # re-verifies every applied path against REMOTE, merges additively, and
+    # then replaces BASE atomically. It throws rather than writing a BASE it
+    # could not prove, so the previous BASE stays authoritative.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [object[]]$AppliedActions,
+
+        [object[]]$AppliedLocals,
+
+        $BaseFiles
+    )
+
+    Assert-SyncPullBaseUpdatePreconditions `
+        -WorkspaceRoot $WorkspaceRoot `
+        -AppliedActions $AppliedActions
+
+    $files = New-RundotSyncPullBaseFiles `
+        -BaseFiles $BaseFiles `
+        -AppliedLocals $AppliedLocals
+
+    Save-BaseManifest `
+        -WorkspaceRoot $WorkspaceRoot `
+        -ProjectId $ProjectId `
+        -Files $files
+
+    return $files
 }

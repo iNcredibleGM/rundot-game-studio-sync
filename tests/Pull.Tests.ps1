@@ -1152,6 +1152,414 @@ try {
         $representThrew = $_.Exception
     }
     Assert-True ($null -ne $representThrew) "an unrepresentable path must abort before any write"
+
+    # ======================================================================
+    # Verified, additive BASE update
+    #
+    # BASE is the last verified shared state, so it moves only after every
+    # written byte is proven. The update is additive: untouched entries
+    # survive, and Pull never deletes, so a deletion candidate keeps its entry.
+    # ======================================================================
+
+    function Invoke-PullTestEndToEnd {
+        # Mirror the CLI: select, apply, and update BASE only on success.
+        param(
+            [Parameter(Mandatory)][string]$WorkspaceRoot,
+            [Parameter(Mandatory)][string]$ProjectId,
+            $Base,
+            $Local,
+            $Snapshot,
+            [switch]$SkipBaseUpdate
+        )
+
+        $selection = Get-SyncPullSelection -Base $Base -Local $Local -Remote $Snapshot.Files
+
+        $applyResult = Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $WorkspaceRoot `
+            -Actions $selection.Actions `
+            -Local $Local `
+            -Remote $Snapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $WorkspaceRoot)
+
+        $baseUpdated = $false
+
+        if (-not $SkipBaseUpdate -and $applyResult.Applied -gt 0) {
+            $existingBaseFiles = $null
+            $liveBase = Read-BaseManifest -WorkspaceRoot $WorkspaceRoot
+            if ($null -ne $liveBase) {
+                $existingBaseFiles = $liveBase.files
+            }
+
+            [void](Update-RundotSyncBaseAfterPull `
+                -WorkspaceRoot $WorkspaceRoot `
+                -ProjectId $ProjectId `
+                -AppliedActions $applyResult.AppliedActions `
+                -AppliedLocals $applyResult.AppliedLocals `
+                -BaseFiles $existingBaseFiles)
+            $baseUpdated = $true
+        }
+
+        return [pscustomobject]@{
+            Selection   = $selection
+            ApplyResult = $applyResult
+            BaseUpdated = $baseUpdated
+        }
+    }
+
+    # ----------------------------------------------------------------------
+    # Success updates BASE with the verified on-disk identity
+    # ----------------------------------------------------------------------
+
+    $baseUpdateWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $baseUpdateProjectId = 'proj-pull-base-1'
+
+    $baseUpdateUntouchedPath = Join-Path $baseUpdateWorkspace "src\untouched.ts"
+    Write-PullTestBytes -LiteralPath $baseUpdateUntouchedPath -Bytes ($pullApplyUtf8.GetBytes("untouched`n"))
+
+    $baseUpdateBinaryPath = Join-Path $baseUpdateWorkspace "public\logo.png"
+    Write-PullTestBytes -LiteralPath $baseUpdateBinaryPath -Bytes ([byte[]](0xFF, 0xD8, 0x00, 0x01))
+
+    $baseUpdateDestPath = Join-Path $baseUpdateWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $baseUpdateDestPath -Bytes ($pullApplyUtf8.GetBytes("before pull`n"))
+
+    # Seed BASE with two untouched entries (one binary) plus the download path.
+    $seedFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $seedFiles['src/untouched.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $baseUpdateUntouchedPath)
+    $seedFiles['public/logo.png'] = (Get-PullTestBaseEntryForLocal -LiteralPath $baseUpdateBinaryPath)
+    $seedFiles['src/a.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $baseUpdateDestPath)
+    Save-BaseManifest `
+        -WorkspaceRoot $baseUpdateWorkspace `
+        -ProjectId $baseUpdateProjectId `
+        -Files $seedFiles
+
+    $baseUpdateStaging = Join-Path $pullApplyRoot "base-update-remote.ts"
+    $baseUpdateRemoteBytes = $pullApplyUtf8.GetBytes("after pull`n")
+    Write-PullTestBytes -LiteralPath $baseUpdateStaging -Bytes $baseUpdateRemoteBytes
+
+    $baseUpdateLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $baseUpdateDestPath) }
+    $baseUpdateRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $baseUpdateStaging -WorkspaceStagingRoot $baseUpdateWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $baseUpdateSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $baseUpdateWorkspace -RemoteEntries $baseUpdateRemoteMap
+
+    $baseUpdateBase = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $baseUpdateDestPath) }
+
+    $baseUpdateResult = Invoke-PullTestEndToEnd `
+        -WorkspaceRoot $baseUpdateWorkspace `
+        -ProjectId $baseUpdateProjectId `
+        -Base $baseUpdateBase `
+        -Local $baseUpdateLocalMap `
+        -Snapshot $baseUpdateSnapshot
+
+    Assert-Equal 1 $baseUpdateResult.ApplyResult.Applied "the end-to-end pull must apply one action"
+    Assert-Equal $true $baseUpdateResult.BaseUpdated "a successful pull must update BASE"
+
+    $baseUpdateRead = Read-BaseManifest -WorkspaceRoot $baseUpdateWorkspace
+    Assert-True ($null -ne $baseUpdateRead) "a successful pull must leave a readable BASE"
+
+    if ($null -ne $baseUpdateRead) {
+        Assert-BaseOwnership `
+            -Base $baseUpdateRead `
+            -ProjectId $baseUpdateProjectId `
+            -WorkspaceRoot $baseUpdateWorkspace
+
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $baseUpdateDestPath) `
+            $baseUpdateRead.files.'src/a.ts'.sha256 `
+            "BASE must record the re-verified on-disk hash for the pulled path"
+        Assert-Equal `
+            'utf8' `
+            $baseUpdateRead.files.'src/a.ts'.kind `
+            "BASE must record the pulled path's byte-derived kind"
+
+        # Additive: untouched entries survive byte-for-byte.
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $baseUpdateUntouchedPath) `
+            $baseUpdateRead.files.'src/untouched.ts'.sha256 `
+            "an untouched BASE entry must survive a pull unchanged"
+        Assert-Equal `
+            $baseUpdateRead.files.'public/logo.png'.sha256 `
+            ([string]$seedFiles['public/logo.png'].Sha256) `
+            "an untouched binary BASE entry must survive a pull"
+
+        # The binary entry keeps its kind and omits text-only diagnostics.
+        Assert-Equal 'binary' $baseUpdateRead.files.'public/logo.png'.kind "a binary BASE entry must keep its kind"
+        Assert-Null `
+            $baseUpdateRead.files.'public/logo.png'.lineEnding `
+            "a binary BASE entry must still omit lineEnding"
+        Assert-Null `
+            $baseUpdateRead.files.'public/logo.png'.hasBom `
+            "a binary BASE entry must still omit hasBom"
+
+        Assert-Equal `
+            3 `
+            @($baseUpdateRead.files.PSObject.Properties).Count `
+            "an additive update must not add or drop entries"
+    }
+
+    # ----------------------------------------------------------------------
+    # BASE records only bytes it could prove: a drifted path refuses the update
+    # ----------------------------------------------------------------------
+
+    $driftWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $driftProjectId = 'proj-pull-base-2'
+    $driftPath = Join-Path $driftWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $driftPath -Bytes ($pullApplyUtf8.GetBytes("drift before`n"))
+
+    $driftFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $driftFiles['src/a.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $driftPath)
+    Save-BaseManifest -WorkspaceRoot $driftWorkspace -ProjectId $driftProjectId -Files $driftFiles
+    $driftBaseBytesBefore = [System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $driftWorkspace))
+
+    $driftStaging = Join-Path $pullApplyRoot "drift-remote.ts"
+    Write-PullTestBytes -LiteralPath $driftStaging -Bytes ($pullApplyUtf8.GetBytes("drift remote`n"))
+    $driftRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $driftStaging -WorkspaceStagingRoot $driftWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $driftSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $driftWorkspace -RemoteEntries $driftRemoteMap
+    $driftLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $driftPath) }
+    $driftSelection = Get-SyncPullSelection -Base @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $driftPath) } -Local $driftLocalMap -Remote $driftSnapshot.Files
+
+    $driftApply = Invoke-RundotSyncPullApply `
+        -WorkspaceRoot $driftWorkspace `
+        -Actions $driftSelection.Actions `
+        -Local $driftLocalMap `
+        -Remote $driftSnapshot.Files `
+        -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $driftWorkspace)
+
+    # The file drifts after it was verified but before BASE is updated.
+    Write-PullTestBytes -LiteralPath $driftPath -Bytes ($pullApplyUtf8.GetBytes("drifted after verify`n"))
+
+    $driftThrew = $null
+    try {
+        Update-RundotSyncBaseAfterPull `
+            -WorkspaceRoot $driftWorkspace `
+            -ProjectId $driftProjectId `
+            -AppliedActions $driftApply.AppliedActions `
+            -AppliedLocals $driftApply.AppliedLocals `
+            -BaseFiles $driftFiles | Out-Null
+    }
+    catch {
+        $driftThrew = $_.Exception
+    }
+
+    Assert-True ($null -ne $driftThrew) "BASE must not be updated for a path that no longer matches REMOTE"
+    if ($null -ne $driftThrew) {
+        Assert-True `
+            (([string]$driftThrew.Message) -match '(?i)refusing to update base') `
+            "the drift refusal should say BASE was not updated"
+    }
+    Assert-Equal `
+        ([System.BitConverter]::ToString($driftBaseBytesBefore)) `
+        ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $driftWorkspace)))) `
+        "a refused BASE update must leave the previous BASE byte-identical"
+
+    # ----------------------------------------------------------------------
+    # A failed apply never reaches BASE: the old BASE stays authoritative
+    # ----------------------------------------------------------------------
+
+    $failBaseWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $failBaseProjectId = 'proj-pull-base-3'
+    $failBasePath = Join-Path $failBaseWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $failBasePath -Bytes ($pullApplyUtf8.GetBytes("fail before`n"))
+
+    $failBaseFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $failBaseFiles['src/a.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $failBasePath)
+    Save-BaseManifest -WorkspaceRoot $failBaseWorkspace -ProjectId $failBaseProjectId -Files $failBaseFiles
+    $failBaseBytesBefore = [System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $failBaseWorkspace))
+
+    $failBaseStaging = Join-Path $pullApplyRoot "fail-base-remote.ts"
+    Write-PullTestBytes -LiteralPath $failBaseStaging -Bytes ($pullApplyUtf8.GetBytes("fail remote`n"))
+    $failBaseRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $failBaseStaging -WorkspaceStagingRoot $failBaseWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $failBaseSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $failBaseWorkspace -RemoteEntries $failBaseRemoteMap
+    $failBaseLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $failBasePath) }
+    $failBaseSelection = Get-SyncPullSelection -Base @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $failBasePath) } -Local $failBaseLocalMap -Remote $failBaseSnapshot.Files
+
+    $realWriteForBaseFail = ${function:Invoke-RundotSyncPullWriteAction}
+    function Invoke-RundotSyncPullWriteAction {
+        param($WorkspaceRoot, $LocalFullPath, $Action, $RemoteMap)
+        throw [System.InvalidOperationException]::new("Injected write failure before BASE.")
+    }
+
+    $failBaseThrew = $null
+    try {
+        Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $failBaseWorkspace `
+            -Actions $failBaseSelection.Actions `
+            -Local $failBaseLocalMap `
+            -Remote $failBaseSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $failBaseWorkspace) | Out-Null
+    }
+    catch {
+        $failBaseThrew = $_.Exception
+    }
+    finally {
+        Set-Item -Path function:Invoke-RundotSyncPullWriteAction -Value $realWriteForBaseFail
+    }
+
+    Assert-True ($null -ne $failBaseThrew) "a failed apply must abort the pull"
+    Assert-Equal `
+        ([System.BitConverter]::ToString($failBaseBytesBefore)) `
+        ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $failBaseWorkspace)))) `
+        "a failed apply must leave the previous BASE byte-identical and authoritative"
+
+    # The apply layer must never write BASE on its own.
+    Assert-True `
+        (((Get-Command Invoke-RundotSyncPullApply -CommandType Function).Definition) -notmatch 'Save-BaseManifest') `
+        "the apply layer must never write BASE itself"
+
+    # ----------------------------------------------------------------------
+    # A no-op pull writes no BASE and no backup set
+    # ----------------------------------------------------------------------
+
+    $noBaseWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $noBaseProjectId = 'proj-pull-base-4'
+    $noBasePath = Join-Path $noBaseWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $noBasePath -Bytes ($pullApplyUtf8.GetBytes("settled`n"))
+
+    $noBaseFiles = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $noBaseFiles['src/a.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $noBasePath)
+    Save-BaseManifest -WorkspaceRoot $noBaseWorkspace -ProjectId $noBaseProjectId -Files $noBaseFiles
+    $noBaseBytesBefore = [System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $noBaseWorkspace))
+
+    # Local and remote are both unchanged, so nothing is pullable.
+    $noBaseLocalMap = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $noBasePath) }
+    $noBaseRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $noBasePath -WorkspaceStagingRoot $noBaseWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $noBaseSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $noBaseWorkspace -RemoteEntries $noBaseRemoteMap
+
+    $noBaseResult = Invoke-PullTestEndToEnd `
+        -WorkspaceRoot $noBaseWorkspace `
+        -ProjectId $noBaseProjectId `
+        -Base @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $noBasePath) } `
+        -Local $noBaseLocalMap `
+        -Snapshot $noBaseSnapshot
+
+    Assert-Equal 0 $noBaseResult.ApplyResult.Applied "an up-to-date workspace must apply nothing"
+    Assert-Equal $false $noBaseResult.BaseUpdated "a no-op pull must not update BASE"
+    Assert-Equal `
+        ([System.BitConverter]::ToString($noBaseBytesBefore)) `
+        ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes((Get-BaseManifestPath -WorkspaceRoot $noBaseWorkspace)))) `
+        "a no-op pull must leave BASE byte-identical"
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $noBaseWorkspace).Count `
+        "a no-op pull must not create a backup set"
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $noBaseWorkspace).Count `
+        "a no-op pull must not write a journal record"
+
+    # ----------------------------------------------------------------------
+    # Remote deletion leaves the local file AND its BASE entry in place
+    # ----------------------------------------------------------------------
+
+    $deleteWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $deleteProjectId = 'proj-pull-base-5'
+
+    $deleteLocalPath = Join-Path $deleteWorkspace "src\a.ts"
+    $deleteLocalBytes = $pullApplyUtf8.GetBytes("local keeps this`n")
+    Write-PullTestBytes -LiteralPath $deleteLocalPath -Bytes $deleteLocalBytes
+
+    $deleteGonePath = Join-Path $deleteWorkspace "src\gone.ts"
+    $deleteGoneBytes = $pullApplyUtf8.GetBytes("remote deleted this`n")
+    Write-PullTestBytes -LiteralPath $deleteGonePath -Bytes $deleteGoneBytes
+
+    $deleteSeed = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    $deleteSeed['src/a.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $deleteLocalPath)
+    $deleteSeed['src/gone.ts'] = (Get-PullTestBaseEntryForLocal -LiteralPath $deleteGonePath)
+    Save-BaseManifest -WorkspaceRoot $deleteWorkspace -ProjectId $deleteProjectId -Files $deleteSeed
+
+    # src/a.ts is a clean download; src/gone.ts is absent from REMOTE.
+    $deleteRemoteStaging = Join-Path $pullApplyRoot "delete-remote-a.ts"
+    Write-PullTestBytes -LiteralPath $deleteRemoteStaging -Bytes ($pullApplyUtf8.GetBytes("pulled a`n"))
+    $deleteRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $deleteRemoteStaging -WorkspaceStagingRoot $deleteWorkspace -CanonicalPath 'src/a.ts')
+    }
+    $deleteSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $deleteWorkspace -RemoteEntries $deleteRemoteMap
+
+    $deleteLocalMap = @{
+        'src/a.ts'    = (New-PullTestLocalManifestEntry -LiteralPath $deleteLocalPath)
+        'src/gone.ts' = (New-PullTestLocalManifestEntry -LiteralPath $deleteGonePath)
+    }
+    $deleteBase = @{
+        'src/a.ts'    = (Get-PullTestBaseEntryForLocal -LiteralPath $deleteLocalPath)
+        'src/gone.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $deleteGonePath)
+    }
+
+    # The remote-deletion candidate is reported, never applied.
+    $deleteSelection = Get-SyncPullSelection -Base $deleteBase -Local $deleteLocalMap -Remote $deleteSnapshot.Files
+    $goneRow = Get-PullTestActionForPath -Actions $deleteSelection.Excluded -Path 'src/gone.ts'
+    if ($null -eq $goneRow) {
+        Assert-True $false "a path absent from REMOTE must be reported as excluded"
+    }
+    else {
+        Assert-Equal 'deleteLocalCandidate' ([string]$goneRow.Status) "the remote-deletion candidate keeps its status"
+    }
+
+    $deleteResult = Invoke-PullTestEndToEnd `
+        -WorkspaceRoot $deleteWorkspace `
+        -ProjectId $deleteProjectId `
+        -Base $deleteBase `
+        -Local $deleteLocalMap `
+        -Snapshot $deleteSnapshot
+
+    Assert-Equal 1 $deleteResult.ApplyResult.Applied "only the clean download may be applied"
+
+    Assert-Equal `
+        $deleteGoneBytes `
+        (Get-PullTestBytes -LiteralPath $deleteGonePath) `
+        "a remote deletion must leave the local file in place"
+
+    $deleteRead = Read-BaseManifest -WorkspaceRoot $deleteWorkspace
+    if ($null -eq $deleteRead) {
+        Assert-True $false "the pull must leave a readable BASE"
+    }
+    else {
+        Assert-Equal `
+            ([string]$deleteBase['src/gone.ts'].sha256) `
+            $deleteRead.files.'src/gone.ts'.sha256 `
+            "a remote deletion must not drop the local path's BASE entry"
+        Assert-Equal `
+            (Get-FileSha256Hex -LiteralPath $deleteLocalPath) `
+            $deleteRead.files.'src/a.ts'.sha256 `
+            "the pulled path must be recorded with its verified hash"
+    }
+
+    # A standing remote-delete candidate is reported, never acted on by Pull.
+    # BASE and REMOTE must agree, and LOCAL must be missing, for this to be a
+    # deleteRemoteCandidate rather than a conflict.
+    $remoteGoneStaging = Join-Path $pullApplyRoot "remote-gone.ts"
+    Write-PullTestBytes -LiteralPath $remoteGoneStaging -Bytes $deleteGoneBytes
+    $remoteGoneMap = @{
+        'src/gone.ts' = (New-PullTestRemoteIdentityEntry -StagingPath $remoteGoneStaging -WorkspaceStagingRoot $deleteWorkspace -CanonicalPath 'src/gone.ts')
+    }
+    $remoteGoneSelection = Get-SyncPullSelection `
+        -Base @{ 'src/gone.ts' = $deleteBase['src/gone.ts'] } `
+        -Local @{} `
+        -Remote $remoteGoneMap
+
+    Assert-Equal `
+        0 `
+        @($remoteGoneSelection.Actions).Count `
+        "a remote-delete candidate must never be an apply candidate"
+
+    $remoteGoneRow = Get-PullTestActionForPath -Actions $remoteGoneSelection.Excluded -Path 'src/gone.ts'
+    if ($null -eq $remoteGoneRow) {
+        Assert-True $false "a path absent from LOCAL but present in REMOTE must be reported as excluded"
+    }
+    else {
+        Assert-Equal `
+            'deleteRemoteCandidate' `
+            ([string]$remoteGoneRow.Status) `
+            "a remote-delete candidate must be reported, not applied"
+    }
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $deleteWorkspace "src\gone.ts.bak"))) `
+        "Pull must not create delete side effects"
 }
 finally {
     if (Test-Path -LiteralPath $pullApplyRoot) {
