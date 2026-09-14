@@ -359,10 +359,20 @@ try {
         'src/c.ts' = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaC)
     }
 
+    # BASE enters the engine only through the resolver result, so a case that
+    # needs a tracked BASE builds a resolution whose manifest carries it.
+    $unionResolution = New-SyncPlanTestResolution `
+        -Base ([pscustomobject]@{
+            capturedAt = '2026-09-14T12:00:00.0000000Z'
+            files      = $unionBase
+        }) `
+        -BasePresent $true `
+        -Untrusted $false
+
     $unionArtifact = New-RundotSyncPlanArtifact `
         -WorkspaceRoot $artifactWorkspace `
         -ProjectId 'proj-test-1' `
-        -Resolution $resolution `
+        -Resolution $unionResolution `
         -Local $unionLocal `
         -Remote $unionRemote `
         -Snapshot $snapshot
@@ -413,10 +423,18 @@ try {
         'src/gone.ts'   = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA)
     }
 
+    $guardResolution = New-SyncPlanTestResolution `
+        -Base ([pscustomobject]@{
+            capturedAt = '2026-09-14T12:00:00.0000000Z'
+            files      = $guardBase
+        }) `
+        -BasePresent $true `
+        -Untrusted $false
+
     $guardArtifact = New-RundotSyncPlanArtifact `
         -WorkspaceRoot $artifactWorkspace `
         -ProjectId 'proj-test-1' `
-        -Resolution $resolution `
+        -Resolution $guardResolution `
         -Local $guardLocal `
         -Remote $guardRemote `
         -Snapshot $snapshot
@@ -480,8 +498,10 @@ try {
         Assert-Null $op.PSObject.Properties['Content'] "an operation row must not carry file content"
         Assert-Null $op.PSObject.Properties['StagingPath'] "an operation row must not carry a staging path"
         Assert-True ($null -ne $op.kinds) "an operation row must carry the three per-side kinds"
-        Assert-Equal 'utf8' ([string]$op.kinds.local) "the local kind must be recorded"
     }
+
+    Assert-Equal 'utf8' ([string]$textUpload.kinds.local) "the text upload local kind must be recorded"
+    Assert-Equal 'binary' ([string]$binaryUpload.kinds.local) "the binary upload local kind must be recorded"
 
 
     # --------------------------------------------------------------------------
@@ -759,7 +779,7 @@ try {
     $deleteAnalysis = New-RundotSyncPlanAnalysis `
         -WorkspaceRoot $artifactWorkspace `
         -ProjectId 'proj-test-1' `
-        -Resolution $resolution `
+        -Resolution $guardResolution `
         -Local $guardLocal `
         -Remote $guardRemote `
         -Snapshot $snapshot `
