@@ -66,6 +66,42 @@ Notes:
 - CLI refresh-token support is not yet implemented. If the official CLI token is expired or near expiry, the tool suggests running `rundot login` and then falls through to the existing authentication methods.
 - Browser/clipboard/manual authentication remains available as a fallback.
 
+## Sync (work in progress)
+
+`game-studio-sync.ps1` is a separate entrypoint for syncing a Studio project
+with a local directory. **Only `Init` is implemented today**; `Plan`, `Status`,
+and `Pull` land in later v0.1.3 issues. Run `-Command Init` and nothing else.
+
+Sync is read-oriented. Neither LOCAL nor REMOTE is authoritative: BASE records
+the last verified shared state. This milestone has no remote mutation - there
+is no `Apply` and no `Push`.
+
+Initialize a workspace:
+
+```powershell
+# Build a trusted workspace from REMOTE into an empty directory
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Init -InitMode FromRemote
+
+# Or attach sync metadata to a directory that already has your files
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Init -InitMode Adopt
+```
+
+- `FromRemote` requires an empty `LocalDir` (only `.git` / `.gitignore` may be
+  present). It verifies every downloaded file before writing BASE, and any
+  failure leaves no BASE.
+- `Adopt` records only paths whose content hash already matched REMOTE
+  exactly, and prints an unresolved-path report for everything else. It never
+  claims agreement that was not proven.
+
+See [docs/init.md](docs/init.md) for the full behavior, including the failure
+table and the `Plan`-without-BASE refusal.
+
+`Plan` and `Status` require a BASE and will refuse without one, pointing at
+`Init`. Until those commands ship, they apply that check and stop rather than
+producing a plan.
+
+> Sync uses unofficial remote API routes that may change without notice.
+
 ## Troubleshooting
 
 ### CLI session found but Studio returns 401

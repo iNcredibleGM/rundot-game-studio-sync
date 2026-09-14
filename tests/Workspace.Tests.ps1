@@ -103,7 +103,7 @@ try {
 
     $base = Read-BaseManifest -WorkspaceRoot $workspace
     Assert-Equal 1 $base.schemaVersion "BASE schemaVersion should be 1"
-    Assert-Equal "0.1.2" $base.toolVersion "BASE toolVersion should be the v0.1.2 milestone"
+    Assert-Equal "0.1.3" $base.toolVersion "BASE toolVersion should be the v0.1.3 milestone"
     Assert-Equal $projectId $base.projectId "BASE should persist projectId"
     Assert-Equal $fingerprint $base.localRootFingerprint "BASE should persist the workspace fingerprint"
     Assert-True (-not [string]::IsNullOrEmpty($base.capturedAt)) "BASE should record capturedAt"
@@ -197,6 +197,85 @@ try {
     $baseV2 = Read-BaseManifest -WorkspaceRoot $workspace
     Assert-Equal $abcSha256 $baseV2.files.'src/foo.ts'.sha256 "atomic replace should keep the complete new BASE"
     Assert-Null $baseV2.files.'public/logo.png' "omitted paths must drop out of BASE rather than remain as tombstones"
+
+
+    # --------------------------------------------------------------------------
+    # No-BASE gate: plan must refuse instead of inventing a sync direction
+    # --------------------------------------------------------------------------
+
+    $refusal = Get-RundotSyncMissingBaseRefusalMessage
+    Assert-True `
+        ($refusal -match [regex]::Escape('-InitMode FromRemote')) `
+        "the no-BASE refusal should point at Init -InitMode FromRemote"
+    Assert-True `
+        ($refusal -match '\bAdopt\b') `
+        "the no-BASE refusal should point at Init -InitMode Adopt"
+    Assert-True `
+        ($refusal -match [regex]::Escape('-Command Init')) `
+        "the no-BASE refusal should show a copy-pasteable Init invocation"
+
+    $banner = Get-RundotSyncNoBaseUntrustedBanner
+    Assert-True `
+        ($banner -match '(?i)untrusted') `
+        "the -AllowNoBase banner must say synchronization direction is untrusted"
+
+    $noBaseWorkspace = Join-Path $testRoot "no-base-workspace"
+    New-Item -ItemType Directory -Path $noBaseWorkspace | Out-Null
+
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase -WorkspaceRoot $noBaseWorkspace -ProjectId $projectId
+    } "planning without a BASE must refuse by default"
+
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $noBaseWorkspace `
+            -ProjectId $projectId `
+            -AllowNoBase:$false
+    } "an explicit -AllowNoBase:`$false must still refuse without a BASE"
+
+    $escaped = Resolve-RundotSyncPlanBase `
+        -WorkspaceRoot $noBaseWorkspace `
+        -ProjectId $projectId `
+        -AllowNoBase
+    Assert-Equal $false $escaped.BasePresent "-AllowNoBase must report that BASE is absent"
+    Assert-Equal $true $escaped.Untrusted "-AllowNoBase must report an untrusted direction"
+    Assert-Null $escaped.Base "-AllowNoBase must not invent a BASE object"
+
+    # A present BASE is returned and still fully ownership-checked.
+    $ownedPlanBase = Resolve-RundotSyncPlanBase `
+        -WorkspaceRoot $workspace `
+        -ProjectId $projectId
+    Assert-Equal $true $ownedPlanBase.BasePresent "an owned BASE should be reported as present"
+    Assert-Equal $false $ownedPlanBase.Untrusted "an owned BASE should not be untrusted"
+    Assert-Equal $projectId $ownedPlanBase.Base.projectId "the resolver should return the owned BASE"
+
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $workspace `
+            -ProjectId "other-project"
+    } "the gate must not accept a BASE owned by a different projectId"
+
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $copiedWorkspace `
+            -ProjectId $projectId
+    } "the gate must not accept a BASE fingerprinted for a different folder"
+
+    # -AllowNoBase bypasses a *missing* BASE only. It must never launder a
+    # present-but-unowned BASE into a trusted one.
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $copiedWorkspace `
+            -ProjectId $projectId `
+            -AllowNoBase
+    } "-AllowNoBase must not bypass ownership of a present BASE"
+
+    Assert-Throws {
+        Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $workspace `
+            -ProjectId "other-project" `
+            -AllowNoBase
+    } "-AllowNoBase must not bypass a projectId mismatch on a present BASE"
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) {
