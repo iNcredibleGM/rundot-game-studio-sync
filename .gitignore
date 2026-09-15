@@ -1,0 +1,4 @@
+# Sync workspace state. Contains paths and SHA-256 hashes, never file contents.
+# It is bound to one project and one folder, so it must not be shared or
+# committed. See the "Your workspace metadata" section in README.md.
+.rundot-sync/

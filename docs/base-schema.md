@@ -109,6 +109,23 @@ full path of `LocalDir` with no trailing slash, using on-disk casing from
 
 Copied `.rundot-sync` metadata cannot drive a different project or folder.
 
+### One initialized workspace per project
+
+Because BASE binds one project and one folder, a workspace is not portable.
+Copying `.rundot-sync` to another machine or directory does not carry the shared
+state over: `Plan` and `Pull` hard-fail on an ownership mismatch instead of
+acting on a BASE that describes somewhere else.
+
+On a second machine, initialize a fresh workspace and move work in by hand:
+
+1. `Init -InitMode FromRemote` into a new or empty directory on that machine.
+2. Copy your in-progress files in.
+3. Run `Plan`. Copied-in work appears as `UPLOAD` candidates and diverged files
+   as `CONFLICT` rows, for you to review.
+
+Multi-machine BASE is out of scope ([ROADMAP.md](../ROADMAP.md)), so each
+machine keeps its own independent BASE.
+
 ## Atomic write
 
 A crash must not leave a truncated live BASE.

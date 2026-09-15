@@ -59,11 +59,23 @@ Milestone: [v0.1.3 - Safe pull planner](https://github.com/iNcredibleGM/rundot-g
 
 Done when a stranger can init, edit one file, see exactly one upload candidate, pull a clean remote-only change with a backup, and verify there is still no remote mutation code path.
 
+Work is complete on the `v0.1.3` integration branch. The `Shipped on main.` marker is added by the ship pull request that lands this milestone ([docs/releasing.md](docs/releasing.md)); acceptance evidence is recorded in [docs/acceptance.md](docs/acceptance.md).
+
 ## v0.2.0 - Safe push
 
 First version that can publish local changes to Studio the way export and pull bring files down.
 
 Investigate the write protocol **before** implementing `Apply-SyncPlan` / `Push`. Do not call `PUT` merely because `Plan` shows `UPLOAD`.
+
+The first work in this milestone is investigation, not implementation: the text
+create/overwrite protocol, binary create/overwrite and collision names, and
+delete/rename/concurrency semantics ([#14](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/14)–[#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16))
+have to be observed and written down first. `Apply-SyncPlan` / `Push`
+([#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17)) is
+designed only from that evidence. The v0.1.3 plan artifact already records what
+a future `Apply` must re-verify before writing: `planId`, `localRootFingerprint`,
+`localManifestHash`, `remoteManifestHashBefore`/`After`, and a per-path
+`expectedRemoteHash` ([docs/plan.md](docs/plan.md)).
 
 Milestone: [v0.2.0 - Safe push](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/3)
 

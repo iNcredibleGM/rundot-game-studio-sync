@@ -30,6 +30,12 @@ Builds a trusted local workspace from REMOTE.
 1. **Destination pre-flight.** `LocalDir` must be empty, or contain only
    `.git` / `.gitignore`. A leftover `.rundot-sync/` with no BASE is
    tolerated so a re-run after a failed attempt needs no manual cleanup.
+   (The raw exporter is stricter here and refuses any `.rundot-sync`, because
+   for export it means "this is a workspace, do not re-dump over it" —
+   [export.md](export.md).)
+   The raw exporter deliberately does not share this tolerance: it refuses a
+   `.rundot-sync/` outright, because a raw re-dump over a workspace is the
+   destructive case ([export.md](export.md)).
 2. **Stable snapshot.** `Get-StableRemoteSnapshot` downloads every listed
    file into `.rundot-sync/temp/remote-snapshot/<attempt>/`, validates paths,
    and proves `ManifestBefore == ManifestAfter`
@@ -163,6 +169,31 @@ are folded into that fingerprint but are not decoded: their algorithm and
 format are undocumented. Init does not treat them as an independent
 verification.
 
+## One workspace per project, and a second machine
+
+BASE binds one Studio `projectId` to one local folder, so a workspace is not
+portable: copying `.rundot-sync` to another machine or directory does not carry
+the shared state over. `Plan` and `Pull` hard-fail on an ownership mismatch
+([base-schema.md](base-schema.md)).
+
+On a second machine, initialize a fresh workspace rather than copying state:
+
+1. `Init -InitMode FromRemote` into a new or empty directory.
+2. Copy your in-progress files in.
+3. Run `Plan`. Copied-in work appears as `UPLOAD` candidates and diverged files
+   as `CONFLICT` rows, for you to review.
+
+Multi-machine BASE is not in this milestone, so each machine keeps its own
+independent BASE.
+
+## Raw export is not init
+
+`game-studio-export.ps1` writes into a new or empty directory too, but it does
+**not** create a workspace and it does not record BASE: it is a raw dump. It
+also refuses a directory that already contains `.rundot-sync`, where Init
+tolerates a BASE-less leftover. Use `Init` when you want sync, and export when
+you want a disposable copy ([export.md](export.md)).
+
 ## Next
 
 Once BASE exists, `Plan` and `Status` are the read commands
@@ -170,4 +201,5 @@ Once BASE exists, `Plan` and `Status` are the read commands
 ([pull.md](pull.md)). `Plan` generates the dry-run report and persists
 `.rundot-sync/last-plan.json`; `Status` runs the same engine and writes
 nothing. Neither mutates Studio, and no command mutates Studio in this
-milestone.
+milestone. A workspace is bound to one project and one folder, and a second
+machine needs its own ([base-schema.md](base-schema.md)).
