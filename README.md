@@ -1,16 +1,26 @@
 # RUN.game Studio Sync
 
-Unofficial tool for exporting RUN Game Studio projects to a local filesystem.
+Unofficial tool for syncing a RUN Game Studio project with a local directory.
 
 > This project is not affiliated with or endorsed by RUN, RUN.game, Series, Inc., or the maintainers of the official `rundot` CLI.
 
 ## What it does
 
-- Exports the editable RUN Game Studio filesystem to a local directory
-- Preserves UTF-8 text correctly
-- Exports binary assets byte-for-byte
-- Optionally exports Studio conversation threads with raw JSON and readable Markdown
-- Supports automatic authentication through a fresh official `rundot` CLI session, with existing fallback authentication mechanisms
+`game-studio-sync.ps1` treats a Studio project and a local directory as two
+sides that can drift apart, and helps you move changes **from Studio to your
+machine** without guessing:
+
+- **Init** builds a workspace and records a verified BASE
+- **Plan** / **Status** show what a future sync would do, without writing
+- **Pull** applies clean remote-only changes, with a backup of everything it replaces
+
+**This version is read-only against Studio.** There is no `Push` and no
+`Apply`. The tool never creates, replaces, renames, or deletes anything in
+Studio.
+
+If all you want is a plain raw copy of a project, the original exporter
+(`game-studio-export.ps1`) still does that into a new or empty directory —
+see [Raw export](#raw-export-new-or-empty-directories-only).
 
 ## Prerequisites
 
@@ -33,48 +43,273 @@ rundot --help
 rundot login
 ```
 
-Git is optional; it is only needed if you want to version/control your exported project.
+Git is optional; it is only needed if you want to version your project files.
 
 ## Quick start
+
+### 1. Initialize a workspace
+
+Point `Init` at a **new or empty** directory. It downloads the project, proves
+every file matches, and only then records BASE.
+
+```powershell
+.\game-studio-sync.ps1 `
+    -ProjectId "YOUR_PROJECT_ID" `
+    -LocalDir ".\dev" `
+    -Command Init `
+    -InitMode FromRemote
+```
+
+`-FromRemote` is accepted as a shorter alias for `-InitMode FromRemote`.
+
+Already have the files? Use `-InitMode Adopt` to attach sync metadata to an
+existing tree instead. Adopt records only paths that already match Studio
+exactly, so it never claims agreement it did not verify.
+
+### 2. Edit your files normally
+
+Work in `.\dev` however you like. Nothing about the workspace is special: it is
+an ordinary folder of project files.
+
+### 3. See what would change
+
+```powershell
+# Dry run, and save the plan artifact to .rundot-sync/last-plan.json
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Plan
+
+# The same report without writing anything
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Status
+```
+
+`Plan` uses three states: **BASE** (the last verified shared state), **LOCAL**
+(your files), and **REMOTE** (Studio now). Neither LOCAL nor REMOTE is
+authoritative — any ambiguity is reported as a conflict rather than guessed at.
+
+Your local edits show up as `UPLOAD` candidates. Because this version cannot
+push, they are reported but never actionable: **a plan is never permission to
+write.**
+
+### 4. Pull clean remote-only changes
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull
+```
+
+`Pull` applies **only** clean remote-only changes, meaning a file that moved on
+in Studio while your copy still matched BASE. Your local edits, conflicts, and
+deletions are reported and left alone.
+
+Before replacing anything it copies the original into
+`.rundot-sync/backups/<timestamp>/`, prints the backup root, and asks you to
+type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
+backup.
+
+## Your workspace metadata
+
+Sync state lives in `<LocalDir>\.rundot-sync\`:
+
+```text
+<LocalDir>/.rundot-sync/
+  base-manifest.json   # BASE: path, size, and SHA-256 per tracked file
+  last-plan.json       # the most recent Plan artifact
+  journal.jsonl        # metadata-only record of pulls
+  backups/             # pre-overwrite copies, restore by plain file copy
+  temp/                # torn-read staging, cleared after each run
+```
+
+**Metadata only: `base-manifest.json`, `last-plan.json`, `journal.jsonl`.**
+These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
+contain file contents, access tokens, or refresh tokens.
+
+**Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
+Before `Pull` overwrites a file it copies the *entire original file* into the
+backup set so you can restore it. **A backup set can therefore contain complete
+file contents.**
+
+Both are sensitive, and for different reasons. `.rundot-sync` reveals the
+*names* of every file in your project, and a backup set may additionally hold
+the full text of files you would rather not publish. A backup is also the only
+copy of that content once Studio has moved on, so delete a backup set only when
+you are sure you no longer need the original.
+
+- **Do not commit it.** The repository ships a `.gitignore` with
+  `.rundot-sync/` for this reason.
+- **Do not paste it into bug reports** if your file names are private.
+
+### One initialized workspace per project
+
+BASE is bound to **one Studio project and one folder** (`projectId` plus a
+fingerprint of the resolved local path). A `.rundot-sync` copied elsewhere does
+not take effect: `Plan` and `Pull` hard-fail on an ownership mismatch rather
+than acting on a BASE that describes a different project or folder.
+
+So if you work on the same project from a **second machine**, do not copy
+`.rundot-sync` to it. Instead:
+
+1. Pick a new or empty directory on that machine.
+2. Run `Init -InitMode FromRemote` there, which records that machine's own BASE.
+3. Copy your in-progress work into it.
+4. Run `Plan`. Your copied-in work appears as `UPLOAD` candidates and any
+   diverged file as a `CONFLICT` — review them yourself.
+
+Multi-machine BASE is a [non-goal](#not-in-this-version), so the two machines
+each keep their own independent BASE.
+
+## Commands
+
+| Command | Writes | Purpose |
+| --- | --- | --- |
+| `Init -InitMode FromRemote` | LOCAL + BASE | Build a trusted workspace from Studio into an empty directory |
+| `Init -InitMode Adopt` | BASE only | Attach sync metadata to an existing tree, recording only proven matches |
+| `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
+| `Status` | nothing | The same report, without saving an artifact |
+| `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
+
+Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
+[Pull](docs/pull.md), [BASE schema](docs/base-schema.md).
+
+`Plan` and `Pull` **refuse without a BASE** and point you at `Init`: without a
+recorded shared state there is no verified direction. The refusal happens before
+authentication, so a workspace that cannot plan never asks for a token.
+
+Every dry run ends with:
+
+```text
+Dry run only. No remote files were modified.
+This plan is a point-in-time observation, not permission to write.
+WARNING: This tool uses unofficial remote API routes that may change.
+```
+
+## Default ignores
+
+Sync skips a fixed set of paths so build output and editor junk do not look
+like project files that were deleted:
+
+| Path | Match |
+| --- | --- |
+| `.git/`, `.rundot-sync/`, `node_modules/` | directory segment |
+| `dist/`, `build/`, `out/`, `.vs/`, `.idea/`, `.vscode/`, `.rundot-studio-export/` | directory segment |
+| `Thumbs.db`, `desktop.ini`, `.DS_Store` | exact file name |
+| `*.swp`, `*~`, `*.tmp`, `*.bak` | file name pattern |
+
+There is **no `.rundotignore`** in this version. The list above is fixed and
+documented in [docs/path-safety.md](docs/path-safety.md).
+
+One important asymmetry: the **raw exporter does not apply these ignores**. It
+downloads everything Studio lists. The ignore set applies to the local
+inventory that `Plan` and `Pull` compare.
+
+## Raw export: new or empty directories only
+
+`game-studio-export.ps1` is the original bulk exporter. It writes the complete
+editable project filesystem to disk, byte-for-byte, and can optionally archive
+Studio conversation threads.
 
 ```powershell
 .\game-studio-export.ps1 `
     -ProjectId "YOUR_PROJECT_ID" `
-    -OutDir ".\dev" `
+    -OutDir ".\raw-copy" `
     -IncludeThreads
 ```
 
-The exporter reads the official CLI session from `%APPDATA%\.rundot\prod.session.json` and uses its `accessToken` directly against Studio. The token must be fresh enough to pass the exporter's 5-minute safety window; otherwise the tool suggests running `rundot login` again and falls through to the other authentication methods.
+It only writes into a **new or empty** `-OutDir`. Only `.git` and `.gitignore`
+may already be present.
 
-The exporter does not modify the official CLI session file, and it does not run `rundot login` automatically.
+If the directory already contains project files, or a `.rundot-sync`
+workspace, the exporter **refuses and writes nothing**. That is deliberate:
+export was never a safe way to refresh an existing tree, because it would
+overwrite local work with whatever Studio currently holds. You will get a
+message pointing at the sync command instead:
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull
+```
+
+See [docs/export.md](docs/export.md) for the exact rules.
 
 ## Authentication
 
 Authentication precedence:
 
 1. Fresh official `rundot` CLI access token from `%APPDATA%\.rundot\prod.session.json`
-2. Previously saved exporter Firebase refresh credentials from `%APPDATA%\.rundot\studio-export.auth.json`
+2. Previously saved Firebase refresh credentials from `%APPDATA%\.rundot\studio-export.auth.json`
 3. Firebase bootstrap JSON from clipboard
 4. Studio bearer token from clipboard
 5. Manual secure bearer-token paste
 
 Notes:
 
-- Studio validation is authoritative. The exporter always confirms a candidate token by requesting the project manifest.
+- Studio validation is authoritative. A candidate token is always confirmed by
+  requesting the project manifest.
 - JWT decoding is used only locally to inspect expiry; signatures are not verified.
-- The exporter applies a 5-minute safety window before attempting the CLI token, because a near-expiry token previously produced HTTP 401.
-- CLI refresh-token support is not yet implemented. If the official CLI token is expired or near expiry, the tool suggests running `rundot login` and then falls through to the existing authentication methods.
-- Browser/clipboard/manual authentication remains available as a fallback.
+- A 5-minute safety window applies before the CLI token is attempted, because a
+  near-expiry token previously produced HTTP 401.
+- CLI refresh-token support is not yet implemented. If the CLI token is expired
+  or near expiry, run `rundot login` again, or use the fallbacks above.
+- Neither script modifies the official CLI session file, and neither runs
+  `rundot login` for you.
+
+## Privacy and the network
+
+**This tool has no telemetry.** It does not phone home, check for updates, or
+report usage. The only network requests it makes are:
+
+- `GET` requests to RUN Game Studio (`venus-studio-prod.series-ai.workers.dev`)
+  for the project manifest and file contents, and
+- a `POST` to Google's `securetoken.googleapis.com` endpoint when refreshing
+  saved Firebase credentials.
+
+Both happen only when you run a command. No project data, file contents, paths,
+or tokens are sent anywhere else.
+
+Saved credentials are stored encrypted with Windows DPAPI. **Never include
+access tokens, refresh tokens, or authentication files in bug reports.**
+
+> Sync uses **unofficial** remote API routes observed from normal Studio
+> traffic. They are undocumented and may change without notice, which would
+> break the tool until it is updated.
 
 ## Troubleshooting
 
 ### CLI session found but Studio returns 401
 
 1. Run `rundot login`
-2. Rerun the exporter promptly
-3. If it still fails, allow the exporter to continue to its saved/clipboard/manual fallback methods
+2. Rerun the command promptly
+3. If it still fails, allow the tool to continue to its saved/clipboard/manual fallback methods
 
-> Never include access tokens, refresh tokens, or authentication files in bug reports.
+### "The remote project changed while being read"
+
+Studio's file list is not known to be atomic, so a capture that changes
+mid-read is discarded and retried, up to three times. This message means it
+never settled: **nothing was written.** Try again when the project is idle.
+See [docs/remote-snapshot.md](docs/remote-snapshot.md).
+
+### "This workspace has no BASE manifest"
+
+`Plan` and `Pull` need a recorded shared state. Run `Init` first. If you are
+sure you want a report without one, `Plan -AllowNoBase` exists as an advanced
+escape hatch, but it states plainly that every sync direction is untrusted.
+`Pull` has no such mode.
+
+### The exporter refuses my directory
+
+That is the intended behavior. See
+[Raw export](#raw-export-new-or-empty-directories-only).
+
+## Not in this version
+
+Deliberately out of scope, so nothing here does them by accident:
+
+- Pushing or applying local changes to Studio (`Push`, `Apply`)
+- Remote create, replace, rename, or delete
+- Binary upload or adopt
+- Deleting anything automatically, locally or remotely
+- `.rundotignore` custom patterns
+- Newline or encoding normalization
+- File watching, device IDs, or a shared multi-machine BASE
+
+Direction is in [ROADMAP.md](ROADMAP.md); the acceptance evidence for this
+milestone is in [docs/acceptance.md](docs/acceptance.md).
 
 ## Contributing
 

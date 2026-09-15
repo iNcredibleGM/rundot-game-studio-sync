@@ -70,7 +70,10 @@ anywhere. Globs and exact names match the final component only.
 `out.ts` does not match `out/`.
 
 These ignores apply to local inventory for later Plan/Pull. Export still
-downloads remote files even when their names match this set.
+downloads remote files even when their names match this set, and the raw
+exporter does **not** consult this matcher when checking its destination: every
+ignore exception would widen the set of existing files it could overwrite
+([export.md](export.md)).
 
 ## Classifier contracts
 
@@ -78,5 +81,7 @@ downloads remote files even when their names match this set.
 - If `Test-IgnoredSyncPath` is true for a BASE path, never emit
   `deleteRemoteCandidate`. Classify it as ignored instead.
 
-The classifier that consumes these contracts lands in a later issue. This
-library is the gate those operations must call.
+These are implemented by the ignore-first rule in
+[classifier.md](classifier.md): the ignore check runs before the three-way
+decision table, so an ignored path is `ignored` and is never an upload,
+a download, a delete candidate, or a conflict.

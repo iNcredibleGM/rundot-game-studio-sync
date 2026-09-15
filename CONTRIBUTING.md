@@ -20,15 +20,15 @@ Issue branches are cut from the current integration branch, not from `main`:
 
 ```text
 main
-v0.1.3
-  └── issue/7-init-from-remote
+v0.2.0
+  └── issue/14-text-write-protocol
 ```
 
-Naming: `issue/<number>-<short-slug>` (example: `issue/7-init-from-remote`).
+Naming: `issue/<number>-<short-slug>` (example: `issue/14-text-write-protocol`).
 
-Open each issue pull request with **base = the integration branch** (for v0.1.3 work, that is `v0.1.3`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
+Open each issue pull request with **base = the integration branch** (for v0.2.0 work, that is `v0.2.0`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
 
-Current pull-planner work (#7–#11) uses integration branch `v0.1.3`. Cut that branch from `main` after v0.1.2 ships. Do not land those issues on `main` until the v0.1.3 ship PR.
+Current push work (#14–#19) uses integration branch `v0.2.0`. Cut that branch from `main` after v0.1.3 ships. Do not land those issues on `main` until the v0.2.0 ship PR.
 
 ## Tests
 

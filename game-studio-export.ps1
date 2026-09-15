@@ -43,6 +43,11 @@ $ErrorActionPreference = "Stop"
 #
 # Text files are written as the exact UTF-8 representation returned by
 # Game Studio, without BOM or newline normalization.
+#
+# This exporter only writes into a NEW or EMPTY -OutDir (only .git and
+# .gitignore may already be present). It is not a refresh command: a
+# destination that already holds project files or a .rundot-sync workspace is
+# refused before authentication, and the refusal points at game-studio-sync.ps1.
 # ============================================================================
 
 
@@ -68,6 +73,30 @@ $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot "lib\Auth.ps1")
 . (Join-Path $PSScriptRoot "lib\Paths.ps1")
 . (Join-Path $PSScriptRoot "lib\Ignore.ps1")
+. (Join-Path $PSScriptRoot "lib\Export.ps1")
+
+
+# ============================================================================
+# Destination gate (before authentication)
+#
+# This is a raw exporter for a new or empty directory. It is not a refresh
+# command: a destination that already holds project files, or a .rundot-sync
+# workspace, is refused here rather than overwritten. The gate runs before any
+# token is resolved, so a refusal never asks for credentials and never reaches
+# the network.
+# ============================================================================
+
+try {
+    Assert-RundotExportDestination -OutDir $OutDir
+}
+catch {
+    Write-Host ""
+    Write-Warning "Export destination refused."
+    Write-Host ""
+    Write-Host $_.Exception.Message
+    Write-Host ""
+    exit 1
+}
 
 
 # ============================================================================
