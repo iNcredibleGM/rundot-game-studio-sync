@@ -70,7 +70,10 @@ anywhere. Globs and exact names match the final component only.
 `out.ts` does not match `out/`.
 
 These ignores apply to local inventory for later Plan/Pull. Export still
-downloads remote files even when their names match this set.
+downloads remote files even when their names match this set, and the raw
+exporter does **not** consult this matcher when checking its destination: every
+ignore exception would widen the set of existing files it could overwrite
+([export.md](export.md)).
 
 ## Classifier contracts
 
