@@ -20,8 +20,8 @@ if (Test-Path -LiteralPath $syncCliPath) {
 # --------------------------------------------------------------------------
 
 Assert-True `
-    ($syncCliSource -match "ValidateSet\(\s*'Init'\s*,\s*'Plan'\s*,\s*'Status'\s*\)") `
-    "the CLI should expose Init, Plan, and Status on a validated -Command"
+    ($syncCliSource -match "ValidateSet\(\s*'Init'\s*,\s*'Plan'\s*,\s*'Status'\s*,\s*'Pull'\s*\)") `
+    "the CLI should expose Init, Plan, Status, and Pull on a validated -Command"
 
 Assert-True `
     ($syncCliSource -match "ValidateSet\(\s*'FromRemote'\s*,\s*'Adopt'\s*\)") `
@@ -287,3 +287,96 @@ foreach ($closingLine in @(
         ($planLibrarySource -match [regex]::Escape($closingLine)) `
         "the plan engine must emit the dry-run closing line: $closingLine"
 }
+
+
+# --------------------------------------------------------------------------
+# Pull wiring: the mutation path stays explicit and confirmed
+# --------------------------------------------------------------------------
+
+Assert-True `
+    ($syncCliSource -match '\$ForcePull') `
+    "the CLI should accept -ForcePull"
+
+Assert-True `
+    ($syncCliSource -match '\$ConfirmOverwrite') `
+    "the CLI should pass an overwrite-confirmation callback into the engine"
+
+foreach ($requiredPullFunction in @(
+    'Invoke-RundotSyncPull'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredPullFunction)) `
+        "the CLI should call $requiredPullFunction rather than duplicating its logic"
+}
+
+foreach ($requiredPullLibrary in @(
+    'Backup.ps1',
+    'Journal.ps1',
+    'Pull.ps1'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredPullLibrary)) `
+        "the CLI should load lib\$requiredPullLibrary"
+}
+
+$pullFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncPullCommand'
+Assert-True `
+    (-not [string]::IsNullOrEmpty($pullFunctionText)) `
+    "the CLI must define Invoke-SyncPullCommand for Pull"
+
+# The BASE gate must run before authentication for Pull too.
+$pullGateIndex = $pullFunctionText.IndexOf('Resolve-RundotSyncPlanBase')
+$pullAuthIndex = $pullFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($pullGateIndex -ge 0 -and $pullAuthIndex -ge 0 -and $pullGateIndex -lt $pullAuthIndex) `
+    "the Pull no-BASE gate should be consulted before requesting Studio authentication"
+
+# Pull composes the tested engine rather than reimplementing it.
+foreach ($pullFunction in @(
+    'Get-LocalManifest',
+    'Get-StableRemoteSnapshot',
+    'Invoke-RundotSyncPull',
+    'Clear-RemoteSnapshotTemp'
+)) {
+    Assert-True `
+        ($pullFunctionText -match [regex]::Escape($pullFunction)) `
+        "Invoke-SyncPullCommand should call $pullFunction"
+}
+
+# The CLI prompts and forwards the decision; the engine owns the write.
+Assert-True `
+    ($pullFunctionText -match [regex]::Escape('-ConfirmOverwrite')) `
+    "the CLI should hand the overwrite prompt to the engine"
+Assert-True `
+    ($pullFunctionText -match [regex]::Escape('-Force')) `
+    "the CLI should forward -ForcePull into the engine"
+
+# Pull is the only mutating command, and it must never reach a Studio write.
+Assert-True `
+    ($pullFunctionText -notmatch '(?i)upload-url|upload-adopt') `
+    "Pull must never reference a Studio upload endpoint"
+Assert-True `
+    ($syncCliSource -notmatch '(?i)Authorization\s*=\s*''Bearer\s+[A-Za-z0-9]') `
+    "the CLI must not hardcode a bearer token for Pull"
+
+# Pull must not expose -SupportsShouldProcess/-Confirm/-WhatIf in this
+# milestone: confirmation is an explicit prompt plus -ForcePull.
+Assert-True `
+    ($syncCliParamBlock -notmatch '(?i)SupportsShouldProcess|\[switch\]\s*\$(Confirm|WhatIf)\b') `
+    "Pull confirmation must be an explicit prompt, not -SupportsShouldProcess"
+
+# A mutating command must still clear the Authorization header before exit.
+$pullAuthClearCount = ([regex]::Matches($pullFunctionText, 'Authorization\s*=\s*\$null')).Count
+Assert-True `
+    ($pullAuthClearCount -ge 1) `
+    "Invoke-SyncPullCommand should clear the Authorization header before exiting"
+
+# -AllowNoBase is a Plan/Status escape hatch. Pull has no untrusted mode.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('-AllowNoBase applies to Plan and Status')) `
+    "the CLI should refuse -AllowNoBase outside Plan and Status"
+
+# The dispatch must route Pull to its own command function.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Invoke-SyncPullCommand')) `
+    "the dispatch should route Pull to Invoke-SyncPullCommand"

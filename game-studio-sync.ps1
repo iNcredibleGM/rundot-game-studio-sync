@@ -6,7 +6,7 @@ param(
     [string]$LocalDir,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Init', 'Plan', 'Status')]
+    [ValidateSet('Init', 'Plan', 'Status', 'Pull')]
     [string]$Command,
 
     [ValidateSet('FromRemote', 'Adopt')]
@@ -16,7 +16,10 @@ param(
     [switch]$FromRemote,
 
     # Advanced escape hatch for Plan/Status when BASE is missing.
-    [switch]$AllowNoBase
+    [switch]$AllowNoBase,
+
+    # Pull only: skip the overwrite confirmation prompt. Never skips backups.
+    [switch]$ForcePull
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,18 +31,27 @@ $ErrorActionPreference = "Stop"
 # authoritative: BASE is the last verified shared state, and any ambiguity is
 # a conflict rather than a guess.
 #
-# Init is the only first-run command and the only writer of BASE. Plan and
-# Status are read-only: Plan writes a dry-run plan artifact, Status writes
-# nothing, and neither touches Studio.
+# Init is the only first-run command. Init and Pull write BASE: Init builds it
+# on first run, and Pull replaces it only after every pulled byte is verified.
+# Plan and Status are read-only: Plan writes a dry-run plan artifact, Status
+# writes nothing, and neither touches Studio.
 #
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode FromRemote
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode Adopt
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status
+#   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull
 #
 # Plan and Status are dry runs. They show what a future Apply would consider,
 # but no operation is applicable in this milestone and no plan is permission
 # to write. Add -Verbose to also list unchanged paths.
+#
+# Pull is the only command that writes LOCAL. It applies clean remote-only
+# changes, backs up every overwritten file into .rundot-sync/backups first,
+# re-verifies the written bytes, and updates BASE only after all of that
+# succeeds. It asks for confirmation before overwriting; -ForcePull skips the
+# prompt but never a backup, and never bypasses the concurrent-edit guard.
+# Pull never deletes anything, locally or remotely.
 #
 # This script is GET-only. It does not create, replace, rename, or delete
 # anything on Studio.
@@ -70,6 +82,9 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Snapshot.ps1")
 . (Join-Path $PSScriptRoot "lib\Classifier.ps1")
 . (Join-Path $PSScriptRoot "lib\Plan.ps1")
+. (Join-Path $PSScriptRoot "lib\Backup.ps1")
+. (Join-Path $PSScriptRoot "lib\Journal.ps1")
+. (Join-Path $PSScriptRoot "lib\Pull.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
 
@@ -107,6 +122,8 @@ function Stop-WithUsageError {
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Init -InitMode Adopt"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull -ForcePull"
     Write-Host ""
 
     Clear-SensitiveVariables
@@ -295,9 +312,179 @@ function Invoke-SyncPlanCommand {
 
 
 # ============================================================================
-# Init
+# Pull
+#
+# Pull is the only command in this milestone that writes LOCAL. It applies
+# clean remote-only changes, backs up every overwrite first, re-verifies the
+# written bytes, and updates BASE only after all of that succeeds.
+#
+# Pull never mutates Studio. -ForcePull may skip the confirmation prompt, but
+# it never skips a backup, and it never bypasses the concurrent-edit guard.
 # ============================================================================
 
+function Read-RundotSyncPullConfirmation {
+    # Deliberate confirmation: the user must type the whole word. Anything
+    # else, including an empty line or a closed console, declines.
+    param(
+        [int]$OverwriteCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Pull will overwrite $OverwriteCount existing local file(s):"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each one is copied into .rundot-sync/backups before it is replaced."
+    Write-Host "Type 'yes' to continue. Anything else cancels the pull."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "Overwrite $OverwriteCount local file(s)?"
+    }
+    catch {
+        # No console to prompt on. Fail closed.
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Invoke-SyncPullCommand {
+    param(
+        [string]$WorkspaceRoot,
+        [string]$StudioProjectId,
+        [bool]$Force,
+        [string]$Origin,
+        [string]$SyncAuthDir,
+        [string]$SyncAuthPath,
+        [string]$CliSessionPath
+    )
+
+    # 1. BASE gate, before authentication. Pull has no untrusted mode: without
+    #    a verified BASE there is no shared state to pull against, so it must
+    #    never ask for a token to find that out.
+    $resolution = $null
+
+    try {
+        $resolution = Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        Clear-SensitiveVariables
+        exit 1
+    }
+
+    # 2. Authenticate. GET-only: every call below reads.
+    Write-Section "Pull - RUN Studio authentication"
+
+    $authResult = Get-RundotAccessToken `
+        -StudioOrigin $Origin `
+        -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir `
+        -AuthPath $SyncAuthPath `
+        -RundotCliSessionPath $CliSessionPath
+
+    $script:Token = $authResult.AccessToken
+    $script:RefreshToken = $authResult.RefreshToken
+
+    $Headers = @{
+        Authorization = "Bearer $script:Token"
+        Accept        = "*/*"
+    }
+
+    $script:Headers = $Headers
+
+    # The engine owns the write; the CLI owns only the prompt. Keeping the
+    # callback here means the engine stays testable without a console.
+    $ConfirmOverwrite = {
+        param($OverwriteCount, $Paths)
+        return (Read-RundotSyncPullConfirmation -OverwriteCount $OverwriteCount -Paths $Paths)
+    }
+
+    try {
+        # 3. LOCAL tree, then a stable REMOTE snapshot. The snapshot is
+        #    torn-read protected, and its staged bytes are what Pull writes.
+        Write-Section "Pull - LOCAL and REMOTE"
+
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+
+        $snapshot = Get-StableRemoteSnapshot `
+            -WorkspaceRoot $WorkspaceRoot `
+            -StudioOrigin $Origin `
+            -ProjectId $StudioProjectId `
+            -Headers $Headers
+
+        Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
+
+        # 4. Select, confirm, apply, verify, and update BASE. The engine
+        #    aborts before writing if any overwrite cannot be confirmed.
+        $result = Invoke-RundotSyncPull `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId `
+            -Resolution $resolution `
+            -Local $localManifest `
+            -Remote $snapshot.Files `
+            -Snapshot $snapshot `
+            -ConfirmOverwrite $ConfirmOverwrite `
+            -Force:$Force
+
+        Write-Host ""
+        Write-Host $result.Report
+        Write-Host ""
+
+        # 5. Staging is never sync content, so it is cleared after the run.
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Cleanup is best effort.
+        }
+
+        Clear-SensitiveVariables
+
+        if ($result.Cancelled) {
+            exit 1
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Cleanup is best effort.
+        }
+        Clear-SensitiveVariables
+        exit 1
+    }
+    finally {
+        $Headers.Authorization = $null
+        Clear-SensitiveVariables
+    }
+
+    exit 0
+}
+
+
+# ============================================================================
+# Init
+# ============================================================================
 function Invoke-SyncInit {
     param(
         [string]$WorkspaceRoot,
@@ -406,6 +593,10 @@ if ($Command -eq 'Init') {
         Stop-WithUsageError "-AllowNoBase applies to Plan and Status, not Init."
     }
 
+    if ($ForcePull) {
+        Stop-WithUsageError "-ForcePull applies to Pull only."
+    }
+
     $resolvedInitMode = Get-ResolvedInitMode `
         -RequestedInitMode $InitMode `
         -FromRemoteAlias ([bool]$FromRemote) `
@@ -423,6 +614,28 @@ if ($Command -eq 'Init') {
 
 if ($initModeSpecified -or $FromRemote) {
     Stop-WithUsageError "-InitMode and -FromRemote apply to Init only."
+}
+
+if ($Command -eq 'Pull') {
+    if ($AllowNoBase) {
+        Stop-WithUsageError (
+            "-AllowNoBase applies to Plan and Status, not Pull.`n" +
+            "Pull requires a verified BASE: without one there is no shared state to pull against."
+        )
+    }
+
+    Invoke-SyncPullCommand `
+        -WorkspaceRoot $LocalDir `
+        -StudioProjectId $ProjectId `
+        -Force ([bool]$ForcePull) `
+        -Origin $StudioOrigin `
+        -SyncAuthDir $AuthDir `
+        -SyncAuthPath $AuthPath `
+        -CliSessionPath $RundotCliSessionPath
+}
+
+if ($ForcePull) {
+    Stop-WithUsageError "-ForcePull applies to Pull only."
 }
 
 Invoke-SyncPlanCommand `
