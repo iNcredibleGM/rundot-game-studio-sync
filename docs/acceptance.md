@@ -44,6 +44,26 @@ automating Studio writes is a non-goal of this milestone. The harness only ever
 reads from Studio, prints no tokens or file contents, and exits non-zero if any
 gate failed.
 
+**The run leaves sensitive state behind, so run it into a throwaway
+directory.** A live run creates a `.rundot-sync` workspace, which names every
+file in the project, and its `backups/` set holds the **full contents** of any
+file `Pull` overwrote ([pull.md](pull.md)). This matters on a public
+repository.
+
+Cleanup behavior:
+
+- If you omit `-LocalDir`, the harness uses a temporary directory and removes it
+  at the end.
+- If you pass a `-LocalDir` **inside the repository** that does not exist yet,
+  the harness removes it at the end.
+- A **pre-existing** `-LocalDir` is always left in place, and a `-LocalDir`
+  **outside** the repository is left in place. Both are reported, because they
+  now contain sensitive state.
+- `-KeepWorkspace` leaves everything in place for inspection.
+
+`.gitignore` covers `.rundot-sync/` in this repository, but that is a backstop,
+not a license to leave workspace state lying around.
+
 ## Gate map
 
 | # | Gate | Evidence | Kind |

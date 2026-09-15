@@ -47,6 +47,10 @@ $testRunner = Join-Path $PSScriptRoot "Run-Tests.ps1"
 
 $script:GateResults = New-Object 'System.Collections.Generic.List[object]'
 
+# Set when this run creates the live workspace, so cleanup removes only what it
+# made rather than a directory the user pointed at on purpose.
+$script:liveWorkspaceCreated = $false
+
 function Add-GateResult {
     param(
         [Parameter(Mandatory)][string]$Gate,
@@ -391,6 +395,7 @@ elseif ([string]::IsNullOrEmpty($ProjectId)) {
 else {
     if ([string]::IsNullOrEmpty($LocalDir)) {
         $LocalDir = Join-Path $scratchRoot "live-workspace"
+        $script:liveWorkspaceCreated = $true
     }
 
     if (-not [System.IO.Path]::IsPathRooted($LocalDir)) {
@@ -398,6 +403,10 @@ else {
     }
 
     $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
+
+    if (-not (Test-Path -LiteralPath $LocalDir -PathType Container)) {
+        $script:liveWorkspaceCreated = $true
+    }
 
     Write-Phase "Live gates"
     Write-Host ""
@@ -706,11 +715,61 @@ Write-Host ""
 
 # ---------------------------------------------------------------------------
 # Cleanup
+#
+# A workspace holds .rundot-sync/, which is sensitive in two ways: the BASE and
+# plan artifacts name every file in the project, and a backup set can hold full
+# file contents. On a public repository that must never be left behind by
+# default, so an acceptance run into a directory inside the repository removes
+# it unless -KeepWorkspace was asked for.
 # ---------------------------------------------------------------------------
 
-if (-not $KeepWorkspace) {
+if ($KeepWorkspace) {
+    Write-Host "Leaving workspaces in place (-KeepWorkspace):"
+    if (-not [string]::IsNullOrEmpty($LocalDir)) { Write-Host "  $LocalDir" }
+    Write-Host "  $scratchRoot"
+    Write-Host ""
+    Write-Host "These contain .rundot-sync/ state, and any backup set holds full file"
+    Write-Host "contents. Delete them before committing, and never commit .rundot-sync/."
+    Write-Host ""
+}
+else {
     if (Test-Path -LiteralPath $scratchRoot) {
         Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $workspaceExists = (-not [string]::IsNullOrEmpty($LocalDir)) -and (Test-Path -LiteralPath $LocalDir)
+
+    if (-not $workspaceExists) {
+        # Nothing to do: no live workspace was used, or it is already gone.
+    }
+    elseif (-not $script:liveWorkspaceCreated) {
+        Write-Host "Left a pre-existing workspace in place:"
+        Write-Host "  $LocalDir"
+        Write-Host "Its .rundot-sync/ now holds state from this run."
+        Write-Host ""
+    }
+    else {
+        # Remove it only inside the repository. A directory the user pointed at
+        # deliberately may hold work this script did not create.
+        $normalizedLocal = [System.IO.Path]::GetFullPath($LocalDir).TrimEnd('\')
+        $normalizedRepo = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd('\')
+        $insideRepo = $normalizedLocal.StartsWith(
+            $normalizedRepo + '\',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+
+        if ($insideRepo) {
+            Write-Host "Removing the workspace this run created:"
+            Write-Host "  $LocalDir"
+            Write-Host ""
+            Remove-Item -LiteralPath $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Write-Host "Workspace is outside the repository, so it was left in place:"
+            Write-Host "  $LocalDir"
+            Write-Host "Delete it yourself when you are done; it contains .rundot-sync/ state."
+            Write-Host ""
+        }
     }
 }
 

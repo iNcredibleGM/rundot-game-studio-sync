@@ -117,10 +117,20 @@ Sync state lives in `<LocalDir>\.rundot-sync\`:
   temp/                # torn-read staging, cleared after each run
 ```
 
-**It stores paths and hashes, not contents.** That is still sensitive
-information: `.rundot-sync` reveals the *names* of every file in your project,
-even ones you would rather not publish. It never contains file contents, access
-tokens, or refresh tokens.
+**Metadata only: `base-manifest.json`, `last-plan.json`, `journal.jsonl`.**
+These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
+contain file contents, access tokens, or refresh tokens.
+
+**Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
+Before `Pull` overwrites a file it copies the *entire original file* into the
+backup set so you can restore it. **A backup set can therefore contain complete
+file contents.**
+
+Both are sensitive, and for different reasons. `.rundot-sync` reveals the
+*names* of every file in your project, and a backup set may additionally hold
+the full text of files you would rather not publish. A backup is also the only
+copy of that content once Studio has moved on, so delete a backup set only when
+you are sure you no longer need the original.
 
 - **Do not commit it.** The repository ships a `.gitignore` with
   `.rundot-sync/` for this reason.

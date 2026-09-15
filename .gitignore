@@ -1,4 +1,4 @@
-# Sync workspace state. Contains paths and SHA-256 hashes, never file contents.
-# It is bound to one project and one folder, so it must not be shared or
-# committed. See the "Your workspace metadata" section in README.md.
+# Sync workspace state. Holds paths and hashes, and under backups/ it holds full
+# copies of files Pull overwrote. Bound to one project and one folder, so it
+# must not be shared or committed. See "Your workspace metadata" in README.md.
 .rundot-sync/
