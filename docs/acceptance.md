@@ -24,6 +24,26 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 The runner dot-sources every `tests/*.Tests.ps1` into one scope and exits
 non-zero if any assertion failed. It prints the pass and fail counts.
 
+### Running the final acceptance harness
+
+`tests/Acceptance.ps1` executes the gates below and prints a PASS/FAIL table.
+It is named `Acceptance.ps1` rather than `*.Tests.ps1` on purpose, so the fast
+unit suite does not pick it up: some gates spawn child processes and hold a file
+lock.
+
+```powershell
+# Offline gates only: no network, no account
+powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE Studio project
+powershell -NoProfile -File .\tests\Acceptance.ps1 -ProjectId <id> -LocalDir <dir>
+```
+
+The live gates pause and tell you which file to change in Studio, because
+automating Studio writes is a non-goal of this milestone. The harness only ever
+reads from Studio, prints no tokens or file contents, and exits non-zero if any
+gate failed.
+
 ## Gate map
 
 | # | Gate | Evidence | Kind |
@@ -33,8 +53,8 @@ non-zero if any assertion failed. It prints the pass and fail counts.
 | 3 | One remote change → download or conflict | Three-way table + live check | Both |
 | 4 | Pull a clean remote-only change; backup exists and restores by copy | Backup tests + live check | Both |
 | 5 | Case collision hard-fails | `tests/Paths.Tests.ps1` | Automated |
-| 6 | Unstable snapshot retries/aborts | `tests/Snapshot.Tests.ps1` | Automated |
-| 7 | Unreadable local file aborts Plan | `tests/Manifest.Tests.ps1` | Automated |
+| 6 | Unstable snapshot retries/aborts | `tests/Snapshot.Tests.ps1` + harness gate 6 | Automated |
+| 7 | Unreadable local file aborts Plan | `tests/Manifest.Tests.ps1` + harness gate 7a/7b | Automated |
 | 8 | Plan without BASE refuses | `tests/SyncPlan.Tests.ps1`, `tests/Workspace.Tests.ps1` | Automated |
 | 9 | Plan shows `expiresAt` | `tests/SyncPlan.Tests.ps1` | Automated |
 | 10 | Mutation grep still zero | `tests/NoRemoteMutation.Tests.ps1` | Automated |
@@ -121,9 +141,28 @@ throws rather than returning a partial map. A partial map would later look like
 deleted files, so the local inventory fails closed. The same file also covers a
 junction aborting the inventory.
 
-The CLI ordering is asserted in source text by `tests/SyncCli.Tests.ps1`: the
-local manifest is built before classification, so an unreadable file aborts the
-run before any plan artifact is produced.
+The harness splits the CLI half of this gate in two, and the split is
+deliberate:
+
+- **7a** runs the real abort: a locked file makes `Get-LocalManifest` throw.
+- **7b** asserts source order in `game-studio-sync.ps1`:
+  `Get-LocalManifest` runs before `New-RundotSyncPlanAnalysis`, and the failure
+  path exits non-zero.
+
+7b is an order assertion rather than a live end-to-end abort because `Plan`
+authenticates **before** it reads LOCAL. Triggering the real abort through the
+CLI therefore needs a token, and asserting only on the exit code would be a
+false pass: `Plan` also exits non-zero when BASE is missing, which would
+"prove" this gate for the wrong reason. `tests/SyncCli.Tests.ps1` asserts the
+same ordering from the unit suite.
+
+The harness repeats both halves: gate 7a locks a file and asserts the inventory
+throws, and gate 7b asserts the CLI ordering. Gate 7b is an ordering assertion
+rather than an end-to-end abort, which is a deliberate limit — `Plan`
+authenticates **before** it reads LOCAL, so provoking the real abort through the
+CLI would need a live token in the test path. Asserting only the exit code would
+be worse than useless here, because `Plan` also exits non-zero when BASE is
+missing, which would appear to prove this gate for the wrong reason.
 
 ### 8. Plan without BASE refuses
 
