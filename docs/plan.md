@@ -41,7 +41,7 @@ the path actionable in principle:
 | `upload` (text) | no | Remote mutation is not implemented in this milestone. |
 | `upload` (binary) | no | Remote binary replacement semantics are unverified. |
 | `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. |
-| `download` | yes | Pulling a remote change is the milestone's read-only work. |
+| `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
 A text upload stays `Status = upload` so the plan still shows the candidate,
 but it is never marked applicable, and it always carries a reason. The
@@ -175,10 +175,11 @@ different project or folder.
 
 ## Plan never updates BASE
 
-`Init` remains the only writer of BASE ([base-schema.md](base-schema.md)).
-`Plan` reads BASE identity from the resolver's manifest and writes only
-`last-plan.json`. `.rundot-sync/` is in the default ignore set, so the artifact
-is never a local inventory entry or an upload candidate.
+`Init` and `Pull` are the writers of BASE: `Init` creates it, and `Pull`
+replaces it only after a fully verified success ([base-schema.md](base-schema.md),
+[pull.md](pull.md)). `Plan` reads BASE identity from the resolver's manifest
+and writes only `last-plan.json`. `.rundot-sync/` is in the default ignore set,
+so the artifact is never a local inventory entry or an upload candidate.
 
 ## Related contracts
 
@@ -186,6 +187,7 @@ is never a local inventory entry or an upload candidate.
 - BASE ownership and atomic writes: [base-schema.md](base-schema.md).
 - Snapshot stability and the torn-read abort: [remote-snapshot.md](remote-snapshot.md).
 - Path identity, safety, and ignores: [path-safety.md](path-safety.md).
+- Applying a remote-only change with backups: [pull.md](pull.md).
 
 Unit coverage lives in `tests/SyncPlan.Tests.ps1` (engine) and
 `tests/SyncCli.Tests.ps1` (CLI wiring), and requires no network.
