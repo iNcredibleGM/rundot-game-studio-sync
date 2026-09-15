@@ -69,12 +69,11 @@ Notes:
 ## Sync (work in progress)
 
 `game-studio-sync.ps1` is a separate entrypoint for syncing a Studio project
-with a local directory. `Init`, `Plan`, and `Status` are implemented; `Pull`
-lands in a later v0.1.3 issue.
+with a local directory. `Init`, `Plan`, `Status`, and `Pull` are implemented.
 
 Sync is read-oriented. Neither LOCAL nor REMOTE is authoritative: BASE records
-the last verified shared state. This milestone has no remote mutation - there
-is no `Apply` and no `Push`.
+the last verified shared state. Pull is the only command that writes LOCAL.
+There is still no remote mutation - there is no `Apply` and no `Push`.
 
 Initialize a workspace:
 
@@ -105,8 +104,11 @@ Inspect the workspace with a dry run:
 
 - Both require a BASE and refuse without one, pointing at `Init`.
 - `Plan` persists `.rundot-sync/last-plan.json`; `Status` writes nothing.
-- Neither changes a local file or Studio. **No operation is applicable in this
-  milestone**, so a plan is never permission to write.
+- Neither changes a local file or Studio, and a plan is never permission to
+  write: remote-mutating operations are always `applicable: false`, so a text
+  upload the classifier calls actionable stays blocked here.
+- `Plan` never updates BASE, and `Pull` recomputes its own actions rather than
+  trusting `last-plan.json`, so an expired plan cannot authorise a write.
 - Add `-Verbose` to also list unchanged paths.
 
 Every dry run ends with:
@@ -116,6 +118,31 @@ Dry run only. No remote files were modified.
 This plan is a point-in-time observation, not permission to write.
 WARNING: This tool uses unofficial remote API routes that may change.
 ```
+
+Apply remote-only changes to your local files:
+
+```powershell
+# Pull clean remote-only changes, with a backup of every file replaced
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull
+
+# Skip the overwrite prompt for unattended runs (backups still happen)
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull -ForcePull
+```
+
+- `Pull` applies **only** clean remote-only changes
+  (`BASE=A LOCAL=A REMOTE=B`). A local edit, a conflict, or a deletion
+  candidate is reported and left alone. It never deletes anything.
+- Before replacing a local file it copies the original into
+  `.rundot-sync/backups/<timestamp>/`, prints the backup root, and asks you to
+  type `yes`. `-ForcePull` skips the prompt but never the backup.
+- It re-verifies every written file against REMOTE and updates BASE only after
+  that succeeds. Any failure rolls the local writes back and leaves the
+  previous BASE authoritative.
+- It records metadata-only entries in `.rundot-sync/journal.jsonl`: paths,
+  hashes, and counts. Never file contents or tokens.
+
+See [docs/pull.md](docs/pull.md) for the full Pull contract, including what it
+refuses to overwrite and how backups are retained.
 
 See [docs/init.md](docs/init.md) for the Init failure table and the
 `Plan`-without-BASE refusal, and [docs/plan.md](docs/plan.md) for the plan

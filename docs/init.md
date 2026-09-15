@@ -1,7 +1,8 @@
 # Init
 
-Init is the first-run workflow. It is the only command that creates a
-workspace and the only writer of BASE.
+Init is the first-run workflow. It is the command that creates a workspace and
+records the first BASE ([pull.md](pull.md) covers the later, verified BASE
+update that `Pull` performs).
 
 A missing BASE is a normal first-run state, not an error. Neither LOCAL nor
 REMOTE is authoritative: BASE records the last verified shared state, and any
@@ -165,6 +166,8 @@ verification.
 ## Next
 
 Once BASE exists, `Plan` and `Status` are the read commands
-([plan.md](plan.md)). `Plan` generates the dry-run report and persists
+([plan.md](plan.md)), and `Pull` applies remote-only changes with backups
+([pull.md](pull.md)). `Plan` generates the dry-run report and persists
 `.rundot-sync/last-plan.json`; `Status` runs the same engine and writes
-nothing. Neither mutates Studio, and `Init` remains the only writer of BASE.
+nothing. Neither mutates Studio, and no command mutates Studio in this
+milestone.
