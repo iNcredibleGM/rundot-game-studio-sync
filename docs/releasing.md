@@ -181,7 +181,7 @@ git checkout -b vA.B.C
 git push -u origin vA.B.C
 ```
 
-`vA.B.C` is the next ROADMAP version (after v0.1.2 that is `v0.1.3`).
+`vA.B.C` is the next ROADMAP version (after v0.1.3 that is `v0.2.0`).
 The GitHub milestone for that version should already exist with its
 child issues. Do not file a tracking issue that restates the milestone.
 

@@ -59,7 +59,7 @@ Milestone: [v0.1.3 - Safe pull planner](https://github.com/iNcredibleGM/rundot-g
 
 Done when a stranger can init, edit one file, see exactly one upload candidate, pull a clean remote-only change with a backup, and verify there is still no remote mutation code path.
 
-Work is complete on the `v0.1.3` integration branch. The `Shipped on main.` marker is added by the ship pull request that lands this milestone ([docs/releasing.md](docs/releasing.md)); acceptance evidence is recorded in [docs/acceptance.md](docs/acceptance.md).
+Shipped on `main`.
 
 ## v0.2.0 - Safe push
 
