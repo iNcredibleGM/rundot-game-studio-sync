@@ -580,6 +580,19 @@ function Get-ProbeListedPaths {
     return $paths
 }
 
+function Get-ProbeProbeOwnedPaths {
+    # Binary uploads are recorded under /uploads regardless of the requested
+    # path, so a survey that only looks in /sync-probe reports zero and hides
+    # everything the probe actually created. Match both directories.
+    param([string[]]$Paths)
+
+    if ($null -eq $Paths) { $Paths = @(Get-ProbeListedPaths) }
+
+    return @($Paths | Where-Object {
+        $_ -like "$($script:ProbeDir)/*" -or $_ -like "$($script:ProbeUploadDir)/*"
+    })
+}
+
 function Get-ProbeFileRow {
     param([string]$Path)
 
@@ -1931,7 +1944,10 @@ function Invoke-ScenarioTextConcurrencyApply {
 function Invoke-ScenarioSurvey {
     # Lists every probe-created path so the human can delete them in the Studio
     # UI. There is no delete route in this milestone (#16 owns it).
-    $paths = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeDir)*" } | Sort-Object)
+    #
+    # Both directories are scanned: text writes land under /sync-probe, but
+    # binary uploads are recorded under /uploads no matter what was requested.
+    $paths = @(Get-ProbeProbeOwnedPaths | Sort-Object)
 
     Add-ProbeEvidence -Case 'survey-probe-paths' -Status 'OBSERVED' -Data @{
         note  = 'delete these paths in the Studio UI to clean up the disposable project'
@@ -2459,6 +2475,63 @@ function Invoke-ScenarioBinaryFailure {
         http = @{ status = $malformed.Status; error = if ($null -ne $malformed.TransportError) { [string]$malformed.TransportError.Message } else { $null } }
     }
     Write-ProbeLog ("[PROBED] binary-failure-presigned-malformed status={0}" -f $malformed.Status)
+
+    # Declared size: is the declaration enforced against the bytes actually
+    # uploaded? For Push this decides whether a wrong declaredSize is caught
+    # server-side or silently accepted, and whether a large declaration is
+    # refused before any bytes move.
+    foreach ($case in @(
+        @{ Case = 'binary-size-zero'; Declared = 0; Note = 'declaredSize 0; expected 400' },
+        @{ Case = 'binary-size-mismatch-small'; Declared = 1; Note = 'declared 1 byte, uploading 71' },
+        @{ Case = 'binary-size-mismatch-large'; Declared = 1000000; Note = 'declared 1 MB, uploading 71 bytes' },
+        @{ Case = 'binary-size-mismatch-huge'; Declared = 104857600; Note = 'declared 100 MB, uploading 71 bytes' }
+    )) {
+        $sizeName = Get-BinaryProbeName -Suffix 'size'
+        $sizePath = "$($script:ProbeDir)/$sizeName"
+
+        $sizeUploadUrl = Invoke-ProbeUploadUrlRequest -Body @{
+            declaredSize = $case.Declared
+            fileName     = $sizeName
+            path         = $sizePath
+        }
+        $sizePresigned = Get-ProbePresignedUrl -Response $sizeUploadUrl
+        $sizePutStatus = $null
+        if ($null -ne $sizePresigned) {
+            $sizePut = Invoke-ProbeRawPut -PresignedUrl $sizePresigned -Bytes $bytes
+            $sizePutStatus = $sizePut.Status
+        }
+
+        $sizeAdoptId = Get-ProbeMintedUploadId -Response $sizeUploadUrl
+        $sizeAdopt = $null
+        $recorded = $null
+        $recordedSize = $null
+        if ($null -ne $sizeAdoptId) {
+            $sizeAdopt = Invoke-ProbeUploadAdoptRequest -Body @{ uploadId = $sizeAdoptId; name = $sizeName }
+            try {
+                $parsedSize = $sizeAdopt.BodyText | ConvertFrom-Json
+                $recorded = [string]$parsedSize.path
+                $recordedSize = [string]$parsedSize.size
+            }
+            catch { }
+            if ($null -ne $recorded) { $script:CreatedPaths.Add($recorded) }
+        }
+
+        Add-ProbeEvidence -Case $case.Case -Status 'PROBED' -Data @{
+            note            = $case.Note
+            declaredSize    = $case.Declared
+            actualBytes     = $bytes.Length
+            uploadUrlStatus = $sizeUploadUrl.Status
+            uploadUrlBody   = $sizeUploadUrl.BodyText
+            putStatus       = $sizePutStatus
+            adoptStatus     = if ($null -ne $sizeAdopt) { $sizeAdopt.Status } else { $null }
+            adoptBody       = if ($null -ne $sizeAdopt) { $sizeAdopt.BodyText } else { $null }
+            recordedPath    = $recorded
+            recordedSize    = $recordedSize
+        }
+        Write-ProbeLog ("[PROBED] {0} declared={1} uploadUrl={2} put={3} adopt={4}" -f `
+            $case.Case, $case.Declared, $sizeUploadUrl.Status, $sizePutStatus, `
+            $(if ($null -ne $sizeAdopt) { $sizeAdopt.Status } else { '-' }))
+    }
 }
 
 
