@@ -162,6 +162,25 @@ Assert-True (
     $probeText -match 'a bare directory like /uploads is never eligible'
 ) "the delete guard must state that a bare directory is never eligible"
 
+# -AllRuns widens the cleanup filter to every probe path, including earlier
+# runs' files, which carry a different stamp. The guard must accept the probe
+# stamp SHAPE in that mode, or -AllRuns would select paths it then refuses and
+# report them as remaining while deleting only the current run's files.
+Assert-True (
+    $probeText -match 'ProbeAllowAllRuns'
+) "the delete guard must widen to the probe stamp shape under -AllRuns"
+
+# Widening must stay a strict shape, never a loose "contains probe".
+Assert-True (
+    $probeText -match [regex]::Escape('probe-\d{8}-\d{6}')
+) "-AllRuns must match a strict probe stamp shape, not a loose substring"
+
+# Cleanup must not abort when the guard refuses a path: -AllRuns selects real
+# project files too, and an uncaught throw would stop cleanup half way through.
+Assert-True (
+    $probeText -match 'binary-cleanup-skipped'
+) "cleanup must record a guard refusal instead of aborting"
+
 # The rename capture is a copied fetch, which carries an Authorization header.
 # It must be redacted rather than recorded.
 Assert-True (

@@ -199,6 +199,7 @@ $script:CleanupRemaining = -1
 $script:Token = $null
 $script:Headers = $null
 $script:WriteEnabled = $false
+$script:ProbeAllowAllRuns = $false
 
 . (Join-Path $RepoRoot 'lib\Paths.ps1')
 . (Join-Path $RepoRoot 'lib\Hashing.ps1')
@@ -2609,6 +2610,16 @@ function Assert-ProbeDeleteTarget {
         if ($leaf -like "*$stamp*") { $stamped = $true; break }
     }
 
+    # -AllRuns widens the candidate filter to every probe path, which includes
+    # earlier runs' files. Those carry a different stamp, so allow any leaf with
+    # the strict probe stamp SHAPE (probe-YYYYMMDD-HHMMSS). This is
+    # deliberately a shape rather than a loose "contains probe": a real project
+    # file would have to be named probe-20260917-123456-... to be caught, and
+    # -AllRuns is an explicit opt-in.
+    if (-not $stamped -and $script:ProbeAllowAllRuns) {
+        $stamped = ($leaf -match '^\.?probe-\d{8}-\d{6}')
+    }
+
     $inUploads = $Path -like "$($script:ProbeUploadDir)/*"
     $reservedShaped = ($Path -like '/.git/*' -or $Path -like '/.rundot/*')
 
@@ -2747,11 +2758,39 @@ function Invoke-ScenarioBinaryCleanup {
         return
     }
 
+    # -AllRuns widens the candidate filter to every probe path, including
+    # earlier runs'. Those carry a different stamp, so the delete guard is told
+    # to accept the probe stamp shape for this run. Without this the widened
+    # filter would select paths the guard then refuses, and -AllRuns would
+    # silently delete only the current run's files while reporting the rest as
+    # remaining.
+    $script:ProbeAllowAllRuns = [bool]$AllRuns
+
     $deleted = 0
     $failed = New-Object 'System.Collections.Generic.List[string]'
+    $skipped = New-Object 'System.Collections.Generic.List[string]'
 
     foreach ($path in $candidates) {
-        $result = Invoke-ProbeDeleteFile -Path $path
+        # -AllRuns widens the candidate filter to every path under /uploads,
+        # which includes real project files. The delete guard correctly refuses
+        # those, so a refusal here is expected rather than exceptional: record
+        # it and move on instead of letting an uncaught throw abort the whole
+        # cleanup half way through.
+        $result = $null
+        try {
+            $result = Invoke-ProbeDeleteFile -Path $path
+        }
+        catch {
+            $skipped.Add($path)
+            Add-ProbeEvidence -Case 'binary-cleanup-skipped' -Status 'OBSERVED' -Data @{
+                note   = 'the delete guard refused this path, so it was not touched'
+                path   = $path
+                reason = $_.Exception.Message
+            }
+            Write-ProbeLog ("[SKIPPED] cleanup refused to delete {0}" -f $path)
+            continue
+        }
+
         if ($result.Deleted) {
             $deleted++
         }
@@ -2782,11 +2821,15 @@ function Invoke-ScenarioBinaryCleanup {
         attempted   = $candidates.Count
         deleted     = $deleted
         failed      = $failed.ToArray()
+        skipped     = $skipped.ToArray()
         remaining   = $remaining
         remainingCount = $remaining.Count
     }
     Write-ProbeLog ("[OBSERVED] binary-cleanup: deleted {0}/{1}, {2} remaining" -f `
         $deleted, $candidates.Count, $remaining.Count)
+    if ($skipped.Count -gt 0) {
+        Write-ProbeLog ("[OBSERVED] binary-cleanup: {0} path(s) were outside the probe's ownership and were left alone." -f $skipped.Count)
+    }
 }
 
 function Invoke-ScenarioBinaryOverwrite {
