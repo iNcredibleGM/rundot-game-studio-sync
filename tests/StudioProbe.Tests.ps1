@@ -169,8 +169,47 @@ Assert-True (
 ) "the rename DevTools capture must name the Authorization header it redacts"
 
 Assert-True (
-    $probeText -match [regex]::Escape('$1=<redacted>')
+    $probeText -match [regex]::Escape('$1$2<redacted>')
 ) "the rename DevTools capture must replace a credential value with a placeholder"
+
+# The capture exists to name the real route, so the method and its URL must
+# both be extracted. Matching on "method" alone records that a request happened
+# without recording where it went, which is exactly the bug this pins.
+Assert-True (
+    $probeText -match 'captureRoutes'
+) "rename-devtools-apply must record the captured method/URL route pairs"
+
+# A blanket https?:// match picks up the "referrer" line, which sits between
+# the fetch URL and the method, so the recorded route would be
+# "https://run.world/" instead of the real endpoint. Rather than assert on the
+# probe's source text (which is fragile), this replicates the extractor's two
+# patterns against a real copied-fetch snippet and checks it picks the endpoint,
+# not the referrer.
+$fetchUrlPattern = 'fetch\(\s*[''"](https?://[^''"]+)[''"]'
+$harUrlPattern = '"(?:url|requestUrl)"\s*:\s*"(https?://[^"]+)"'
+$sampleCapture = @(
+    'await fetch("https://studio.example/api/projects/p1/move", {'
+    '    "referrer": "https://run.world/",'
+    '    "body": "{}",'
+    '    "method": "POST",'
+    '    "mode": "cors"'
+    '});'
+)
+
+$extractedUrl = $null
+foreach ($line in $sampleCapture) {
+    $fetchMatch = [regex]::Match($line, $fetchUrlPattern)
+    if ($fetchMatch.Success) { $extractedUrl = $fetchMatch.Groups[1].Value; continue }
+    $harMatch = [regex]::Match($line, $harUrlPattern)
+    if ($harMatch.Success) { $extractedUrl = $harMatch.Groups[1].Value; continue }
+}
+
+Assert-Equal 'https://studio.example/api/projects/p1/move' $extractedUrl `
+    "the capture extractor must read the fetch endpoint, not the referrer line"
+
+Assert-True (
+    $probeText -match 'requestUrl'
+) "rename-devtools-apply must also read a HAR url field"
 
 Assert-True (
     $probeText -match 'function Invoke-ScenarioRunDeleteRenameAll'

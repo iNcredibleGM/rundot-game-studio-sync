@@ -3877,6 +3877,7 @@ function Invoke-ScenarioRenameDevToolsApply {
 
     $captureText = $null
     $captureLines = $null
+    $captureRoutes = $null
     $captureHadResponse = $false
     if (-not [string]::IsNullOrWhiteSpace($CapturePath) -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
         $captureText = (Get-Content -LiteralPath $CapturePath -Raw)
@@ -3884,10 +3885,56 @@ function Invoke-ScenarioRenameDevToolsApply {
         # Authorization header, which must never reach evidence, and a HAR
         # carries the whole exchange, so anything credential-shaped is
         # redacted rather than recorded.
+        #
+        # The method/URL pairs are extracted explicitly. Matching on "method"
+        # alone is not enough: the URL lives on its own line, so a naive filter
+        # records that a request happened without recording where it went,
+        # which is the one thing this scenario exists to capture.
+        $redact = {
+            param([string]$Text)
+            $t = $Text
+            $t = $t -replace '(?i)(authorization|bearer|token|cookie|api[-_]?key)("?\s*[:=]\s*"?)[^",\s]+', '$1$2<redacted>'
+            $t = $t -replace 'eyJ[A-Za-z0-9_\-]{5,}', '<redacted-jwt>'
+            return $t
+        }
+
         $captureLines = @($captureText -split "`r?`n" |
-            Where-Object { $_ -match "(?i)^\s*(fetch|curl|https?://|[A-Z]{3,7}\s+https?://|method|\""(status|url|method)\"")" } |
-            Select-Object -First 40 |
-            ForEach-Object { $_ -replace '(?i)(authorization|bearer|token|cookie|api[-_]?key)\s*["'']?\s*[:=]\s*["'']?[^"'',\s]+', '$1=<redacted>' })
+            Where-Object { $_ -match '(?i)fetch\(|"method"|"url"|\bmethod:|https?://' } |
+            Select-Object -First 60 |
+            ForEach-Object { & $redact $_ })
+
+        # The route index: every URL with its method, so the evidence names the
+        # real route rather than just proving that some request occurred.
+        #
+        # The URL is read ONLY from a fetch() call or a HAR "url" field. A
+        # blanket https?:// match picks up the "referrer" line, which sits
+        # between the URL and the method in a copied fetch and would replace
+        # the real route with "https://run.world/".
+        $routes = New-Object 'System.Collections.Generic.List[object]'
+        $lastUrl = $null
+        foreach ($line in ($captureText -split "`r?`n")) {
+            $fetchMatch = [regex]::Match($line, 'fetch\(\s*[''"](https?://[^''"]+)[''"]')
+            $harUrlMatch = [regex]::Match($line, '"(?:url|requestUrl)"\s*:\s*"(https?://[^"]+)"')
+
+            if ($fetchMatch.Success) {
+                $lastUrl = & $redact $fetchMatch.Groups[1].Value
+                continue
+            }
+            if ($harUrlMatch.Success) {
+                $lastUrl = & $redact $harUrlMatch.Groups[1].Value
+                continue
+            }
+
+            $methodMatch = [regex]::Match($line, '"method"\s*:\s*"([A-Za-z]+)"')
+            if ($methodMatch.Success -and $null -ne $lastUrl) {
+                $routes.Add([pscustomobject]@{
+                    method = $methodMatch.Groups[1].Value
+                    url    = $lastUrl
+                })
+                $lastUrl = $null
+            }
+        }
+        $captureRoutes = $routes.ToArray()
         $captureHadResponse = ($captureText -match '(?i)"status"\s*:')
     }
 
@@ -3903,6 +3950,7 @@ function Invoke-ScenarioRenameDevToolsApply {
         contentMoved      = ($null -ne $renamedPath)
         captureProvided   = (-not [string]::IsNullOrWhiteSpace($captureText))
         captureHadResponse = $captureHadResponse
+        captureRoutes     = $captureRoutes
         captureLines      = $captureLines
     }
 
