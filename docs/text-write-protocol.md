@@ -55,12 +55,19 @@ established by this investigation**. `Plan` classifies a brand-new local file as
 `upload` with a dash in REMOTE (`— / A / —`), so the create case is exactly the
 case this route cannot serve.
 
+**One create avenue does exist**, but not through this route: the binary upload
+flow can create a text file at `/uploads/{basename}`
+([binary-upload-protocol.md](binary-upload-protocol.md)). It cannot create a
+file at an arbitrary path, and it collides rather than replaces, so it is a
+narrow exception rather than a general create mechanism.
+
 Consequence for [#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17):
 `Apply-SyncPlan` / `Push` **cannot publish a new file** using this route alone.
 A create path must be found before `Push` can honour every `upload` row, or
 `Push` must refuse new-file rows explicitly rather than failing them mid-run.
-Do not assume the binary `upload-url` / `upload-adopt` flow covers text; that is
-[#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15).
+Do not assume the binary `upload-url` / `upload-adopt` flow covers text
+generally; it covers only `/uploads/{basename}`, as
+[#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15) found.
 
 ## Overwrite semantics
 
