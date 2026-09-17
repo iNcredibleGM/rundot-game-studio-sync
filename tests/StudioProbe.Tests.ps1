@@ -43,6 +43,26 @@ Assert-True (
     $probeText -match '\$AccessTokenPath'
 ) "the probe must accept a token file so a token never has to be pasted inline"
 
+# A swallowed switch name is the mistake that cost a debugging session:
+# '-ProjectId ABC-Scenario run-binary-all' binds ProjectId='ABC-Scenario', and
+# the resulting rejection looks like an auth failure. The probe must catch it.
+Assert-True (
+    $probeText -match 'swallowed the next switch name'
+) "the probe must detect a -ProjectId that swallowed the next switch name"
+
+Assert-True (
+    $probeText -match '\$probeParameterNames'
+) "the swallowed-switch check must cover this script's own parameter names"
+
+# The probe must never fall through to an interactive token prompt.
+Assert-True (
+    $probeText -notmatch 'Get-RundotAccessToken'
+) "the probe must not call the shared helper that can prompt for a token"
+
+Assert-True (
+    $probeText -match 'This probe deliberately does not prompt'
+) "the probe must state that it refuses to prompt for a token"
+
 Assert-True (
     $probeText -match 'Refusing to mutate Studio without -ConfirmRemoteWrite'
 ) "the probe must refuse to mutate without -ConfirmRemoteWrite"

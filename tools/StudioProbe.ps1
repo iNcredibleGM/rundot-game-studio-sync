@@ -1029,6 +1029,34 @@ function Invoke-ProbeBinaryUpload {
 Write-ProbeLog "Probe scenario: $Scenario"
 Write-ProbeLog 'Project: <redacted>'
 
+# ---------------------------------------------------------------------------
+# Parameter sanity.
+#
+# PowerShell binds '-ProjectId ABC-Scenario run-binary-all' with the value
+# 'ABC-Scenario', silently swallowing the next switch name into the value. The
+# project ID then looks plausible, every request 401s or 404s, and the probe's
+# own auth messages point at the wrong problem entirely. A project ID never
+# ends in one of this script's own parameter names, so that shape is rejected
+# with the fix spelled out.
+# ---------------------------------------------------------------------------
+$probeParameterNames = @(
+    'ProjectId', 'Scenario', 'RepoRoot', 'StudioOrigin', 'OutDir',
+    'AccessToken', 'AccessTokenPath', 'NoInteractiveAuth', 'ConfirmRemoteWrite'
+)
+
+foreach ($parameterName in $probeParameterNames) {
+    $swallowed = '-' + $parameterName
+    if ($ProjectId.EndsWith($swallowed, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $suggested = $ProjectId.Substring(0, $ProjectId.Length - $swallowed.Length)
+        throw (
+            "-ProjectId swallowed the next switch name. Got '$ProjectId', which " +
+            "ends in '$swallowed'. There is a missing space before '$swallowed'. " +
+            "Use: -ProjectId $suggested -Scenario $Scenario"
+        )
+    }
+}
+
+
 # Read the token from a file when one was given. This is the preferred path:
 # the token never enters a shell history or a chat transcript.
 if (-not [string]::IsNullOrWhiteSpace($AccessTokenPath)) {
@@ -1111,29 +1139,6 @@ if (-not $ConfirmRemoteWrite) {
 }
 
 
-if ([string]::IsNullOrWhiteSpace($AccessToken)) {
-    $savedAuthPath = Join-Path $env:APPDATA '.rundot\studio-export.auth.json'
-    $cliSessionPath = Join-Path $env:APPDATA '.rundot\prod.session.json'
-
-    $savedAuth = Load-StudioAuth -AuthPath $savedAuthPath
-    $cliSession = Get-RundotCliSession -RundotCliSessionPath $cliSessionPath
-
-    $cliUsable = $false
-    if ($null -ne $cliSession) {
-        $cliUsable = Test-RundotCliTokenFresh `
-            -AccessToken $cliSession.AccessToken `
-            -ExpiresAtUnixTimeMs $cliSession.ExpiresAtUnixTimeMs
-    }
-
-    if (-not $cliUsable -and $null -eq $savedAuth -and $NoInteractiveAuth) {
-        throw (
-            'No non-interactive Studio authentication is available: the CLI ' +
-            'session is expired or missing, and no saved refresh credentials ' +
-            'exist. Run ''rundot login'', or pass -AccessToken.'
-        )
-    }
-}
-
 if (-not [string]::IsNullOrWhiteSpace($AccessToken)) {
     $parsed = Get-TokenFromText $AccessToken
     $script:Token = if ($parsed) { $parsed } else { $AccessToken.Trim() }
@@ -1144,20 +1149,81 @@ if (-not [string]::IsNullOrWhiteSpace($AccessToken)) {
         -AccessToken $script:Token
 
     if ($null -eq $manifest) {
-        throw 'The supplied token was rejected by Studio for this project.'
+        throw (
+            'The supplied token was rejected by Studio for this project. ' +
+            'Either the token is stale, or -ProjectId is not a project this ' +
+            'account can read.'
+        )
     }
 
     Write-ProbeLog 'Supplied token accepted.'
 }
 else {
-    $authResult = Get-RundotAccessToken `
+    # Resolve a token without ever prompting. The shared helper falls back to
+    # an interactive paste, which is the wrong behavior for a probe: a run that
+    # blocks on a hidden prompt in a non-interactive shell is worse than a run
+    # that fails with a reason. Try the CLI session, then saved refresh
+    # credentials, and only then give up.
+    $savedAuthPath = Join-Path $env:APPDATA '.rundot\studio-export.auth.json'
+    $cliSessionPath = Join-Path $env:APPDATA '.rundot\prod.session.json'
+
+    $cliSession = Get-RundotCliSession -RundotCliSessionPath $cliSessionPath
+    $savedAuth = Load-StudioAuth -AuthPath $savedAuthPath
+
+    $candidateToken = $null
+    $cliFresh = $false
+
+    if ($null -ne $cliSession) {
+        $cliFresh = Test-RundotCliTokenFresh `
+            -AccessToken $cliSession.AccessToken `
+            -ExpiresAtUnixTimeMs $cliSession.ExpiresAtUnixTimeMs
+        if ($cliFresh) { $candidateToken = $cliSession.AccessToken }
+    }
+
+    if ($null -eq $candidateToken -and $null -ne $savedAuth) {
+        Write-ProbeLog 'Trying saved Studio refresh credentials...'
+        $refreshed = Get-FreshStudioToken -ApiKey $savedAuth.ApiKey -RefreshToken $savedAuth.RefreshToken
+        if ($null -ne $refreshed) { $candidateToken = $refreshed.AccessToken }
+    }
+
+    if ($null -eq $candidateToken) {
+        $reason = if ($null -eq $cliSession) {
+            'no RUNdot CLI session was found'
+        }
+        elseif (-not $cliFresh) {
+            'the RUNdot CLI access token is expired or near expiry'
+        }
+        else {
+            'no usable token was produced'
+        }
+
+        throw (
+            "No non-interactive Studio authentication is available: $reason. " +
+            'Run ''rundot login'' to refresh, or pass -AccessTokenPath with a ' +
+            'fresh token. This probe deliberately does not prompt.'
+        )
+    }
+
+    # Validate against the project before any scenario runs, so a rejected
+    # token is reported as a token problem rather than as a scenario failure.
+    $manifest = Get-StudioManifestWithToken `
         -StudioOrigin $StudioOrigin `
         -ProjectId $ProjectId `
-        -AuthDir (Join-Path $env:APPDATA '.rundot') `
-        -AuthPath (Join-Path $env:APPDATA '.rundot\studio-export.auth.json') `
-        -RundotCliSessionPath (Join-Path $env:APPDATA '.rundot\prod.session.json')
+        -AccessToken $candidateToken
 
-    $script:Token = $authResult.AccessToken
+    if ($null -eq $manifest) {
+        $source = if ($cliFresh) { 'RUNdot CLI session' } else { 'saved refresh credentials' }
+
+        throw (
+            "Studio rejected the token from the $source for project '$ProjectId'. " +
+            'Check that -ProjectId is correct and that there is a SPACE before ' +
+            '-Scenario on the command line; without it PowerShell binds the two ' +
+            'together and the project ID is wrong. Otherwise run ''rundot login'' ' +
+            'again, or pass -AccessTokenPath with a fresh token.'
+        )
+    }
+
+    $script:Token = $candidateToken
     Write-ProbeLog 'Shared authentication accepted.'
 }
 
