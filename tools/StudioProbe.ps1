@@ -1027,6 +1027,58 @@ function Get-ProbeAdoptFieldValue {
     }
 }
 
+function Invoke-ProbeAdoptWalk {
+    # adopt names the first missing field in each rejection, so walk that chain
+    # instead of hardcoding a body. Any case that adopts goes through this, so
+    # a case never has to know the full contract and cannot silently send a
+    # field name the server does not recognize.
+    param(
+        [string]$UploadId,
+        [string]$Name,
+        [string]$Path,
+        [byte[]]$Bytes,
+        [hashtable]$Seed,
+        [int]$MaxAttempts = 8
+    )
+
+    $body = @{}
+    if ($null -ne $Seed) {
+        foreach ($key in $Seed.Keys) { $body[$key] = $Seed[$key] }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UploadId)) { $body['uploadId'] = $UploadId }
+
+    $walk = New-Object 'System.Collections.Generic.List[object]'
+    $response = $null
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $response = Invoke-ProbeUploadAdoptRequest -Body $body
+        $walk.Add([pscustomobject]@{
+            attempt = $attempt
+            request = $body
+            status  = $response.Status
+            body    = $response.BodyText
+        })
+
+        if ($response.Status -eq 200) { break }
+
+        $missingField = Get-ProbeValidationField -Response $response
+        if ([string]::IsNullOrWhiteSpace($missingField)) { break }
+        if ($body.ContainsKey($missingField)) { break }
+
+        $value = Get-ProbeAdoptFieldValue `
+            -Field $missingField -FileName $Name -Path $Path -Bytes $Bytes
+
+        if ($null -eq $value) { break }
+        $body[$missingField] = $value
+    }
+
+    return [pscustomobject]@{
+        Body     = $body
+        Response = $response
+        Walk     = $walk.ToArray()
+    }
+}
+
 function Invoke-ProbeBinaryUpload {
     # The whole three-step flow for one file. Records each step, and returns
     # the resulting project path the adopt step reported, if any.
@@ -1108,13 +1160,13 @@ function Invoke-ProbeBinaryUpload {
 
     $adoptBody = $AdoptBodyOverride
     $adoptResponse = $null
-    $adoptWalk = New-Object 'System.Collections.Generic.List[object]'
+    $adoptWalk = @()
 
     if ($null -ne $adoptBody) {
         $adoptResponse = Invoke-ProbeUploadAdoptRequest -Body $adoptBody
     }
     else {
-        $adoptBody = @{ uploadId = $mintedUploadId }
+        $seed = @{}
 
         # Carry through any other object identity the upload-url response
         # exposed, so the adopt body matches what the server handed out.
@@ -1123,44 +1175,24 @@ function Invoke-ProbeBinaryUpload {
             foreach ($candidate in @('key', 'objectKey', 'object_key', 'token')) {
                 $property = $parsedUpload.PSObject.Properties[$candidate]
                 if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                    $adoptBody[$candidate] = [string]$property.Value
+                    $seed[$candidate] = [string]$property.Value
                 }
             }
         }
 
-        for ($attempt = 1; $attempt -le 8; $attempt++) {
-            $adoptResponse = Invoke-ProbeUploadAdoptRequest -Body $adoptBody
+        $adoptResult = Invoke-ProbeAdoptWalk `
+            -UploadId $mintedUploadId `
+            -Name $FileName `
+            -Path "$($script:ProbeDir)/$FileName" `
+            -Bytes $Bytes `
+            -Seed $seed
 
-            $adoptWalk.Add([pscustomobject]@{
-                attempt = $attempt
-                request = $adoptBody
-                status  = $adoptResponse.Status
-                body    = $adoptResponse.BodyText
-            })
-
-            if ($adoptResponse.Status -eq 200) { break }
-
-            $missingField = Get-ProbeValidationField -Response $adoptResponse
-            if ([string]::IsNullOrWhiteSpace($missingField)) { break }
-            if ($adoptBody.ContainsKey($missingField)) { break }
-
-            $value = Get-ProbeAdoptFieldValue `
-                -Field $missingField `
-                -FileName $FileName `
-                -Path "$($script:ProbeDir)/$FileName" `
-                -Bytes $Bytes `
-                -ContentType $ContentType
-
-            if ($null -eq $value) {
-                Write-ProbeLog ("[STOPPED] {0}: adopt wants '{1}', which this probe cannot supply" -f $Case, $missingField)
-                break
-            }
-
-            $adoptBody[$missingField] = $value
-        }
+        $adoptBody = $adoptResult.Body
+        $adoptResponse = $adoptResult.Response
+        $adoptWalk = $adoptResult.Walk
     }
 
-    $result.adoptWalk = $adoptWalk.ToArray()
+    $result.adoptWalk = $adoptWalk
     $result.adopt = @{
         request = $adoptBody
         status  = $adoptResponse.Status
@@ -1171,14 +1203,35 @@ function Invoke-ProbeBinaryUpload {
     }
     Write-ProbeLog ("[PROBED] {0} upload-adopt status={1}" -f $Case, $adoptResponse.Status)
 
-    # Whatever the adopt response calls the final path, the authoritative
-    # answer is what the project file list now contains.
+    # Whatever the adopt response recorded is authoritative. Do NOT match by
+    # filename substring: a collision rename appends a suffix, so
+    # 'name-1.png' does not match '*name.png*' and a substring filter hides the
+    # very duplicate this probe is looking for.
+    $recordedPath = $null
+    try {
+        $parsedAdopt = $adoptResponse.BodyText | ConvertFrom-Json
+        $recordedPath = [string]$parsedAdopt.path
+    }
+    catch { }
+
     Start-Sleep -Milliseconds 400
     $paths = Get-ProbeListedPaths
     $result.listedPaths = $paths
-    $result.listedAfter = @($paths | Where-Object { $_ -like "*$FileName*" })
+    $result.recordedPath = $recordedPath
+    $result.recordedName = if ($null -ne $recordedPath) {
+        [System.IO.Path]::GetFileName($recordedPath)
+    }
+    else { $null }
+    $result.pathHonored = (
+        $null -ne $recordedPath -and
+        [string]::Equals($recordedPath, "$($script:ProbeDir)/$FileName", [System.StringComparison]::OrdinalIgnoreCase)
+    )
+    $result.listedAfter = @($paths | Where-Object {
+        $null -ne $recordedPath -and
+        [string]::Equals($_, $recordedPath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
 
-    foreach ($path in $result.listedAfter) { $script:CreatedPaths.Add([string]$path) }
+    if ($null -ne $recordedPath) { $script:CreatedPaths.Add($recordedPath) }
 
     Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data $result
     return $result
@@ -2120,15 +2173,33 @@ function Invoke-ScenarioBinaryCollision {
             -Bytes $bytes `
             -Note "repeat $i with an identical filename and identical bytes"
 
-        $matching = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeDir)*" })
         Add-ProbeEvidence -Case "binary-collision-survey-$i" -Status 'OBSERVED' -Data @{
-            note    = "probe paths after repeat $i"
-            paths   = $matching
-            count   = $matching.Count
-            attempt = $i
+            note         = "repeat ${i}: the path adopt recorded, and its suffix sequence"
+            attempt      = $i
+            recordedPath = $result.recordedPath
+            listedAfter  = $result.listedAfter
+            pathHonored  = $result.pathHonored
         }
-        Write-ProbeLog ("[OBSERVED] binary-collision-survey-{0}: {1} path(s)" -f $i, $matching.Count)
+        Write-ProbeLog ("[OBSERVED] binary-collision-repeat-{0} recorded={1}" -f $i, $result.recordedPath)
     }
+
+    # The full suffix sequence for this one basename, gathered by prefix so the
+    # -1/-2/-3 siblings are all visible.
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    $family = @(Get-ProbeListedPaths | Where-Object {
+        $_ -match ('(?i)/' + [regex]::Escape($stem) + '(-\d+)?' + [regex]::Escape($extension) + '$')
+    } | Sort-Object)
+
+    Add-ProbeEvidence -Case 'binary-collision-family' -Status 'OBSERVED' -Data @{
+        note       = 'every path sharing this basename; the suffix sequence proves monotonic increment'
+        fileName   = $fileName
+        stem       = $stem
+        extension  = $extension
+        family     = $family
+        familySize = $family.Count
+    }
+    Write-ProbeLog ("[OBSERVED] binary-collision family ({0}): {1}" -f $family.Count, ($family -join ', '))
 
     # Suffix edge cases: extensionless, multi-dot, leading dot, and a name
     # that already ends in a numeric suffix.
@@ -2309,11 +2380,12 @@ function Invoke-ScenarioBinaryOverwrite {    # Can an existing binary be replace
         $reAdoptPutStatus = $reAdoptPut.Status
     }
 
-    $reAdopt = Invoke-ProbeUploadAdoptRequest -Body @{
-        uploadId = $reAdoptId
-        fileName = $fileName
-        path     = $createdPath
-    }
+    $reAdoptResult = Invoke-ProbeAdoptWalk `
+        -UploadId $reAdoptId `
+        -Name $fileName `
+        -Path $createdPath `
+        -Bytes $replaceBytes
+    $reAdopt = $reAdoptResult.Response
     $afterReAdopt = Get-ProbeReadOrNull -Path $createdPath
 
     Add-ProbeEvidence -Case 'binary-overwrite-readopt' -Status 'PROBED' -Data @{
@@ -2324,13 +2396,14 @@ function Invoke-ScenarioBinaryOverwrite {    # Can an existing binary be replace
         putStatus       = $reAdoptPutStatus
         adoptStatus     = $reAdopt.Status
         adoptBody       = $reAdopt.BodyText
+        adoptRequest    = $reAdoptResult.Body
         shaAfter        = if ($null -ne $afterReAdopt) { $afterReAdopt.Sha256 } else { $null }
         sentSha256      = Get-Sha256Hex -Bytes $replaceBytes
         replacedInPlace = (
             $null -ne $afterReAdopt -and
             [string]::Equals($afterReAdopt.Sha256, (Get-Sha256Hex -Bytes $replaceBytes), [System.StringComparison]::OrdinalIgnoreCase)
         )
-        pathsAfter      = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeDir)*" })
+        pathsAfter      = @(Get-ProbeProbeOwnedPaths)
     }
     Write-ProbeLog ("[PROBED] binary-overwrite-readopt adoptStatus={0}" -f $reAdopt.Status)
 
@@ -2354,15 +2427,22 @@ function Invoke-ScenarioBinaryIdempotency {
     $second = Invoke-ProbeBinaryUpload -Case 'binary-idempotency-second' -FileName $fileName -Bytes $bytes `
         -Note 'second upload, byte-identical'
 
-    $paths = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeDir)*" })
+    $paths = @(Get-ProbeProbeOwnedPaths)
+    $firstOwned = @($first.listedAfter)
+    $secondOwned = @($second.listedAfter)
+    $allOwned = @($firstOwned + $secondOwned | Sort-Object -Unique)
+
     Add-ProbeEvidence -Case 'binary-idempotency-survey' -Status 'OBSERVED' -Data @{
-        note        = 'identical uploads converge on one path, or multiply it?'
-        firstPaths  = $first.listedAfter
-        secondPaths = $second.listedAfter
-        allPaths    = $paths
+        note          = 'identical uploads converge on one path, or multiply it?'
+        firstPaths    = $firstOwned
+        secondPaths   = $secondOwned
+        distinctPaths = $allOwned
+        distinctCount = $allOwned.Count
+        multiplied    = ($allOwned.Count -gt 1)
+        allPaths      = $paths
     }
-    Write-ProbeLog ("[OBSERVED] binary-idempotency: first={0} second={1}" -f `
-        (@($first.listedAfter).Count), (@($second.listedAfter).Count))
+    Write-ProbeLog ("[OBSERVED] binary-idempotency: two identical uploads produced {0} distinct path(s): {1}" -f `
+        $allOwned.Count, ($allOwned -join ', '))
 
     # Retry an ambiguous failure: send the presigned PUT twice.
     $retryName = Get-BinaryProbeName -Suffix 'retry'
@@ -2481,12 +2561,14 @@ function Invoke-ScenarioBinaryFailure {
     # server-side or silently accepted, and whether a large declaration is
     # refused before any bytes move.
     foreach ($case in @(
-        @{ Case = 'binary-size-zero'; Declared = 0; Note = 'declaredSize 0; expected 400' },
-        @{ Case = 'binary-size-mismatch-small'; Declared = 1; Note = 'declared 1 byte, uploading 71' },
-        @{ Case = 'binary-size-mismatch-large'; Declared = 1000000; Note = 'declared 1 MB, uploading 71 bytes' },
-        @{ Case = 'binary-size-mismatch-huge'; Declared = 104857600; Note = 'declared 100 MB, uploading 71 bytes' }
+        @{ Case = 'binary-size-zero'; Suffix = 'sizezero'; Declared = 0; Note = 'declaredSize 0; expected 400' },
+        @{ Case = 'binary-size-mismatch-small'; Suffix = 'sizesmall'; Declared = 1; Note = 'declared 1 byte, uploading 71' },
+        @{ Case = 'binary-size-mismatch-large'; Suffix = 'sizelarge'; Declared = 1000000; Note = 'declared 1 MB, uploading 71 bytes' },
+        @{ Case = 'binary-size-mismatch-huge'; Suffix = 'sizehuge'; Declared = 104857600; Note = 'declared 100 MB, uploading 71 bytes' }
     )) {
-        $sizeName = Get-BinaryProbeName -Suffix 'size'
+        # A distinct name per case, so the survey shows which declaration
+        # produced which file rather than a row of identical -size names.
+        $sizeName = Get-BinaryProbeName -Suffix $case.Suffix
         $sizePath = "$($script:ProbeDir)/$sizeName"
 
         $sizeUploadUrl = Invoke-ProbeUploadUrlRequest -Body @{
