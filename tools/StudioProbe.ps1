@@ -3525,33 +3525,52 @@ function Invoke-ScenarioRenameDevToolsPrepare {
     # the human a precise instruction. The rename route has no documented
     # shape, so a real UI rename captured from DevTools is the authoritative
     # source when the guessed candidates fail.
-    $target = New-ProbeOwnedTextFile -Suffix 'rename-devtools' -Content 'rename this file in the Studio UI'
+    #
+    # The content is unique per run so the file can be located by hash
+    # afterwards even if the human gives it an unrelated name.
+    $target = New-ProbeOwnedTextFile -Suffix 'rename-devtools'
 
     if ($null -eq $target.Path) {
         Write-ProbeLog '[STOPPED] rename-devtools-prepare: the target could not be created'
         return
     }
 
+    # The new name should keep the run stamp, because the delete guard only
+    # accepts a stamped /uploads path. A name without it is still detected by
+    # hash, but cannot be deleted automatically.
+    $suggestedName = "$($script:ProbeNamePrefix)-renamed.txt"
+
     $stateFile = Join-Path $OutDir 'probe-rename-state.json'
     @{
-        path      = $target.Path
-        sha256    = $target.Sha256
+        path       = $target.Path
+        sha256     = $target.Sha256
+        runStamp   = $script:ProbeRunStamp
         preparedAt = (Get-Date).ToUniversalTime().ToString('o')
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $stateFile -Encoding UTF8
 
     Add-ProbeEvidence -Case 'rename-devtools-prepare' -Status 'PROBED' -Data @{
-        note      = 'target written; rename it by hand in Studio with DevTools open'
-        path      = $target.Path
-        stateFile = $stateFile
+        note          = 'target written; rename it by hand in Studio with DevTools open'
+        path          = $target.Path
+        sha256        = $target.Sha256
+        runStamp      = $script:ProbeRunStamp
+        suggestedName = $suggestedName
+        stateFile     = $stateFile
     }
 
     Write-ProbeLog ''
     Write-ProbeLog 'NEXT (human step):'
-    Write-ProbeLog "  1. In Studio, rename $($target.Path) to any new name. Save."
-    Write-ProbeLog '  2. Open DevTools > Network, repeat the rename if needed, and'
-    Write-ProbeLog '     right-click the request > Copy > Copy as fetch (or Save all as HAR).'
+    Write-ProbeLog "  1. In Studio, rename $($target.Path)"
+    Write-ProbeLog "     Suggested new name: $suggestedName"
+    Write-ProbeLog '     Keep the probe-<stamp> prefix: a stamped name can be deleted'
+    Write-ProbeLog '     automatically, and a name without it has to be removed by hand.'
+    Write-ProbeLog '  2. With DevTools > Network open, repeat the rename if needed.'
+    Write-ProbeLog '     Right-click the rename request > Copy > Copy as fetch.'
+    Write-ProbeLog '     For the response too, use Save all as HAR instead.'
     Write-ProbeLog '  3. Save that text to a file, e.g. %TEMP%\rundot-rename-capture.txt'
     Write-ProbeLog '  4. Run -Scenario rename-devtools-apply -CapturePath <that file>'
+    Write-ProbeLog ''
+    Write-ProbeLog 'The apply step locates the file by content hash and deletes it, so the'
+    Write-ProbeLog 'project is left clean. Do not delete it yourself before running apply.'
     Write-ProbeLog ''
 }
 
@@ -3560,6 +3579,12 @@ function Invoke-ScenarioRenameDevToolsApply {
     # body. The capture is never parsed into a replayed request: it is evidence
     # about the shape, and a probe that replayed a copied auth header would be
     # storing a credential.
+    #
+    # This runs in a SEPARATE process from rename-devtools-prepare, so the
+    # per-process run stamp is useless here. The prepare run's stamp is read
+    # back out of the state file's path, and the renamed file is located by
+    # CONTENT HASH rather than by name: the human picks the new name, and a
+    # copy-as-fetch capture does not reliably show the path the server recorded.
     param([string]$CapturePath)
 
     $stateFile = Join-Path $OutDir 'probe-rename-state.json'
@@ -3569,36 +3594,135 @@ function Invoke-ScenarioRenameDevToolsApply {
     }
 
     $oldPath = if ($null -ne $state) { [string]$state.path } else { $null }
+    $oldSha = if ($null -ne $state) { [string]$state.sha256 } else { $null }
 
-    # The renamed path is whatever new probe-owned path appeared. Match by the
-    # run stamp rather than assuming the human's chosen name.
-    $ownedNow = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" })
-    $oldStillListed = $null -ne $oldPath -and ($null -ne (Get-ProbeRowOrNull -Path $oldPath))
+    # Recover the prepare run's stamp from the path it wrote. A filename built
+    # by Get-BinaryProbeName looks like probe-<yyyyMMdd-HHmmss>-<suffix>.txt.
+    $prepareStamp = $null
+    if (-not [string]::IsNullOrWhiteSpace($oldPath)) {
+        $stampMatch = [regex]::Match($oldPath, 'probe-(\d{8}-\d{6})')
+        if ($stampMatch.Success) { $prepareStamp = $stampMatch.Groups[1].Value }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($prepareStamp)) {
+        Add-ProbeEvidence -Case 'rename-devtools-apply' -Status 'STOPPED' -Data @{
+            note      = 'the prepare state file is missing or names no run-stamped path'
+            stateFile = $stateFile
+            oldPath   = $oldPath
+        }
+        Write-ProbeLog ("[STOPPED] rename-devtools-apply: run rename-devtools-prepare first; {0} is missing or unusable." -f $stateFile)
+        return
+    }
+
+    $oldStillListed = $null -ne (Get-ProbeRowOrNull -Path $oldPath)
+
+    # Every probe path from the PREPARE run, not this one.
+    $ownedNow = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$prepareStamp*" })
+
+    # Locate the renamed file by content. The path may have changed, the bytes
+    # did not, so a hash match identifies it without trusting the new name.
+    $renamedPath = $null
+    $hashMatches = @()
+    foreach ($candidate in $ownedNow) {
+        if ($null -ne $oldPath -and [string]::Equals($candidate, $oldPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $read = Get-ProbeReadOrNull -Path $candidate
+        if ($null -eq $read) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($oldSha) -and
+            [string]::Equals($read.Sha256, $oldSha, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $hashMatches += $candidate
+            if ($null -eq $renamedPath) { $renamedPath = $candidate }
+        }
+    }
 
     $captureText = $null
     $captureLines = $null
+    $captureHadResponse = $false
     if (-not [string]::IsNullOrWhiteSpace($CapturePath) -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
         $captureText = (Get-Content -LiteralPath $CapturePath -Raw)
-        # Record only the request line and method-shaped lines. A copied fetch
-        # carries an Authorization header, which must never reach evidence.
+        # Record the request shape only. A copied fetch carries an
+        # Authorization header, which must never reach evidence, and a HAR
+        # carries the whole exchange, so anything credential-shaped is
+        # redacted rather than recorded.
         $captureLines = @($captureText -split "`r?`n" |
-            Where-Object { $_ -match "(?i)^\s*(fetch|curl|https?://|[A-Z]{3,7}\s+https?://|method)" } |
+            Where-Object { $_ -match "(?i)^\s*(fetch|curl|https?://|[A-Z]{3,7}\s+https?://|method|\""(status|url|method)\"")" } |
             Select-Object -First 40 |
-            ForEach-Object { $_ -replace '(?i)(authorization|bearer|token|cookie)\s*[:=]\s*\S+', '$1=<redacted>' })
+            ForEach-Object { $_ -replace '(?i)(authorization|bearer|token|cookie|api[-_]?key)\s*["'']?\s*[:=]\s*["'']?[^"'',\s]+', '$1=<redacted>' })
+        $captureHadResponse = ($captureText -match '(?i)"status"\s*:')
     }
 
     Add-ProbeEvidence -Case 'rename-devtools-apply' -Status 'OBSERVED' -Data @{
-        note             = 'the real rename route, as captured from the Studio UI'
-        oldPath          = $oldPath
-        oldStillListed   = $oldStillListed
-        ownedPathsNow    = $ownedNow
-        captureProvided  = (-not [string]::IsNullOrWhiteSpace($captureText))
-        captureLines     = $captureLines
+        note              = 'the real rename route, as captured from the Studio UI'
+        prepareStamp      = $prepareStamp
+        oldPath           = $oldPath
+        oldStillListed    = $oldStillListed
+        oldSha256         = $oldSha
+        ownedPathsNow     = $ownedNow
+        renamedPathByHash = $renamedPath
+        hashMatches       = $hashMatches
+        contentMoved      = ($null -ne $renamedPath)
+        captureProvided   = (-not [string]::IsNullOrWhiteSpace($captureText))
+        captureHadResponse = $captureHadResponse
+        captureLines      = $captureLines
     }
 
-    Write-ProbeLog ("[OBSERVED] rename-devtools-apply oldStillListed={0} ownedNow={1}" -f $oldStillListed, $ownedNow.Count)
+    Write-ProbeLog ("[OBSERVED] rename-devtools-apply oldStillListed={0} prepareStamp={1}" -f $oldStillListed, $prepareStamp)
+    if ($null -ne $renamedPath) {
+        Write-ProbeLog ("[OBSERVED] rename-devtools-apply the bytes now live at {0} (matched by content hash)" -f $renamedPath)
+    }
+    elseif ($oldStillListed) {
+        Write-ProbeLog '[OBSERVED] rename-devtools-apply: the original path is still listed and no hash match appeared; the rename may not have happened, or the file was moved out of /uploads.'
+    }
     if ($null -eq $captureText) {
         Write-ProbeLog '[WARNING] rename-devtools-apply: no -CapturePath was given, so only the path change was recorded.'
+    }
+    elseif (-not $captureHadResponse) {
+        Write-ProbeLog '[NOTE] rename-devtools-apply: the capture looks like a request only (copy-as-fetch), so the response body is not in it.'
+        Write-ProbeLog '       If the renamed path is unknown, re-capture with DevTools > Network > right-click > Save all as HAR.'
+    }
+
+    # Leave the project as found. The renamed file is deletable only when it
+    # kept a run-stamped name under /uploads, because that is all the delete
+    # guard accepts. Anything else is reported for manual removal rather than
+    # forced, so the guard is never weakened for convenience.
+    $cleanupTargets = @()
+    if ($null -ne $renamedPath) { $cleanupTargets += $renamedPath }
+    if ($oldStillListed) { $cleanupTargets += $oldPath }
+
+    $deleted = @()
+    $manual = @()
+    foreach ($cleanupPath in ($cleanupTargets | Sort-Object -Unique)) {
+        try {
+            $result = Invoke-ProbeDeleteFile -Path $cleanupPath -Case "rename-devtools-cleanup"
+            if ($result.Deleted) {
+                $deleted += $cleanupPath
+            }
+            else {
+                $manual += $cleanupPath
+            }
+        }
+        catch {
+            # The delete guard refused it, which means the human renamed the
+            # file to a name the probe does not own. That is expected, not an
+            # error, so record it for manual cleanup instead of failing.
+            $manual += $cleanupPath
+        }
+    }
+
+    Add-ProbeEvidence -Case 'rename-devtools-cleanup' -Status 'OBSERVED' -Data @{
+        note           = 'the hand-off leaves the project as found where the guard allows it'
+        attempted      = @($cleanupTargets | Sort-Object -Unique)
+        deleted        = $deleted
+        needsManual    = $manual
+    }
+
+    if ($deleted.Count -gt 0) {
+        Write-ProbeLog ("[CLEANUP] rename-devtools-apply deleted {0} path(s)." -f $deleted.Count)
+    }
+    if ($manual.Count -gt 0) {
+        Write-ProbeLog '[CLEANUP] rename-devtools-apply could not delete these; remove them in the Studio UI:'
+        foreach ($path in $manual) { Write-ProbeLog "  $path" }
     }
 }
 

@@ -184,6 +184,30 @@ Assert-True (
     $probeText -match 'function Invoke-ScenarioRenameDevToolsApply'
 ) "the DevTools rename capture must have a recording scenario"
 
+# The rename hand-off runs as two separate processes, so the apply step cannot
+# use its own per-process run stamp: it would never match the file the prepare
+# run created. It must recover the prepare stamp from the state file, and find
+# the renamed file by content hash rather than by name, because the human picks
+# the new name and a copy-as-fetch capture does not show the recorded path.
+Assert-True (
+    $probeText -match 'prepareStamp'
+) "rename-devtools-apply must recover the prepare run's stamp instead of using its own"
+
+Assert-True (
+    $probeText -match 'renamedPathByHash'
+) "rename-devtools-apply must locate the renamed file by content hash"
+
+# The apply step must leave the project clean, but must not weaken the delete
+# guard to do it: a path the guard refuses is reported for manual removal.
+$applyIndex = $probeText.IndexOf('function Invoke-ScenarioRenameDevToolsApply')
+$applyBody = if ($applyIndex -ge 0) { $probeText.Substring($applyIndex) } else { '' }
+Assert-True (
+    $applyBody -match 'rename-devtools-cleanup'
+) "rename-devtools-apply must clean up the hand-off"
+Assert-True (
+    $applyBody -match 'needsManual'
+) "rename-devtools-apply must report a path it could not delete rather than forcing it"
+
 # ---------------------------------------------------------------------------
 # Every declared scenario must be dispatchable, and every scenario must also
 # appear in the dry-run plan. A scenario that is in the ValidateSet but not the
