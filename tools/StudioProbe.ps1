@@ -27,6 +27,30 @@
 #     banned), so they are listed for manual cleanup in the Studio UI.
 #   - Tokens are never printed, logged, or written to evidence. Evidence holds
 #     status codes, sizes, hashes, and redacted bodies only.
+#
+# Usage:
+#
+#   # 1. Put a fresh Studio bearer token in a file (never inline; it would land
+#   #    in your shell history). The token is never printed by the probe.
+#   rundot login
+#   #   ...then copy the access token to, e.g., %TEMP%\rundot-token.txt
+#
+#   # 2. Dry run first. Prints what would be sent and sends nothing.
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-binary-all
+#
+#   # 3. The real run, against a DISPOSABLE project only.
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-binary-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
+#   # The #14 text investigation, for regression:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-text-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
+# Evidence lands in -OutDir (default %TEMP%\rundot-probe-evidence) as a JSON
+# file and a log. The log ends with the CLEANUP list of paths the probe
+# created, which must be deleted by hand in the Studio UI.
+#
+# The token file must be outside the repository. Never commit it.
 
 param(
     [Parameter(Mandatory = $true)]
