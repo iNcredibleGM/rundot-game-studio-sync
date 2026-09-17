@@ -166,6 +166,14 @@ DevTools Network panel (`rename-devtools-prepare` / `rename-devtools-apply`).
 That capture is the outstanding step for this section; until it exists, treat
 "Studio has no rename API" as strongly suggested but not established.
 
+To complete it, `rename-devtools-prepare` writes a probe-owned target and
+prints instructions; the rename is then performed by hand in Studio with
+DevTools open, and `rename-devtools-apply` records the captured request and
+locates the moved bytes by content hash (the human chooses the new name, so the
+path cannot be assumed). Capture a HAR rather than a copied fetch if the
+response body is wanted — a request-only capture does not show the path the
+server recorded.
+
 ## Revision identity
 
 A `GET /files` row for a text file exposes **only three fields**, before and
