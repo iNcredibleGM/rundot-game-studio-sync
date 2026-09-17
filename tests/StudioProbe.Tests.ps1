@@ -40,6 +40,10 @@ Assert-True (
 ) "the probe must declare a -ConfirmRemoteWrite switch"
 
 Assert-True (
+    $probeText -match '\$AccessTokenPath'
+) "the probe must accept a token file so a token never has to be pasted inline"
+
+Assert-True (
     $probeText -match 'Refusing to mutate Studio without -ConfirmRemoteWrite'
 ) "the probe must refuse to mutate without -ConfirmRemoteWrite"
 
@@ -72,6 +76,12 @@ Assert-True (
 Assert-True (
     $probeText -match "\`$script:ProbeDir = '/sync-probe'"
 ) "the probe-owned prefix must be /sync-probe"
+
+# The ownership test must compare on a path boundary. A plain StartsWith would
+# treat /sync-probe-other/x.txt as owned and let a destructive case escape.
+Assert-True (
+    $probeText -match "\`$owned \+ '/'"
+) "probe path ownership must compare on a segment boundary, not a raw string prefix"
 
 # ---------------------------------------------------------------------------
 # The restore discipline that #14 learned the hard way.

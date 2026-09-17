@@ -51,7 +51,11 @@ param(
         'binary-overwrite',
         'binary-idempotency',
         'binary-failure',
-        'binary-survey'
+        'binary-survey',
+        # Whole-investigation runners. These are the ones to use by hand: one
+        # command per issue instead of seven.
+        'run-text-all',
+        'run-binary-all'
     )]
     [string]$Scenario,
 
@@ -61,13 +65,13 @@ param(
 
     [string]$OutDir = (Join-Path $env:TEMP 'rundot-probe-evidence'),
 
-    # The project path a destructive case is allowed to touch. It must be
-    # probe-owned; see Assert-ProbeOwnedPath.
-    [string]$TargetPath = '/sync-probe/README.md',
-
     # A bearer token, a JWT, or pasted DevTools text containing one. Never
     # logged. Exists so automation never blocks on an interactive prompt.
     [string]$AccessToken,
+
+    # A file containing the same thing. Preferred over -AccessToken: the token
+    # never reaches a shell history or a chat transcript.
+    [string]$AccessTokenPath,
 
     # Refuse the interactive fallback instead of prompting.
     [switch]$NoInteractiveAuth,
@@ -242,15 +246,27 @@ function Get-Utf8NoBomBytes {
 # ---------------------------------------------------------------------------
 
 function Test-ProbeOwnedPath {
-    # A destructive case may only touch a path this probe owns. The default
-    # target and every probe-created path live under /sync-probe.
+    # A destructive case may only touch a path this probe owns. Every path the
+    # probe creates lives under /sync-probe.
+    #
+    # The comparison is on a segment boundary, not a raw string prefix: a
+    # plain StartsWith would treat /sync-probe-other/x.txt as owned because it
+    # shares the text prefix, which would let a case escape the probe directory.
     param([string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
 
     $canonical = ConvertTo-CanonicalSyncPath -Path $Path
     $owned = ConvertTo-CanonicalSyncPath -Path $script:ProbeDir
-    return $canonical.StartsWith($owned, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ([string]::Equals($canonical, $owned, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    return $canonical.StartsWith(
+        ($owned + '/'),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 function Assert-ProbeOwnedPath {
@@ -989,6 +1005,22 @@ function Invoke-ProbeBinaryUpload {
 Write-ProbeLog "Probe scenario: $Scenario"
 Write-ProbeLog 'Project: <redacted>'
 
+# Read the token from a file when one was given. This is the preferred path:
+# the token never enters a shell history or a chat transcript.
+if (-not [string]::IsNullOrWhiteSpace($AccessTokenPath)) {
+    if (-not (Test-Path -LiteralPath $AccessTokenPath -PathType Leaf)) {
+        throw "AccessTokenPath '$AccessTokenPath' does not exist."
+    }
+
+    $AccessToken = (Get-Content -LiteralPath $AccessTokenPath -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($AccessToken)) {
+        throw "AccessTokenPath '$AccessTokenPath' is empty."
+    }
+
+    Write-ProbeLog 'Read a token from -AccessTokenPath (value not shown).'
+}
+
+
 # ---------------------------------------------------------------------------
 # The early gate.
 #
@@ -1020,6 +1052,8 @@ function Get-ProbeScenarioPlan {
         'binary-idempotency'       = @('POST /upload-url + PUT + adopt, twice', 'PUT the same presigned URL twice')
         'binary-failure'           = @('POST /upload-adopt (unknown id)', 'POST /upload-url (bad bodies, no auth)', 'PUT presigned URL (wrong type, malformed URL)')
         'binary-survey'            = @()
+        'run-text-all'             = @('The full #14 text investigation: create, overwrite, version, conditional, idempotency, failure, survey')
+        'run-binary-all'           = @('The full #15 binary investigation: discover, create, collision, overwrite, idempotency, failure, survey')
     }
 
     if ($plans.ContainsKey($Name)) { return @($plans[$Name]) }
@@ -2040,6 +2074,65 @@ function Invoke-ScenarioBinaryFailure {
 
 
 # ---------------------------------------------------------------------------
+# Whole-investigation runners
+#
+# One command per issue instead of seven, for the human running the probe.
+# Every sub-scenario keeps its own per-case evidence; these only sequence them
+# and keep going when one case fails, so a single rejection does not cost the
+# rest of the run.
+# ---------------------------------------------------------------------------
+
+function Invoke-ProbeStep {
+    param(
+        [string]$Name,
+        [scriptblock]$Action
+    )
+
+    Write-ProbeLog ''
+    Write-ProbeLog "=== $Name ==="
+
+    try {
+        & $Action
+    }
+    catch {
+        # A refusal or a transport failure is a finding, not a reason to abort
+        # the whole run.
+        Add-ProbeEvidence -Case "$Name-aborted" -Status 'ERROR' -Data @{
+            note  = 'this step threw; the runner continued'
+            error = $_.Exception.Message
+        }
+        Write-ProbeLog ("[ERROR] {0}: {1}" -f $Name, $_.Exception.Message)
+    }
+}
+
+function Invoke-ScenarioRunTextAll {
+    # Re-runs the #14 text investigation end to end. Useful as a regression
+    # check that the documented text semantics still hold.
+    Invoke-ProbeStep 'text-create' { Invoke-ScenarioTextCreate }
+    Invoke-ProbeStep 'text-overwrite' { Invoke-ScenarioTextOverwrite }
+    Invoke-ProbeStep 'text-version' { Invoke-ScenarioTextVersion }
+    Invoke-ProbeStep 'text-conditional' { Invoke-ScenarioTextConditional }
+    Invoke-ProbeStep 'text-idempotency' { Invoke-ScenarioTextIdempotency }
+    Invoke-ProbeStep 'text-failure' { Invoke-ScenarioTextFailure }
+    Invoke-ProbeStep 'text-survey' { Invoke-ScenarioSurvey }
+}
+
+function Invoke-ScenarioRunBinaryAll {
+    # The #15 characterization, in the order the evidence needs to be read:
+    # discover the contract, then create, collide, try to replace, then
+    # idempotency and failure, then list what is left behind.
+    Invoke-ProbeStep 'binary-discover' { Invoke-ScenarioBinaryDiscover }
+    Invoke-ProbeStep 'binary-create' { Invoke-ScenarioBinaryCreate }
+    Invoke-ProbeStep 'binary-collision' { Invoke-ScenarioBinaryCollision }
+    Invoke-ProbeStep 'binary-overwrite' { Invoke-ScenarioBinaryOverwrite }
+    Invoke-ProbeStep 'binary-idempotency' { Invoke-ScenarioBinaryIdempotency }
+    Invoke-ProbeStep 'binary-failure' { Invoke-ScenarioBinaryFailure }
+    Invoke-ProbeStep 'binary-survey' { Invoke-ScenarioSurvey }
+}
+
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2060,6 +2153,8 @@ switch ($Scenario) {
     'binary-idempotency'         { Invoke-ScenarioBinaryIdempotency }
     'binary-failure'             { Invoke-ScenarioBinaryFailure }
     'binary-survey'              { Invoke-ScenarioSurvey }
+    'run-text-all'               { Invoke-ScenarioRunTextAll }
+    'run-binary-all'             { Invoke-ScenarioRunBinaryAll }
     default {
         throw "Scenario '$Scenario' is not implemented."
     }
