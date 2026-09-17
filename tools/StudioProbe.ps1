@@ -71,6 +71,7 @@ param(
         # New in the #15 binary investigation.
         'binary-discover',
         'binary-create',
+        'binary-path-control',
         'binary-collision',
         'binary-overwrite',
         'binary-idempotency',
@@ -122,6 +123,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'lib\RemoteApi.ps1'))) {
 $script:ProbeDir = '/sync-probe'
 $script:ProbeRootPath = "$($script:ProbeDir)/probe.txt"
 $script:ProbeNestedPath = "$($script:ProbeDir)/nested/deep.txt"
+
+# Binary uploads do NOT honor the requested path: adopt recorded every file
+# under /uploads/ regardless of what was asked for. Probe-owned binary paths
+# are therefore matched by filename under this directory.
+$script:ProbeUploadDir = '/uploads'
 
 $script:LogPath = $null
 $script:EvidencePath = $null
@@ -914,6 +920,100 @@ function Get-ProbeResponseFields {
     return $fields
 }
 
+function Get-ProbeValidationField {
+    # The `field` a VALIDATION_ERROR named. This is how the undocumented
+    # contract is learned: ask, get told which field is missing, add it.
+    param($Response)
+
+    if ($null -eq $Response) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$Response.BodyText)) { return $null }
+
+    try { $parsed = $Response.BodyText | ConvertFrom-Json }
+    catch { return $null }
+
+    $error = $parsed.PSObject.Properties['error']
+    if ($null -eq $error -or $null -eq $error.Value) { return $null }
+
+    $field = $error.Value.PSObject.Properties['field']
+    if ($null -eq $field) { return $null }
+
+    return [string]$field.Value
+}
+
+function Get-ProbeMintedUploadId {
+    # The uploadId adopt requires. Try every plausible spelling rather than
+    # assuming one, and fall back to a nested object.
+    param($Response)
+
+    if ($null -eq $Response) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$Response.BodyText)) { return $null }
+
+    try { $parsed = $Response.BodyText | ConvertFrom-Json }
+    catch { return $null }
+
+    foreach ($candidate in @('uploadId', 'upload_id', 'id')) {
+        $property = $parsed.PSObject.Properties[$candidate]
+        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return [string]$property.Value
+        }
+    }
+
+    foreach ($candidate in @('data', 'result', 'upload')) {
+        $property = $parsed.PSObject.Properties[$candidate]
+        if ($null -ne $property -and $null -ne $property.Value) {
+            $nested = Get-ProbeMintedUploadId -Response ([pscustomobject]@{
+                BodyText = ($property.Value | ConvertTo-Json -Compress -Depth 8)
+            })
+            if ($null -ne $nested) { return $nested }
+        }
+    }
+
+    return $null
+}
+
+function New-ProbeUploadUrlBody {
+    # The observed required shape. declaredSize is what the server validates
+    # first; the discover scenario found it by asking with an empty body.
+    param(
+        [string]$FileName,
+        [string]$Path,
+        [int]$DeclaredSize,
+        [string]$ContentType = 'image/png'
+    )
+
+    return @{
+        fileName     = $FileName
+        path         = $Path
+        declaredSize = $DeclaredSize
+        contentType  = $ContentType
+    }
+}
+
+function Get-ProbeAdoptFieldValue {
+    # Map a field the server named as missing to the value it wants. adopt
+    # validates in its own order, so this is keyed by name rather than
+    # hardcoded as a sequence.
+    param(
+        [string]$Field,
+        [string]$FileName,
+        [string]$Path,
+        [byte[]]$Bytes,
+        [string]$ContentType = 'image/png'
+    )
+
+    switch ($Field) {
+        'name'         { return $FileName }
+        'fileName'     { return $FileName }
+        'path'         { return $Path }
+        'contentType'  { return $ContentType }
+        'mimeType'     { return $ContentType }
+        'size'         { return $Bytes.Length }
+        'declaredSize' { return $Bytes.Length }
+        'type'         { return 'file' }
+        default        { return $null }
+    }
+}
+
 function Invoke-ProbeBinaryUpload {
     # The whole three-step flow for one file. Records each step, and returns
     # the resulting project path the adopt step reported, if any.
@@ -943,7 +1043,11 @@ function Invoke-ProbeBinaryUpload {
     # --- Step 1: ask for a presigned URL -------------------------------
     $uploadUrlBody = $UploadUrlBody
     if ($null -eq $uploadUrlBody) {
-        $uploadUrlBody = @{ fileName = $FileName; path = "$($script:ProbeDir)/$FileName"; contentType = $ContentType }
+        $uploadUrlBody = New-ProbeUploadUrlBody `
+            -FileName $FileName `
+            -Path "$($script:ProbeDir)/$FileName" `
+            -DeclaredSize $Bytes.Length `
+            -ContentType $ContentType
     }
 
     $uploadUrlResponse = Invoke-ProbeUploadUrlRequest -Body $uploadUrlBody
@@ -959,7 +1063,13 @@ function Invoke-ProbeBinaryUpload {
 
     $presignedUrl = Get-ProbePresignedUrl -Response $uploadUrlResponse
     if ($null -eq $presignedUrl) {
-        Write-ProbeLog ("[STOPPED] {0}: no presigned URL in the upload-url response; nothing was uploaded" -f $Case)
+        $missingField = Get-ProbeValidationField -Response $uploadUrlResponse
+        if ($null -ne $missingField) {
+            Write-ProbeLog ("[STOPPED] {0}: upload-url rejected the body; it wants '$missingField'" -f $Case)
+        }
+        else {
+            Write-ProbeLog ("[STOPPED] {0}: no presigned URL in the upload-url response; nothing was uploaded" -f $Case)
+        }
         Add-ProbeEvidence -Case $Case -Status 'STOPPED' -Data $result
         return $result
     }
@@ -975,23 +1085,69 @@ function Invoke-ProbeBinaryUpload {
     Write-ProbeLog ("[PROBED] {0} presigned-put status={1}" -f $Case, $rawPut.Status)
 
     # --- Step 3: adopt --------------------------------------------------
+    # adopt requires the uploadId that step 1 minted, and it validates its own
+    # remaining fields in a fixed order. Rather than hardcode a guessed body,
+    # walk the validation errors: send what is known, read the `field` the
+    # server names, supply it, repeat. Bounded so a field this probe cannot
+    # supply fails loudly instead of looping.
+    $mintedUploadId = Get-ProbeMintedUploadId -Response $uploadUrlResponse
+    $result.mintedUploadId = $mintedUploadId
+
     $adoptBody = $AdoptBodyOverride
-    if ($null -eq $adoptBody) {
-        $adoptBody = @{ fileName = $FileName; path = "$($script:ProbeDir)/$FileName" }
-        # Carry through any object identity the upload-url response exposed.
-        $parsedUpload = $null
-        try { $parsedUpload = $uploadUrlResponse.BodyText | ConvertFrom-Json } catch { }
+    $adoptResponse = $null
+    $adoptWalk = New-Object 'System.Collections.Generic.List[object]'
+
+    if ($null -ne $adoptBody) {
+        $adoptResponse = Invoke-ProbeUploadAdoptRequest -Body $adoptBody
+    }
+    else {
+        $adoptBody = @{ uploadId = $mintedUploadId }
+
+        # Carry through any other object identity the upload-url response
+        # exposed, so the adopt body matches what the server handed out.
+        try { $parsedUpload = $uploadUrlResponse.BodyText | ConvertFrom-Json } catch { $parsedUpload = $null }
         if ($null -ne $parsedUpload) {
-            foreach ($candidate in @('key', 'objectKey', 'object_key', 'uploadId', 'upload_id', 'id', 'token')) {
+            foreach ($candidate in @('key', 'objectKey', 'object_key', 'token')) {
                 $property = $parsedUpload.PSObject.Properties[$candidate]
                 if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
                     $adoptBody[$candidate] = [string]$property.Value
                 }
             }
         }
+
+        for ($attempt = 1; $attempt -le 8; $attempt++) {
+            $adoptResponse = Invoke-ProbeUploadAdoptRequest -Body $adoptBody
+
+            $adoptWalk.Add([pscustomobject]@{
+                attempt = $attempt
+                request = $adoptBody
+                status  = $adoptResponse.Status
+                body    = $adoptResponse.BodyText
+            })
+
+            if ($adoptResponse.Status -eq 200) { break }
+
+            $missingField = Get-ProbeValidationField -Response $adoptResponse
+            if ([string]::IsNullOrWhiteSpace($missingField)) { break }
+            if ($adoptBody.ContainsKey($missingField)) { break }
+
+            $value = Get-ProbeAdoptFieldValue `
+                -Field $missingField `
+                -FileName $FileName `
+                -Path "$($script:ProbeDir)/$FileName" `
+                -Bytes $Bytes `
+                -ContentType $ContentType
+
+            if ($null -eq $value) {
+                Write-ProbeLog ("[STOPPED] {0}: adopt wants '{1}', which this probe cannot supply" -f $Case, $missingField)
+                break
+            }
+
+            $adoptBody[$missingField] = $value
+        }
     }
 
-    $adoptResponse = Invoke-ProbeUploadAdoptRequest -Body $adoptBody
+    $result.adoptWalk = $adoptWalk.ToArray()
     $result.adopt = @{
         request = $adoptBody
         status  = $adoptResponse.Status
@@ -1099,6 +1255,7 @@ function Get-ProbeScenarioPlan {
         'text-survey'              = @()
         'binary-discover'          = @('POST /upload-url (several candidate bodies)', 'POST /upload-adopt (several candidate bodies)')
         'binary-create'            = @('POST /upload-url', 'PUT presigned URL (raw bytes)', 'POST /upload-adopt', 'GET /file (read back)')
+        'binary-path-control'      = @('POST /upload-url + PUT + adopt, requesting several different project paths')
         'binary-collision'         = @('POST /upload-url + PUT + adopt, repeated with identical filenames and edge-case names')
         'binary-overwrite'         = @('POST /upload-url + PUT + adopt against an existing binary path', 'POST /upload-adopt (re-adopt)')
         'binary-idempotency'       = @('POST /upload-url + PUT + adopt, twice', 'PUT the same presigned URL twice')
@@ -1793,47 +1950,25 @@ function Invoke-ScenarioSurvey {
 
 function Invoke-ScenarioBinaryDiscover {
     # The three request bodies are undocumented. Learn them from validation
-    # errors instead of guessing, the same way #14 learned the text body.
+    # errors instead of guessing: send a body, read the `field` the server names
+    # as missing, add it, repeat. This is how the text body was learned in #14.
     $fileName = Get-BinaryProbeName -Suffix 'discover'
     $targetPath = "$($script:ProbeDir)/$fileName"
+    $bytes = Get-BinaryProbeBytes -Variant 1
 
+    # upload-url: walk the required fields one at a time.
     $bodies = @(
-        @{ Case = 'binary-discover-empty-body'; Body = @{}; Note = 'empty object; validation should name the required fields' },
-        @{ Case = 'binary-discover-filename-only'; Body = @{ fileName = $fileName }; Note = 'fileName alone' },
-        @{ Case = 'binary-discover-path-only'; Body = @{ path = $targetPath }; Note = 'path alone' },
-        @{ Case = 'binary-discover-name-and-path'; Body = @{ fileName = $fileName; path = $targetPath }; Note = 'fileName plus path' },
-        @{ Case = 'binary-discover-name-path-type'; Body = @{ fileName = $fileName; path = $targetPath; contentType = 'image/png' }; Note = 'adds contentType' },
-        @{ Case = 'binary-discover-size-too'; Body = @{ fileName = $fileName; path = $targetPath; contentType = 'image/png'; size = 100 }; Note = 'adds size' }
+        @{ Case = 'binary-discover-upload-url-empty'; Body = @{}; Note = 'empty object; the server names the first missing field' },
+        @{ Case = 'binary-discover-upload-url-size'; Body = @{ declaredSize = $bytes.Length }; Note = 'declaredSize alone' },
+        @{ Case = 'binary-discover-upload-url-size-name'; Body = @{ declaredSize = $bytes.Length; fileName = $fileName }; Note = 'declaredSize plus fileName' },
+        @{ Case = 'binary-discover-upload-url-size-path'; Body = @{ declaredSize = $bytes.Length; path = $targetPath }; Note = 'declaredSize plus path' },
+        @{ Case = 'binary-discover-upload-url-full'; Body = @{ declaredSize = $bytes.Length; fileName = $fileName; path = $targetPath; contentType = 'image/png' }; Note = 'the full candidate body' },
+        @{ Case = 'binary-discover-upload-url-zero-size'; Body = @{ declaredSize = 0; fileName = $fileName; path = $targetPath }; Note = 'declaredSize must be positive; 0 should be rejected' }
     )
 
+    $acceptedBody = $null
     foreach ($candidate in $bodies) {
         $response = Invoke-ProbeUploadUrlRequest -Body $candidate.Body
-        Add-ProbeEvidence -Case $candidate.Case -Status 'PROBED' -Data @{
-            note   = $candidate.Note
-            request = $candidate.Body
-            http   = @{
-                status  = $response.Status
-                body    = $response.BodyText
-                fields  = Get-ProbeResponseFields -Response $response
-                headers = $response.ResponseHeaders
-            }
-        }
-        Write-ProbeLog ("[PROBED] {0} status={1}" -f $candidate.Case, $response.Status)
-
-        if ($response.Status -eq 200) {
-            Write-ProbeLog ("[FOUND] {0} accepted the body: {1}" -f $candidate.Case, ($candidate.Body | ConvertTo-Json -Compress))
-            break
-        }
-    }
-
-    # Adopt validation, learned the same way.
-    foreach ($candidate in @(
-        @{ Case = 'binary-discover-adopt-empty'; Body = @{}; Note = 'empty adopt body' },
-        @{ Case = 'binary-discover-adopt-filename'; Body = @{ fileName = $fileName }; Note = 'adopt with fileName' },
-        @{ Case = 'binary-discover-adopt-path'; Body = @{ path = $targetPath }; Note = 'adopt with path' },
-        @{ Case = 'binary-discover-adopt-name-path'; Body = @{ fileName = $fileName; path = $targetPath }; Note = 'adopt with fileName and path' }
-    )) {
-        $response = Invoke-ProbeUploadAdoptRequest -Body $candidate.Body
         Add-ProbeEvidence -Case $candidate.Case -Status 'PROBED' -Data @{
             note    = $candidate.Note
             request = $candidate.Body
@@ -1841,9 +1976,92 @@ function Invoke-ScenarioBinaryDiscover {
                 status  = $response.Status
                 body    = $response.BodyText
                 fields  = Get-ProbeResponseFields -Response $response
+                headers = $response.ResponseHeaders
+            }
+            missingField = Get-ProbeValidationField -Response $response
+        }
+        Write-ProbeLog ("[PROBED] {0} status={1} missingField={2}" -f `
+            $candidate.Case, $response.Status, (Get-ProbeValidationField -Response $response))
+
+        if ($response.Status -eq 200) {
+            $acceptedBody = $candidate.Body
+            Write-ProbeLog ("[FOUND] upload-url accepts: {0}" -f ($candidate.Body | ConvertTo-Json -Compress))
+            Write-ProbeLog ("[FOUND] upload-url response fields: {0}" -f `
+                ((Get-ProbeResponseFields -Response $response).Keys -join ', '))
+            break
+        }
+    }
+
+    # adopt: walk its required fields the same way. uploadId must be minted by
+    # step 1, so a fabricated one only ever proves the first validation rule.
+    # Mint a real uploadId first, then walk the rest of the contract.
+    foreach ($candidate in @(
+        @{ Case = 'binary-discover-adopt-empty'; Body = @{}; Note = 'empty adopt body' },
+        @{ Case = 'binary-discover-adopt-bogus-id'; Body = @{ uploadId = 'not-a-minted-upload-id' }; Note = 'a fabricated uploadId' }
+    )) {
+        $response = Invoke-ProbeUploadAdoptRequest -Body $candidate.Body
+        Add-ProbeEvidence -Case $candidate.Case -Status 'PROBED' -Data @{
+            note         = $candidate.Note
+            request      = $candidate.Body
+            missingField = Get-ProbeValidationField -Response $response
+            http         = @{
+                status  = $response.Status
+                body    = $response.BodyText
+                fields  = Get-ProbeResponseFields -Response $response
             }
         }
-        Write-ProbeLog ("[PROBED] {0} status={1}" -f $candidate.Case, $response.Status)
+        Write-ProbeLog ("[PROBED] {0} status={1} missingField={2}" -f `
+            $candidate.Case, $response.Status, (Get-ProbeValidationField -Response $response))
+    }
+
+    # Now walk the real chain: mint an uploadId, PUT the bytes, then let the
+    # server name each remaining required field in turn.
+    $walkName = Get-BinaryProbeName -Suffix 'adoptwalk'
+    $walkPath = "$($script:ProbeDir)/$walkName"
+    $walkUrl = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $walkName -Path $walkPath -DeclaredSize $bytes.Length)
+    $walkId = Get-ProbeMintedUploadId -Response $walkUrl
+    $walkPresigned = Get-ProbePresignedUrl -Response $walkUrl
+
+    if ($null -ne $walkPresigned) {
+        [void](Invoke-ProbeRawPut -PresignedUrl $walkPresigned -Bytes $bytes)
+    }
+
+    $walkBody = @{ uploadId = $walkId }
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        $response = Invoke-ProbeUploadAdoptRequest -Body $walkBody
+        $missingField = Get-ProbeValidationField -Response $response
+
+        Add-ProbeEvidence -Case "binary-discover-adopt-walk-$attempt" -Status 'PROBED' -Data @{
+            note         = "adopt validation walk, attempt $attempt"
+            request      = $walkBody
+            missingField = $missingField
+            http         = @{
+                status = $response.Status
+                body   = $response.BodyText
+                fields = Get-ProbeResponseFields -Response $response
+            }
+        }
+        Write-ProbeLog ("[PROBED] binary-discover-adopt-walk-{0} status={1} missingField={2}" -f `
+            $attempt, $response.Status, $missingField)
+
+        if ($response.Status -eq 200) {
+            Write-ProbeLog ("[FOUND] adopt accepts: {0}" -f ($walkBody | ConvertTo-Json -Compress))
+            break
+        }
+
+        if ([string]::IsNullOrWhiteSpace($missingField)) { break }
+        if ($walkBody.ContainsKey($missingField)) { break }
+
+        $value = Get-ProbeAdoptFieldValue `
+            -Field $missingField -FileName $walkName -Path $walkPath -Bytes $bytes
+
+        if ($null -eq $value) {
+            Write-ProbeLog ("[STOPPED] adopt wants '{0}', which the probe cannot supply" -f $missingField)
+            break
+        }
+
+        $walkBody[$missingField] = $value
     }
 }
 
@@ -1920,28 +2138,16 @@ function Invoke-ScenarioBinaryCollision {
         }
     }
 
-    # Where does the collision rename apply: basename, or full path?
+    # Where does the collision rename apply: basename, or full path? A nested
+    # target also exercises whether the parent directory needs to pre-exist.
     $nestedName = Get-BinaryProbeName -Suffix 'nested'
     $nestedPath = "$($script:ProbeDir)/nested/$nestedName"
-    foreach ($i in @(1, 2)) {
-        $response = Invoke-ProbeUploadUrlRequest -Body @{
-            fileName = $nestedName
-            path     = $nestedPath
-            contentType = 'image/png'
-        }
-        $presigned = Get-ProbePresignedUrl -Response $response
-        if ($null -ne $presigned) {
-            $rawPut = Invoke-ProbeRawPut -PresignedUrl $presigned -Bytes (Get-BinaryProbeBytes -Variant 5)
-            $adopt = Invoke-ProbeUploadAdoptRequest -Body @{ fileName = $nestedName; path = $nestedPath }
-            Add-ProbeEvidence -Case "binary-collision-nested-$i" -Status 'PROBED' -Data @{
-                note       = 'nested directory collision'
-                requestPath = $nestedPath
-                uploadUrlStatus = $response.Status
-                putStatus  = $rawPut.Status
-                adoptStatus = $adopt.Status
-                adoptBody  = $adopt.BodyText
-            }
-        }
+    for ($i = 1; $i -le 2; $i++) {
+        $nestedResult = Invoke-ProbeBinaryUpload `
+            -Case "binary-collision-nested-$i" `
+            -FileName $nestedName `
+            -Bytes (Get-BinaryProbeBytes -Variant 5) `
+            -Note "nested target, upload $i; the adopt path is a nested directory"
     }
 
     $nested = @(Get-ProbeListedPaths | Where-Object { $_ -like '*nested*' })
@@ -1951,8 +2157,83 @@ function Invoke-ScenarioBinaryCollision {
     }
 }
 
-function Invoke-ScenarioBinaryOverwrite {
-    # Can an existing binary be replaced, or does every upload add a sibling?
+function Invoke-ScenarioBinaryPathControl {
+    # The central question for #17: does a binary upload choose its project
+    # path, or does the server? Every adopt in the first run recorded the file
+    # under /uploads/<name> even when a different path was requested. This
+    # isolates that: request several different paths and compare what the
+    # server recorded.
+    $bytes = Get-BinaryProbeBytes -Variant 11
+
+    $targets = @(
+        @{ Case = 'binary-path-control-uploads-dir'; Path = "$($script:ProbeDir)/pc-uploads.png"; Note = 'requested a /sync-probe path' },
+        @{ Case = 'binary-path-control-root'; Path = '/pc-root.png'; Note = 'requested a project-root path' },
+        @{ Case = 'binary-path-control-nested'; Path = '/sync-probe/deep/pc-nested.png'; Note = 'requested a nested directory' },
+        @{ Case = 'binary-path-control-src'; Path = '/src/pc-src.png'; Note = 'requested a path inside src' }
+    )
+
+    foreach ($target in $targets) {
+        $name = [System.IO.Path]::GetFileName($target.Path)
+        $uploadUrl = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+            -FileName $name -Path $target.Path -DeclaredSize $bytes.Length)
+        $presigned = Get-ProbePresignedUrl -Response $uploadUrl
+        $putStatus = $null
+        if ($null -ne $presigned) {
+            $put = Invoke-ProbeRawPut -PresignedUrl $presigned -Bytes $bytes
+            $putStatus = $put.Status
+        }
+
+        $adoptId = Get-ProbeMintedUploadId -Response $uploadUrl
+        $adopt = Invoke-ProbeUploadAdoptRequest -Body @{ uploadId = $adoptId; name = $name }
+
+        $recorded = $null
+        try {
+            $parsed = $adopt.BodyText | ConvertFrom-Json
+            $recorded = [string]$parsed.path
+        }
+        catch { }
+
+        Add-ProbeEvidence -Case $target.Case -Status 'PROBED' -Data @{
+            note            = $target.Note
+            requestedPath   = $target.Path
+            fileName        = $name
+            uploadUrlStatus = $uploadUrl.Status
+            putStatus       = $putStatus
+            adoptStatus     = $adopt.Status
+            adoptBody       = $adopt.BodyText
+            recordedPath    = $recorded
+            pathHonored     = ($null -ne $recorded -and
+                [string]::Equals($recorded, $target.Path, [System.StringComparison]::OrdinalIgnoreCase))
+        }
+        Write-ProbeLog ("[PROBED] {0} requested={1} recorded={2}" -f $target.Case, $target.Path, $recorded)
+
+        if ($null -ne $recorded) { $script:CreatedPaths.Add($recorded) }
+    }
+
+    # Does the upload-url even look at path? Send the same fileName with two
+    # different paths and compare the minted ids and urls.
+    $probeName = Get-BinaryProbeName -Suffix 'pathignore'
+    $withPath = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $probeName -Path "/sync-probe/$probeName" -DeclaredSize $bytes.Length)
+    $withOtherPath = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $probeName -Path "/src/$probeName" -DeclaredSize $bytes.Length)
+    $noPath = Invoke-ProbeUploadUrlRequest -Body @{ declaredSize = $bytes.Length; fileName = $probeName }
+
+    Add-ProbeEvidence -Case 'binary-path-control-upload-url-ignores-path' -Status 'OBSERVED' -Data @{
+        note            = 'same fileName, three different path inputs'
+        withPathStatus  = $withPath.Status
+        withOtherStatus = $withOtherPath.Status
+        noPathStatus    = $noPath.Status
+        withPathId      = Get-ProbeMintedUploadId -Response $withPath
+        withOtherId     = Get-ProbeMintedUploadId -Response $withOtherPath
+        noPathId        = Get-ProbeMintedUploadId -Response $noPath
+        withPathBody    = $withPath.BodyText
+        noPathBody      = $noPath.BodyText
+    }
+    Write-ProbeLog ("[OBSERVED] upload-url with path={0} without path={1}" -f $withPath.Status, $noPath.Status)
+}
+
+function Invoke-ScenarioBinaryOverwrite {    # Can an existing binary be replaced, or does every upload add a sibling?
     # Create a probe-owned binary first, then try every plausible replace
     # mechanism against it.
     $fileName = Get-BinaryProbeName -Suffix 'replace'
@@ -1999,20 +2280,43 @@ function Invoke-ScenarioBinaryOverwrite {
         matchingPaths    = $allMatching
     }
 
-    # Attempt 2: re-adopt the same upload id, if the discover step exposed one.
-    $reAdoptUrl = Invoke-ProbeUploadUrlRequest -Body @{
+    # Attempt 2: re-adopt a freshly minted uploadId against the SAME path.
+    # If replacement is possible at all, this is where it shows: a new upload
+    # bound to a path that already exists.
+    $reAdoptUrl = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $fileName -Path $createdPath -DeclaredSize $replaceBytes.Length)
+    $reAdoptPresigned = Get-ProbePresignedUrl -Response $reAdoptUrl
+    $reAdoptId = Get-ProbeMintedUploadId -Response $reAdoptUrl
+    $reAdoptPutStatus = $null
+    if ($null -ne $reAdoptPresigned) {
+        $reAdoptPut = Invoke-ProbeRawPut -PresignedUrl $reAdoptPresigned -Bytes $replaceBytes
+        $reAdoptPutStatus = $reAdoptPut.Status
+    }
+
+    $reAdopt = Invoke-ProbeUploadAdoptRequest -Body @{
+        uploadId = $reAdoptId
         fileName = $fileName
         path     = $createdPath
-        contentType = 'image/png'
     }
-    $reAdopt = Invoke-ProbeUploadAdoptRequest -Body @{ fileName = $fileName; path = $createdPath }
+    $afterReAdopt = Get-ProbeReadOrNull -Path $createdPath
+
     Add-ProbeEvidence -Case 'binary-overwrite-readopt' -Status 'PROBED' -Data @{
-        note            = 're-adopt the same path without a new presigned upload'
+        note            = 'a second upload bound to a path that already exists'
+        targetPath      = $createdPath
         uploadUrlStatus = $reAdoptUrl.Status
+        mintedUploadId  = $reAdoptId
+        putStatus       = $reAdoptPutStatus
         adoptStatus     = $reAdopt.Status
         adoptBody       = $reAdopt.BodyText
+        shaAfter        = if ($null -ne $afterReAdopt) { $afterReAdopt.Sha256 } else { $null }
+        sentSha256      = Get-Sha256Hex -Bytes $replaceBytes
+        replacedInPlace = (
+            $null -ne $afterReAdopt -and
+            [string]::Equals($afterReAdopt.Sha256, (Get-Sha256Hex -Bytes $replaceBytes), [System.StringComparison]::OrdinalIgnoreCase)
+        )
         pathsAfter      = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeDir)*" })
     }
+    Write-ProbeLog ("[PROBED] binary-overwrite-readopt adoptStatus={0}" -f $reAdopt.Status)
 
     # Attempt 3: PUT new bytes to the existing presigned URL for this path.
     if ($null -ne $create.presigned) {
@@ -2046,16 +2350,14 @@ function Invoke-ScenarioBinaryIdempotency {
 
     # Retry an ambiguous failure: send the presigned PUT twice.
     $retryName = Get-BinaryProbeName -Suffix 'retry'
-    $uploadUrl = Invoke-ProbeUploadUrlRequest -Body @{
-        fileName = $retryName
-        path     = "$($script:ProbeDir)/$retryName"
-        contentType = 'image/png'
-    }
+    $uploadUrl = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $retryName -Path "$($script:ProbeDir)/$retryName" -DeclaredSize (Get-BinaryProbeBytes -Variant 9).Length)
     $presigned = Get-ProbePresignedUrl -Response $uploadUrl
     if ($null -ne $presigned) {
         $firstPut = Invoke-ProbeRawPut -PresignedUrl $presigned -Bytes (Get-BinaryProbeBytes -Variant 9)
         $secondPut = Invoke-ProbeRawPut -PresignedUrl $presigned -Bytes (Get-BinaryProbeBytes -Variant 9)
         $adopt = Invoke-ProbeUploadAdoptRequest -Body @{
+            uploadId = (Get-ProbeMintedUploadId -Response $uploadUrl)
             fileName = $retryName
             path     = "$($script:ProbeDir)/$retryName"
         }
@@ -2138,11 +2440,8 @@ function Invoke-ScenarioBinaryFailure {
     Write-ProbeLog ("[PROBED] binary-failure-adopt-bad-auth status={0}" -f $badAuthAdopt.Status)
 
     # Presigned URL: correct bytes but a wrong content type.
-    $uploadUrl = Invoke-ProbeUploadUrlRequest -Body @{
-        fileName = $fileName
-        path     = $targetPath
-        contentType = 'image/png'
-    }
+    $uploadUrl = Invoke-ProbeUploadUrlRequest -Body (New-ProbeUploadUrlBody `
+        -FileName $fileName -Path $targetPath -DeclaredSize $bytes.Length)
     $presigned = Get-ProbePresignedUrl -Response $uploadUrl
     if ($null -ne $presigned) {
         $wrongType = Invoke-ProbeRawPut -PresignedUrl $presigned -Bytes $bytes -ContentType 'application/octet-stream'
@@ -2213,6 +2512,7 @@ function Invoke-ScenarioRunBinaryAll {
     # idempotency and failure, then list what is left behind.
     Invoke-ProbeStep 'binary-discover' { Invoke-ScenarioBinaryDiscover }
     Invoke-ProbeStep 'binary-create' { Invoke-ScenarioBinaryCreate }
+    Invoke-ProbeStep 'binary-path-control' { Invoke-ScenarioBinaryPathControl }
     Invoke-ProbeStep 'binary-collision' { Invoke-ScenarioBinaryCollision }
     Invoke-ProbeStep 'binary-overwrite' { Invoke-ScenarioBinaryOverwrite }
     Invoke-ProbeStep 'binary-idempotency' { Invoke-ScenarioBinaryIdempotency }
@@ -2238,6 +2538,7 @@ switch ($Scenario) {
     'text-survey'                { Invoke-ScenarioSurvey }
     'binary-discover'            { Invoke-ScenarioBinaryDiscover }
     'binary-create'              { Invoke-ScenarioBinaryCreate }
+    'binary-path-control'        { Invoke-ScenarioBinaryPathControl }
     'binary-collision'           { Invoke-ScenarioBinaryCollision }
     'binary-overwrite'           { Invoke-ScenarioBinaryOverwrite }
     'binary-idempotency'         { Invoke-ScenarioBinaryIdempotency }
