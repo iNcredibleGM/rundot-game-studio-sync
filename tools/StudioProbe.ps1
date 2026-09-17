@@ -1,5 +1,6 @@
 # Studio protocol probe: the reusable investigation harness behind
-# docs/text-write-protocol.md (#14) and docs/binary-upload-protocol.md (#15).
+# docs/text-write-protocol.md (#14), docs/binary-upload-protocol.md (#15), and
+# docs/delete-rename-protocol.md (#16).
 #
 # THIS FILE IS NOT PART OF THE PRODUCT.
 #
@@ -23,10 +24,17 @@
 #   - Disposable Studio project only. Never point it at a real project.
 #   - Overwrite cases only ever target a path the probe itself created, and
 #     every one of them is restored and verified by SHA-256 afterwards.
-#   - Binary creates cannot be deleted through the API (delete is #16 and is
-#     banned), so they are listed for manual cleanup in the Studio UI.
+#   - DELETE is the one mutation that can destroy something the probe did not
+#     create, so Assert-ProbeDeleteTarget guards the target itself: only
+#     /sync-probe, a run-stamped /uploads path, or a run-stamped
+#     reserved-shaped path is eligible. A bare directory is never eligible.
+#   - Created binaries and text files are deleted at the end of a full run
+#     (DELETE /file, found during #15 and characterized by #16) and the
+#     deletion is verified by list absence. Anything cleanup cannot remove is
+#     listed for manual removal in the Studio UI.
 #   - Tokens are never printed, logged, or written to evidence. Evidence holds
-#     status codes, sizes, hashes, and redacted bodies only.
+#     status codes, sizes, hashes, and redacted bodies only. A DevTools rename
+#     capture is redacted for credential-shaped text before it is recorded.
 #
 # Usage:
 #
@@ -46,9 +54,20 @@
 #   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-text-all `
 #       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
 #
+#   # The #16 delete/rename/concurrency investigation:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-delete-rename-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
+#   # The rename route has no documented shape, so the guessed candidates are
+#   # backed by a human capture. Prepare a target, rename it by hand in Studio
+#   # with DevTools open, save the request, then record it:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario rename-devtools-prepare -ConfirmRemoteWrite
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario rename-devtools-apply `
+#       -CapturePath "$env:TEMP\rundot-rename-capture.txt" -ConfirmRemoteWrite
+#
 # Evidence lands in -OutDir (default %TEMP%\rundot-probe-evidence) as a JSON
-# file and a log. The log ends with the CLEANUP list of paths the probe
-# created, which must be deleted by hand in the Studio UI.
+# file and a log. A full run deletes what it created; anything left behind is
+# printed as a CLEANUP list to remove in the Studio UI.
 #
 # The token file must be outside the repository. Never commit it.
 
@@ -2073,8 +2092,9 @@ function Invoke-ScenarioTextConcurrencyApply {
 }
 
 function Invoke-ScenarioSurvey {
-    # Lists every probe-created path so the human can delete them in the Studio
-    # UI. There is no delete route in this milestone (#16 owns it).
+    # Lists every probe-created path so a human can delete anything cleanup
+    # could not. DELETE /file is characterized by #16, but this remains the
+    # honest fallback for a path the API refuses to remove.
     #
     # Both directories are scanned: text writes land under /sync-probe, but
     # binary uploads are recorded under /uploads no matter what was requested.

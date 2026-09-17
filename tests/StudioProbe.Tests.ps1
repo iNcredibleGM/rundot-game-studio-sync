@@ -129,12 +129,31 @@ Assert-True (
 # ---------------------------------------------------------------------------
 
 Assert-True (
-    $probeText -match 'function Assert-ProbeDeleteTarget'
+    $probeText -match '(?m)^function Assert-ProbeDeleteTarget\b'
 ) "every DELETE must route through Assert-ProbeDeleteTarget"
 
 Assert-True (
     $probeText -match 'Refusing to DELETE a path the probe does not own'
 ) "the delete guard must refuse a path the probe does not own"
+
+# The guard existing is not enough: Invoke-ProbeDeleteFile must actually call
+# it, or a future edit could bypass the check while leaving the function in
+# place. Match the call inside that function's body.
+$deleteHelperIndex = $probeText.IndexOf('function Invoke-ProbeDeleteFile')
+$deleteGuardCallIndex = if ($deleteHelperIndex -ge 0) {
+    $probeText.IndexOf('Assert-ProbeDeleteTarget -Path $Path -Case $Case', $deleteHelperIndex)
+}
+else { -1 }
+
+Assert-True (
+    $deleteGuardCallIndex -gt $deleteHelperIndex
+) "Invoke-ProbeDeleteFile must call Assert-ProbeDeleteTarget before it sends"
+
+# The delete helper must also keep the list-absence proof: a status alone is
+# never evidence that a file is gone.
+Assert-True (
+    $probeText -match 'StillListed'
+) "a DELETE must be proved by list absence, not by its status"
 
 # A bare directory such as /uploads must never be an eligible delete target:
 # binary uploads flatten into /uploads, so a directory DELETE there could
@@ -146,8 +165,12 @@ Assert-True (
 # The rename capture is a copied fetch, which carries an Authorization header.
 # It must be redacted rather than recorded.
 Assert-True (
-    $probeText -match '(?i)authorization\|bearer\|token\|cookie'
-) "the rename DevTools capture must redact credential-shaped text"
+    $probeText -match "(?i)authorization"
+) "the rename DevTools capture must name the Authorization header it redacts"
+
+Assert-True (
+    $probeText -match [regex]::Escape('$1=<redacted>')
+) "the rename DevTools capture must replace a credential value with a placeholder"
 
 Assert-True (
     $probeText -match 'function Invoke-ScenarioRunDeleteRenameAll'
