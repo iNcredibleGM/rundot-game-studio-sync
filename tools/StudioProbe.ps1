@@ -2489,9 +2489,14 @@ function Invoke-ScenarioBinaryTextViaUpload {
 }
 
 function Invoke-ScenarioBinaryDeleteDiscover {
-    # Cleanup needs a delete route, and none is documented: #16 owns delete and
-    # has not run. Try the plausible shapes against a probe-owned file so the
-    # probe can offer automated cleanup instead of a manual to-do list.
+    # This is the historical #15 discovery step, kept because it is the record
+    # of how the delete route was found: four plausible shapes were tried
+    # against a probe-owned file and only DELETE /file removed it.
+    #
+    # #16 has since characterized that route properly (see the delete
+    # scenarios below and docs/delete-rename-protocol.md). This scenario is
+    # left as-is rather than folded into them, so a future reader can see what
+    # the discovery actually tested.
     #
     # Every target here is a file this run created. Nothing outside the probe
     # namespace is touched, and a failure is recorded rather than retried.
