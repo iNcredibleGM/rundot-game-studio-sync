@@ -46,8 +46,10 @@ Observed flow:
 2. PUT raw bytes to returned presigned object-storage URL
 3. POST /api/projects/{projectId}/upload-adopt
 
-Uploading a second binary with the same filename was observed to create a
-collision-safe renamed file such as `name-1.png`, rather than replacing the
-existing file.
-
-Status: observed, not yet part of the supported tool.
+Status: observed and characterized in
+[binary-upload-protocol.md](binary-upload-protocol.md), but not part of the
+supported tool. Two findings dominate: the requested `path` is **ignored**, and
+the file is always recorded at `/uploads/{basename}`; and a repeated filename
+**never replaces** the existing file, it creates a numeric-suffixed sibling
+(`name-1.png`). Replacement was not achievable by any attempt. Nothing in the
+product calls these routes.
