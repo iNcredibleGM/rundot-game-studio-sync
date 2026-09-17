@@ -1156,6 +1156,29 @@ function Invoke-ScenarioTextCreate {
     Invoke-ProbeRoundTrip -Case 'text-create-no-trailing-newline' -Path "$($script:ProbeDir)/notrailing.txt" `
         -ContentBytes (New-JsonContentBody -Text 'no trailing newline') `
         -Note 'a trailing newline must not be added'
+
+    # #14 found POST on the file route is 405. Re-confirm it, because a create
+    # mechanism is still the open question for #17 and a new verb would be the
+    # first place to look.
+    $postUri = New-ProbeFileUrl -Path $script:ProbeRootPath
+    Assert-ProbeWriteAllowed -Case 'text-create-post-file-route' -Method 'POST' -Uri $postUri
+    $postResponse = Invoke-ProbeHttp `
+        -Method 'POST' `
+        -Uri $postUri `
+        -Headers $script:Headers `
+        -BodyBytes (New-JsonContentBody -Text 'post to create') `
+        -ContentType 'application/json'
+    Add-ProbeEvidence -Case 'text-create-post-file-route' -Status 'PROBED' -Data @{
+        note = 'POST on the file route; 405 means the route is PUT-only'
+        path = $script:ProbeRootPath
+        http = @{ status = $postResponse.Status; body = $postResponse.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] text-create-post-file-route status={0}" -f $postResponse.Status)
+
+    # A directory-shaped path: is there a separate create for a folder?
+    Invoke-ProbeRoundTrip -Case 'text-create-directory-shaped-path' -Path "$($script:ProbeDir)/nested" `
+        -ContentBytes (New-JsonContentBody -Text '') `
+        -Note 'PUT with a directory-shaped path'
 }
 
 function Invoke-ScenarioTextOverwrite {
@@ -1411,9 +1434,12 @@ function Invoke-ScenarioTextFailure {
 
     # Path validation, absolute so the format rule is met.
     foreach ($badPath in @('/../escaped.txt', '/.git/probe.txt', '/.rundot/probe.txt')) {
+        $badUri = New-ProbeFileUrl -Path $badPath
+        Assert-ProbeWriteAllowed -Case "text-failure-path-validation:$badPath" -Method 'PUT' -Uri $badUri
+
         $response = Invoke-ProbeHttp `
             -Method 'PUT' `
-            -Uri (New-ProbeFileUrl -Path $badPath) `
+            -Uri $badUri `
             -Headers $script:Headers `
             -BodyBytes (New-JsonContentBody -Text 'path validation probe') `
             -ContentType 'application/json'
@@ -1426,12 +1452,34 @@ function Invoke-ScenarioTextFailure {
         Write-ProbeLog ("[PROBED] text-failure-path-validation $badPath status={0}" -f $response.Status)
     }
 
+    # A NUL in the path. This cannot go through ConvertTo-CanonicalSyncPath
+    # (which rejects embedded NULs by design), so the URI is built directly.
+    # #14 found 400; re-confirming keeps the path-safety claim honest.
+    $nulPath = "/sync-probe/nul" + [char]0 + ".txt"
+    $nulEncoded = [System.Uri]::EscapeDataString($nulPath)
+    $nulUri = "$StudioOrigin/api/projects/$ProjectId/file?path=$nulEncoded"
+    Assert-ProbeWriteAllowed -Case 'text-failure-nul-path' -Method 'PUT' -Uri $nulUri
+
+    $nulResponse = Invoke-ProbeHttp `
+        -Method 'PUT' `
+        -Uri $nulUri `
+        -Headers $script:Headers `
+        -BodyBytes (New-JsonContentBody -Text 'nul path probe') `
+        -ContentType 'application/json'
+    Add-ProbeEvidence -Case 'text-failure-nul-path' -Status 'PROBED' -Data @{
+        note = 'path containing a NUL; #14 found 400'
+        http = @{ status = $nulResponse.Status; body = $nulResponse.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] text-failure-nul-path status={0}" -f $nulResponse.Status)
+
     # Auth probes.
     $authBody = New-JsonContentBody -Text 'auth probe'
+    $targetUri = New-ProbeFileUrl -Path $target
+    Assert-ProbeWriteAllowed -Case 'text-failure-auth-probes' -Method 'PUT' -Uri $targetUri
 
     $noAuth = Invoke-ProbeHttp `
         -Method 'PUT' `
-        -Uri (New-ProbeFileUrl -Path $target) `
+        -Uri $targetUri `
         -Headers @{ Accept = '*/*' } `
         -BodyBytes $authBody `
         -ContentType 'application/json'
@@ -1443,7 +1491,7 @@ function Invoke-ScenarioTextFailure {
 
     $badAuth = Invoke-ProbeHttp `
         -Method 'PUT' `
-        -Uri (New-ProbeFileUrl -Path $target) `
+        -Uri $targetUri `
         -Headers @{ Authorization = 'Bearer not-a-real-token'; Accept = '*/*' } `
         -BodyBytes $authBody `
         -ContentType 'application/json'
@@ -1456,11 +1504,13 @@ function Invoke-ScenarioTextFailure {
     # Size boundary. #14 found the limit is exactly 2,000,000 characters
     # inclusive; these confirm it is still there.
     $original = Get-ProbeReadOrNull -Path $target
+    Assert-ProbeWriteAllowed -Case 'text-failure-size-probes' -Method 'PUT' -Uri $targetUri
+
     foreach ($size in @(1999999, 2000000, 2000001)) {
         $big = 'a' * $size
         $response = Invoke-ProbeHttp `
             -Method 'PUT' `
-            -Uri (New-ProbeFileUrl -Path $target) `
+            -Uri $targetUri `
             -Headers $script:Headers `
             -BodyBytes (New-JsonContentBody -Text $big) `
             -ContentType 'application/json'
