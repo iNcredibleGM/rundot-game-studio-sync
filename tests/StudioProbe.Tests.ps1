@@ -124,6 +124,228 @@ Assert-True (
 ) "probe path ownership must compare on a segment boundary, not a raw string prefix"
 
 # ---------------------------------------------------------------------------
+# #16: DELETE is the one mutation that can destroy a file the probe did not
+# create, so the target itself is guarded, not just the write gate.
+# ---------------------------------------------------------------------------
+
+Assert-True (
+    $probeText -match '(?m)^function Assert-ProbeDeleteTarget\b'
+) "every DELETE must route through Assert-ProbeDeleteTarget"
+
+Assert-True (
+    $probeText -match 'Refusing to DELETE a path the probe does not own'
+) "the delete guard must refuse a path the probe does not own"
+
+# The guard existing is not enough: Invoke-ProbeDeleteFile must actually call
+# it, or a future edit could bypass the check while leaving the function in
+# place. Match the call inside that function's body.
+$deleteHelperIndex = $probeText.IndexOf('function Invoke-ProbeDeleteFile')
+$deleteGuardCallIndex = if ($deleteHelperIndex -ge 0) {
+    $probeText.IndexOf('Assert-ProbeDeleteTarget -Path $Path -Case $Case', $deleteHelperIndex)
+}
+else { -1 }
+
+Assert-True (
+    $deleteGuardCallIndex -gt $deleteHelperIndex
+) "Invoke-ProbeDeleteFile must call Assert-ProbeDeleteTarget before it sends"
+
+# The delete helper must also keep the list-absence proof: a status alone is
+# never evidence that a file is gone.
+Assert-True (
+    $probeText -match 'StillListed'
+) "a DELETE must be proved by list absence, not by its status"
+
+# A bare directory such as /uploads must never be an eligible delete target:
+# binary uploads flatten into /uploads, so a directory DELETE there could
+# destroy real project files.
+Assert-True (
+    $probeText -match 'a bare directory like /uploads is never eligible'
+) "the delete guard must state that a bare directory is never eligible"
+
+# -AllRuns widens the cleanup filter to every probe path, including earlier
+# runs' files, which carry a different stamp. The guard must accept the probe
+# stamp SHAPE in that mode, or -AllRuns would select paths it then refuses and
+# report them as remaining while deleting only the current run's files.
+Assert-True (
+    $probeText -match 'ProbeAllowAllRuns'
+) "the delete guard must widen to the probe stamp shape under -AllRuns"
+
+# Widening must stay a strict shape, never a loose "contains probe".
+Assert-True (
+    $probeText -match [regex]::Escape('probe-\d{8}-\d{6}')
+) "-AllRuns must match a strict probe stamp shape, not a loose substring"
+
+# Cleanup must not abort when the guard refuses a path: -AllRuns selects real
+# project files too, and an uncaught throw would stop cleanup half way through.
+Assert-True (
+    $probeText -match 'binary-cleanup-skipped'
+) "cleanup must record a guard refusal instead of aborting"
+
+# The rename capture is a copied fetch, which carries an Authorization header.
+# It must be redacted rather than recorded.
+Assert-True (
+    $probeText -match "(?i)authorization"
+) "the rename DevTools capture must name the Authorization header it redacts"
+
+Assert-True (
+    $probeText -match [regex]::Escape('$1$2<redacted>')
+) "the rename DevTools capture must replace a credential value with a placeholder"
+
+# The capture exists to name the real route, so the method and its URL must
+# both be extracted. Matching on "method" alone records that a request happened
+# without recording where it went, which is exactly the bug this pins.
+Assert-True (
+    $probeText -match 'captureRoutes'
+) "rename-devtools-apply must record the captured method/URL route pairs"
+
+# A blanket https?:// match picks up the "referrer" line, which sits between
+# the fetch URL and the method, so the recorded route would be
+# "https://run.world/" instead of the real endpoint. Rather than assert on the
+# probe's source text (which is fragile), this replicates the extractor's two
+# patterns against a real copied-fetch snippet and checks it picks the endpoint,
+# not the referrer.
+$fetchUrlPattern = 'fetch\(\s*[''"](https?://[^''"]+)[''"]'
+$harUrlPattern = '"(?:url|requestUrl)"\s*:\s*"(https?://[^"]+)"'
+$sampleCapture = @(
+    'await fetch("https://studio.example/api/projects/p1/move", {'
+    '    "referrer": "https://run.world/",'
+    '    "body": "{}",'
+    '    "method": "POST",'
+    '    "mode": "cors"'
+    '});'
+)
+
+$extractedUrl = $null
+foreach ($line in $sampleCapture) {
+    $fetchMatch = [regex]::Match($line, $fetchUrlPattern)
+    if ($fetchMatch.Success) { $extractedUrl = $fetchMatch.Groups[1].Value; continue }
+    $harMatch = [regex]::Match($line, $harUrlPattern)
+    if ($harMatch.Success) { $extractedUrl = $harMatch.Groups[1].Value; continue }
+}
+
+Assert-Equal 'https://studio.example/api/projects/p1/move' $extractedUrl `
+    "the capture extractor must read the fetch endpoint, not the referrer line"
+
+Assert-True (
+    $probeText -match 'requestUrl'
+) "rename-devtools-apply must also read a HAR url field"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioRunDeleteRenameAll'
+) "the #16 investigation must be runnable with one command"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioConditionalDelete'
+) "the delete verb's precondition behavior must be probed"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioRenameDevToolsApply'
+) "the DevTools rename capture must have a recording scenario"
+
+# The rename hand-off runs as two separate processes, so the apply step cannot
+# use its own per-process run stamp: it would never match the file the prepare
+# run created. It must recover the prepare stamp from the state file, and find
+# the renamed file by content hash rather than by name, because the human picks
+# the new name and a copy-as-fetch capture does not show the recorded path.
+Assert-True (
+    $probeText -match 'prepareStamp'
+) "rename-devtools-apply must recover the prepare run's stamp instead of using its own"
+
+Assert-True (
+    $probeText -match 'renamedPathByHash'
+) "rename-devtools-apply must locate the renamed file by content hash"
+
+# The apply step must leave the project clean, but must not weaken the delete
+# guard to do it: a path the guard refuses is reported for manual removal.
+$applyIndex = $probeText.IndexOf('function Invoke-ScenarioRenameDevToolsApply')
+$applyBody = if ($applyIndex -ge 0) { $probeText.Substring($applyIndex) } else { '' }
+Assert-True (
+    $applyBody -match 'rename-devtools-cleanup'
+) "rename-devtools-apply must clean up the hand-off"
+Assert-True (
+    $applyBody -match 'needsManual'
+) "rename-devtools-apply must report a path it could not delete rather than forcing it"
+
+# ---------------------------------------------------------------------------
+# Every declared scenario must be dispatchable, and every scenario must also
+# appear in the dry-run plan. A scenario that is in the ValidateSet but not the
+# dispatch switch fails at run time, after -ConfirmRemoteWrite was supplied,
+# which is the worst moment to discover a typo. A scenario missing from the
+# plan text would make a dry run under-report what it would send.
+# ---------------------------------------------------------------------------
+
+$validateSetMatch = [regex]::Match(
+    $probeText,
+    '(?s)\[ValidateSet\((.*?)\)\]\s*\[string\]\$Scenario'
+)
+Assert-True $validateSetMatch.Success "the probe must declare a scenario ValidateSet"
+
+$declaredScenarios = @()
+if ($validateSetMatch.Success) {
+    $declaredScenarios = @(
+        [regex]::Matches($validateSetMatch.Groups[1].Value, "'([a-z0-9-]+)'") |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+    )
+}
+
+Assert-True (
+    $declaredScenarios.Count -gt 20
+) "the scenario list must include the #16 delete/rename/concurrency scenarios"
+
+$dispatchMatch = [regex]::Match($probeText, '(?s)switch \(\$Scenario\) \{(.*?)\n\}')
+Assert-True $dispatchMatch.Success "the probe must have a scenario dispatch switch"
+
+$undispatched = @()
+if ($dispatchMatch.Success) {
+    foreach ($scenarioName in $declaredScenarios) {
+        if ($dispatchMatch.Groups[1].Value -notmatch [regex]::Escape("'$scenarioName'")) {
+            $undispatched += $scenarioName
+        }
+    }
+}
+
+Assert-Equal 0 $undispatched.Count (
+    "every declared scenario must be dispatched; missing: $($undispatched -join ', ')"
+)
+
+# The runner functions are the documented entry points; they must exist and be
+# reachable from the dispatch switch.
+foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all')) {
+    Assert-True (
+        $dispatchMatch.Success -and
+        $dispatchMatch.Groups[1].Value -match [regex]::Escape("'$runnerName'")
+    ) "the $runnerName runner must be dispatched"
+}
+
+# Every scenario must also have a dry-run plan entry, so a dry run reports what
+# it would send. Read-only survey scenarios are the deliberate exception.
+$planMatch = [regex]::Match($probeText, '(?s)\$plans = @\{(.*?)\n    \}')
+$missingPlans = @()
+if ($planMatch.Success) {
+    foreach ($scenarioName in $declaredScenarios) {
+        if ($scenarioName -like '*-survey') { continue }
+        if ($planMatch.Groups[1].Value -notmatch [regex]::Escape("'$scenarioName'")) {
+            $missingPlans += $scenarioName
+        }
+    }
+}
+
+Assert-Equal 0 $missingPlans.Count (
+    "every mutating scenario must have a dry-run plan entry; missing: $($missingPlans -join ', ')"
+)
+
+# A dispatch arm that is present but empty would satisfy the reachability check
+# above while sending nothing, so the arm must call a scenario function.
+if ($dispatchMatch.Success) {
+    $emptyArms = [regex]::Matches(
+        $dispatchMatch.Groups[1].Value,
+        "(?m)^\s*'[a-z0-9-]+'\s*\{\s*\}"
+    )
+    Assert-Equal 0 $emptyArms.Count "a probe dispatch arm must call a scenario function, not be empty"
+}
+
+# ---------------------------------------------------------------------------
 # The restore discipline that #14 learned the hard way.
 # ---------------------------------------------------------------------------
 

@@ -32,6 +32,41 @@ tool. It is **overwrite-only**: a path that is not already in the project
 returns 404, and there is no ETag, version field, or honoured `If-Match`. Nothing
 in the product calls this route.
 
+## Delete file
+
+DELETE /api/projects/{projectId}/file?path={encodedPath}
+
+Status: observed and characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md), but not part of the
+supported tool. It removes exactly the named file and returns
+`{"success":true,"data":{"deleted":"<path>"}}`. A repeated delete returns 404
+rather than an error, a directory-shaped path is 404 rather than recursive, and
+`If-Match` / `If-None-Match` are ignored exactly as they are on the write
+route. A rename or move is `POST /api/projects/{id}/move` with `{from,to}`,
+characterized in [delete-rename-protocol.md](delete-rename-protocol.md). It
+honors an arbitrary destination path, preserves bytes, and refuses to overwrite
+an existing destination with `409 ALREADY_EXISTS`. Nothing in the product calls
+these routes, and `deleteRemoteCandidate` remains classification-only.
+
+## Move / rename file
+
+POST /api/projects/{projectId}/move
+
+Content-Type: application/json
+
+{
+  "from": "/uploads/a.txt",
+  "to": "/sync-probe/b.txt"
+}
+
+Status: observed and characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md), but not part of the
+supported tool. It honors an arbitrary destination path (unlike the upload
+flow), preserves bytes exactly for text and binaries, and **refuses to
+overwrite**: a destination that already exists returns `409 ALREADY_EXISTS` and
+changes nothing. A move from a path that does not exist is `404`. Nothing in
+the product calls this route.
+
 ## Threads
 
 GET /api/projects/{projectId}/threads

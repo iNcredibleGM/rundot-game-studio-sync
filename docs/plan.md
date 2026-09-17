@@ -39,8 +39,8 @@ the path actionable in principle:
 | Status | Applicable | Why |
 | --- | --- | --- |
 | `upload` (text) | no | Remote mutation is not implemented in this milestone. |
-| `upload` (binary) | no | Remote binary replacement semantics are unverified. |
-| `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. |
+| `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
+| `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. Studio cannot make a delete conditional: there is no ETag or version field and If-Match is ignored, so a stale delete cannot be refused server-side. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
 A text upload stays `Status = upload` so the plan still shows the candidate,
@@ -188,6 +188,8 @@ so the artifact is never a local inventory entry or an upload candidate.
 - Snapshot stability and the torn-read abort: [remote-snapshot.md](remote-snapshot.md).
 - Path identity, safety, and ignores: [path-safety.md](path-safety.md).
 - Applying a remote-only change with backups: [pull.md](pull.md).
+- The delete verb and the concurrency controls a future `Apply` must respect:
+  [delete-rename-protocol.md](delete-rename-protocol.md).
 
 Unit coverage lives in `tests/SyncPlan.Tests.ps1` (engine) and
 `tests/SyncCli.Tests.ps1` (CLI wiring), and requires no network.

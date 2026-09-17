@@ -12,8 +12,8 @@ permit a write.
 
 Read paths are in [protocol.md](protocol.md). The text write route is
 [text-write-protocol.md](text-write-protocol.md); this document covers only the
-binary upload flow. Delete and rename are
-[#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16).
+binary upload flow. Delete, rename, and concurrency are characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md).
 
 ## Endpoints
 
@@ -180,9 +180,13 @@ The original file was byte-for-byte unchanged in every case.
 | Fresh `upload-url` + PUT + adopt against an existing name | New sibling; original unchanged |
 | Re-adopt with a newly minted `uploadId` and the same `name` | New sibling; original unchanged |
 
-The only way to change a binary is create-a-new-name plus delete-the-old, and
-**delete is not established by this investigation** — it belongs to
-[#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16).
+The only way to change a binary is create-a-new-name plus delete-the-old, or a
+move. Delete is characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md): it removes exactly the
+named path. **A move is the only way to relocate a binary to an arbitrary
+path**, because the upload flow cannot choose a path and cannot replace a file,
+while `POST /move` honors any destination, preserves the bytes, and refuses to
+overwrite an existing file (`409 ALREADY_EXISTS`).
 
 This is the opposite of the text route, where `PUT` replaces in place with no
 collision rename ([text-write-protocol.md](text-write-protocol.md)).
@@ -361,17 +365,25 @@ cannot work around them.
    are the bytes the plan observed. It would be creating a new file, not
    replacing a known one.
 
-3. **The existing classifier reason is still correct.** Binary uploads remain
-   `applicable: false` with `Remote binary replacement semantics are
-   unverified.` The verification is now done, and the answer is that
-   replacement is not possible — so the reason is accurate but could be
-   sharpened in a follow-up to say so explicitly.
+3. **The existing classifier reason is now accurate.** Binary uploads remain
+   `applicable: false`. The reason previously said replacement semantics were
+   "unverified"; the verification is done and the answer is that replacement
+   is not possible, so the reason was sharpened to say so explicitly in the
+   same change that recorded this evidence.
 
 4. **A future binary `Push` would need a different shape entirely**: treat
    binaries as additive-only (create, never replace), require the remote path
    to be `/uploads/<basename>`, refuse when that name already exists rather
    than silently accepting a collision rename, and never claim to have
    satisfied a plan row whose path differs from what the server recorded.
+
+   Since this record was written, [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)
+   characterized `POST /move`, which changes the picture: the upload flow can
+   still only *create* at `/uploads/<basename>`, but a **move can then relocate
+   that file to any path**. So a binary can reach an arbitrary path in two
+   steps — upload, then move — with the move refusing to overwrite an existing
+   destination. That is a viable path for a binary `upload` row, and it is
+   recorded in [delete-rename-protocol.md](delete-rename-protocol.md).
 
 5. **The create gap from #14 is partly closed, but only for `/uploads`.**
    `PUT /file` cannot create anything, and the upload flow can create a file
@@ -388,8 +400,8 @@ this evidence-only record.
 
 ## Cleanup and the delete route
 
-Delete was unverified (#16 owns it), so a probe run left its files behind and
-cleanup was a manual to-do list. That is no longer necessary:
+Delete was unverified when this investigation began, so a probe run left its
+files behind and cleanup was a manual to-do list. That is no longer necessary:
 
 ```text
 DELETE /api/projects/{projectId}/file?path={encodedPath}
@@ -400,11 +412,12 @@ The status alone is not proof — the proof is that the path disappears from
 `GET /files`. `DELETE` on the `/file` route is the one that works; the other
 plausible shapes were tried and did not remove the file.
 
-This is recorded here only because automated cleanup needs it. It is **not** a
-general statement about delete semantics: what happens to a directory, a
-path that is already absent, a reserved path, or a file the probe did not
-create is [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)'s
-question, and `Push` must not use this route until that investigation lands.
+Delete semantics are now characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md): it removes exactly the
+named path, a repeated delete returns `404` rather than an error, a
+directory-shaped path is `404` rather than recursive, and `If-Match` is
+ignored. `Push` must still not use this route in v0.1.3, because
+`deleteRemoteCandidate` remains classification-only.
 
 Two safeguards keep cleanup safe:
 

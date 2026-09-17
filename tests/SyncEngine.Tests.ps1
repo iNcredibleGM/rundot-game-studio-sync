@@ -325,6 +325,12 @@ Assert-True `
     ([string]$deleteRemoteRow.Reason -match '(?i)classification-only') `
     "a delete candidate reason should say deletion is classification-only"
 Assert-True `
+    ([string]$deleteRemoteRow.Reason -match '(?i)etag') `
+    "a delete candidate reason should name the missing ETag that makes a stale delete unrefusable"
+Assert-True `
+    ([string]$deleteRemoteRow.Reason -match '(?i)if-match') `
+    "a delete candidate reason should name the ignored If-Match precondition"
+Assert-True `
     ([string]$deleteRemoteRow.Reason -notmatch '(?i)bearer|token') `
     "a delete candidate reason must never contain credentials"
 
@@ -464,18 +470,18 @@ Assert-True `
     "a binary upload candidate must never be relabelled 'skip'"
 Assert-Equal $false $binaryUploadRow.Applicable "a binary upload candidate is not applicable until #15"
 Assert-Equal `
-    'Remote binary replacement semantics are unverified.' `
+    'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
     ([string]$binaryUploadRow.Reason) `
-    "a binary upload candidate must carry the fixed unverified-semantics reason"
+    "a binary upload candidate must carry the fixed replacement-impossible reason"
 
 # A brand-new binary file is the same conservative case.
 $newBinaryRow = Get-SyncPlanChange -Path 'public/new.png' -Base $null -Local $binaryLocalB -Remote $null
 Assert-Equal 'upload' ([string]$newBinaryRow.Status) "a new binary file must still display as upload"
 Assert-Equal $false $newBinaryRow.Applicable "a new binary file is not applicable until #15"
 Assert-Equal `
-    'Remote binary replacement semantics are unverified.' `
+    'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
     ([string]$newBinaryRow.Reason) `
-    "a new binary file must carry the fixed unverified-semantics reason"
+    "a new binary file must carry the fixed replacement-impossible reason"
 
 # A text upload stays applicable, so the flag is genuinely about binaries.
 $textUploadRow = Get-SyncPlanChange -Path 'src/new.ts' -Base $null -Local $localA -Remote $null

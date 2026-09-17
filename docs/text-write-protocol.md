@@ -11,8 +11,9 @@ purpose of the record is to constrain the design of
 permit a write.
 
 Read paths are in [protocol.md](protocol.md); this document covers only the
-write side. Binary create/overwrite is [#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15)
-and delete/rename is [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16).
+write side. Binary create/overwrite is [#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15),
+and delete, rename, and concurrency are characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md).
 
 ## Endpoint
 

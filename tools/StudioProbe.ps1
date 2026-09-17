@@ -1,5 +1,6 @@
 # Studio protocol probe: the reusable investigation harness behind
-# docs/text-write-protocol.md (#14) and docs/binary-upload-protocol.md (#15).
+# docs/text-write-protocol.md (#14), docs/binary-upload-protocol.md (#15), and
+# docs/delete-rename-protocol.md (#16).
 #
 # THIS FILE IS NOT PART OF THE PRODUCT.
 #
@@ -23,10 +24,17 @@
 #   - Disposable Studio project only. Never point it at a real project.
 #   - Overwrite cases only ever target a path the probe itself created, and
 #     every one of them is restored and verified by SHA-256 afterwards.
-#   - Binary creates cannot be deleted through the API (delete is #16 and is
-#     banned), so they are listed for manual cleanup in the Studio UI.
+#   - DELETE is the one mutation that can destroy something the probe did not
+#     create, so Assert-ProbeDeleteTarget guards the target itself: only
+#     /sync-probe, a run-stamped /uploads path, or a run-stamped
+#     reserved-shaped path is eligible. A bare directory is never eligible.
+#   - Created binaries and text files are deleted at the end of a full run
+#     (DELETE /file, found during #15 and characterized by #16) and the
+#     deletion is verified by list absence. Anything cleanup cannot remove is
+#     listed for manual removal in the Studio UI.
 #   - Tokens are never printed, logged, or written to evidence. Evidence holds
-#     status codes, sizes, hashes, and redacted bodies only.
+#     status codes, sizes, hashes, and redacted bodies only. A DevTools rename
+#     capture is redacted for credential-shaped text before it is recorded.
 #
 # Usage:
 #
@@ -46,9 +54,20 @@
 #   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-text-all `
 #       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
 #
+#   # The #16 delete/rename/concurrency investigation:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-delete-rename-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
+#   # The rename route has no documented shape, so the guessed candidates are
+#   # backed by a human capture. Prepare a target, rename it by hand in Studio
+#   # with DevTools open, save the request, then record it:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario rename-devtools-prepare -ConfirmRemoteWrite
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario rename-devtools-apply `
+#       -CapturePath "$env:TEMP\rundot-rename-capture.txt" -ConfirmRemoteWrite
+#
 # Evidence lands in -OutDir (default %TEMP%\rundot-probe-evidence) as a JSON
-# file and a log. The log ends with the CLEANUP list of paths the probe
-# created, which must be deleted by hand in the Studio UI.
+# file and a log. A full run deletes what it created; anything left behind is
+# printed as a CLEANUP list to remove in the Studio UI.
 #
 # The token file must be outside the repository. Never commit it.
 
@@ -80,10 +99,30 @@ param(
         'binary-idempotency',
         'binary-failure',
         'binary-survey',
+        # New in the #16 delete/rename/concurrency investigation.
+        'delete-file-basic',
+        'delete-idempotency',
+        'delete-absent',
+        'delete-directory',
+        'delete-reserved',
+        'delete-encoding',
+        'delete-auth',
+        'delete-response-headers',
+        'rename-probe',
+        'rename-move',
+        'rename-devtools-prepare',
+        'rename-devtools-apply',
+        'concurrency-delete-vs-write',
+        'concurrency-delete-while-listed',
+        'revision-identity',
+        'etag-headers',
+        'conditional-delete',
+        'delete-rename-survey',
         # Whole-investigation runners. These are the ones to use by hand: one
         # command per issue instead of seven.
         'run-text-all',
-        'run-binary-all'
+        'run-binary-all',
+        'run-delete-rename-all'
     )]
     [string]$Scenario,
 
@@ -92,6 +131,11 @@ param(
     [string]$StudioOrigin = 'https://venus-studio-prod.series-ai.workers.dev',
 
     [string]$OutDir = (Join-Path $env:TEMP 'rundot-probe-evidence'),
+
+    # The DevTools capture file for rename-devtools-apply. A copied fetch or
+    # HAR carries an Authorization header, so the probe redacts anything
+    # credential-shaped before it records the request shape.
+    [string]$CapturePath,
 
     # A bearer token, a JWT, or pasted DevTools text containing one. Never
     # logged. Exists so automation never blocks on an interactive prompt.
@@ -155,6 +199,7 @@ $script:CleanupRemaining = -1
 $script:Token = $null
 $script:Headers = $null
 $script:WriteEnabled = $false
+$script:ProbeAllowAllRuns = $false
 
 . (Join-Path $RepoRoot 'lib\Paths.ps1')
 . (Join-Path $RepoRoot 'lib\Hashing.ps1')
@@ -1295,7 +1340,8 @@ Write-ProbeLog 'Project: <redacted>'
 # ---------------------------------------------------------------------------
 $probeParameterNames = @(
     'ProjectId', 'Scenario', 'RepoRoot', 'StudioOrigin', 'OutDir',
-    'AccessToken', 'AccessTokenPath', 'NoInteractiveAuth', 'ConfirmRemoteWrite'
+    'AccessToken', 'AccessTokenPath', 'NoInteractiveAuth', 'ConfirmRemoteWrite',
+    'CapturePath'
 )
 
 foreach ($parameterName in $probeParameterNames) {
@@ -1362,8 +1408,27 @@ function Get-ProbeScenarioPlan {
         'binary-idempotency'       = @('POST /upload-url + PUT + adopt, twice', 'PUT the same presigned URL twice')
         'binary-failure'           = @('POST /upload-adopt (unknown id)', 'POST /upload-url (bad bodies, no auth)', 'PUT presigned URL (wrong type, malformed URL)')
         'binary-survey'            = @()
+        'delete-file-basic'        = @('POST /upload-url + PUT + adopt a probe-owned target', 'DELETE /file (the target), then confirm absence from GET /files')
+        'delete-idempotency'       = @('DELETE /file twice on the same probe-owned path')
+        'delete-absent'            = @('DELETE /file (a path that never existed)')
+        'delete-directory'         = @('DELETE /file (a directory-shaped probe-owned path with a child)')
+        'delete-reserved'          = @('DELETE /file (/.git/... and /.rundot/... probe-shaped paths)')
+        'delete-encoding'          = @('DELETE /file (relative, space-encoded, and traversal spellings)')
+        'delete-auth'              = @('DELETE /file (no credential, garbage bearer, then authenticated cleanup)')
+        'delete-response-headers'  = @('DELETE /file, recording response headers')
+        'rename-probe'             = @('PATCH/POST/PUT candidate rename routes against probe-owned targets')
+        'rename-move'              = @('POST /api/projects/{id}/move with { from, to }: basic, same-directory, absent source, retry, overwrite, and binary cases')
+        'rename-devtools-prepare'  = @('POST /upload-url + PUT + adopt a target, then hand off to a human rename in Studio')
+        'rename-devtools-apply'    = @('read a DevTools capture file and record the real rename route')
+        'concurrency-delete-vs-write' = @('DELETE a probe-owned file, then PUT bytes read before the delete')
+        'concurrency-delete-while-listed' = @('fingerprint GET /files, DELETE a path, fingerprint again')
+        'revision-identity'        = @('diff the listed row fields across create, overwrite, and delete')
+        'etag-headers'             = @('GET /file, GET /files, PUT /file, DELETE /file (record response headers)')
+        'conditional-delete'       = @('DELETE /file with If-Match / If-None-Match')
+        'delete-rename-survey'     = @()
         'run-text-all'             = @('The full #14 text investigation: create, overwrite, version, conditional, idempotency, failure, survey')
         'run-binary-all'           = @('The full #15 binary investigation: discover, create, collision, overwrite, idempotency, failure, survey')
+        'run-delete-rename-all'    = @('The full #16 investigation: delete semantics, rename discovery, concurrency, revision identity, ETag, conditional delete, survey')
     }
 
     if ($plans.ContainsKey($Name)) { return @($plans[$Name]) }
@@ -2030,8 +2095,9 @@ function Invoke-ScenarioTextConcurrencyApply {
 }
 
 function Invoke-ScenarioSurvey {
-    # Lists every probe-created path so the human can delete them in the Studio
-    # UI. There is no delete route in this milestone (#16 owns it).
+    # Lists every probe-created path so a human can delete anything cleanup
+    # could not. DELETE /file is characterized by #16, but this remains the
+    # honest fallback for a path the API refuses to remove.
     #
     # Both directories are scanned: text writes land under /sync-probe, but
     # binary uploads are recorded under /uploads no matter what was requested.
@@ -2426,9 +2492,14 @@ function Invoke-ScenarioBinaryTextViaUpload {
 }
 
 function Invoke-ScenarioBinaryDeleteDiscover {
-    # Cleanup needs a delete route, and none is documented: #16 owns delete and
-    # has not run. Try the plausible shapes against a probe-owned file so the
-    # probe can offer automated cleanup instead of a manual to-do list.
+    # This is the historical #15 discovery step, kept because it is the record
+    # of how the delete route was found: four plausible shapes were tried
+    # against a probe-owned file and only DELETE /file removed it.
+    #
+    # #16 has since characterized that route properly (see the delete
+    # scenarios below and docs/delete-rename-protocol.md). This scenario is
+    # left as-is rather than folded into them, so a future reader can see what
+    # the discovery actually tested.
     #
     # Every target here is a file this run created. Nothing outside the probe
     # namespace is touched, and a failure is recorded rather than retried.
@@ -2502,26 +2573,155 @@ function Invoke-ScenarioBinaryDeleteDiscover {
     Write-ProbeLog ("[OBSERVED] binary-delete-discover: this run created {0} path(s)" -f $remaining.Count)
 }
 
+function Assert-ProbeDeleteTarget {
+    # A DELETE is the one mutation that can destroy something the probe did not
+    # create. The write gate is not enough, so the target itself is checked:
+    #
+    #   - anything under /sync-probe (the probe's own directory), or
+    #   - a /uploads basename carrying a probe run stamp, or
+    #   - a reserved-shaped path whose basename carries a probe run stamp, which
+    #     nothing could have created.
+    #
+    # A bare directory like /uploads is never eligible, which is the case this
+    # guard exists for.
+    #
+    # The stamp is normally THIS process's. A two-process hand-off (the rename
+    # prepare/apply pair) legitimately operates on an earlier run's files, so
+    # the caller may name additional stamps it is allowed to touch. That is an
+    # explicit, auditable allowance rather than a widened pattern: without it a
+    # generic probe-shaped pattern would let any file that merely looks like a
+    # probe artifact be deleted.
+    param(
+        [string]$Path,
+        [string]$Case,
+        [string[]]$AllowedStamp
+    )
+
+    if (Test-ProbeOwnedPath -Path $Path) { return }
+
+    $leaf = [System.IO.Path]::GetFileName($Path)
+    $stamps = @($script:ProbeRunStamp)
+    if ($null -ne $AllowedStamp) {
+        $stamps += @($AllowedStamp | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+
+    $stamped = $false
+    foreach ($stamp in $stamps) {
+        if ($leaf -like "*$stamp*") { $stamped = $true; break }
+    }
+
+    # -AllRuns widens the candidate filter to every probe path, which includes
+    # earlier runs' files. Those carry a different stamp, so allow any leaf with
+    # the strict probe stamp SHAPE (probe-YYYYMMDD-HHMMSS). This is
+    # deliberately a shape rather than a loose "contains probe": a real project
+    # file would have to be named probe-20260917-123456-... to be caught, and
+    # -AllRuns is an explicit opt-in.
+    if (-not $stamped -and $script:ProbeAllowAllRuns) {
+        $stamped = ($leaf -match '^\.?probe-\d{8}-\d{6}')
+    }
+
+    $inUploads = $Path -like "$($script:ProbeUploadDir)/*"
+    $reservedShaped = ($Path -like '/.git/*' -or $Path -like '/.rundot/*')
+
+    if ($stamped -and ($inUploads -or $reservedShaped)) { return }
+
+    throw (
+        "Refusing to DELETE a path the probe does not own. " +
+        "Case '$Case' targeted '$Path'; only /sync-probe, a run-stamped " +
+        "/uploads path, or a run-stamped reserved-shaped path is eligible."
+    )
+}
+
 function Invoke-ProbeDeleteFile {
     # DELETE /api/projects/{id}/file?path=... returns 200 and removes the file.
-    # Discovered by binary-delete-discover; #16 still owns the full semantics.
-    param([string]$Path)
+    # Discovered by binary-delete-discover and promoted to a characterized
+    # contract by #16.
+    param(
+        [string]$Path,
+        [hashtable]$ExtraHeaders,
+        [string]$Case,
+        [string[]]$AllowedStamp
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Case)) { $Case = "delete:$Path" }
+
+    Assert-ProbeDeleteTarget -Path $Path -Case $Case -AllowedStamp $AllowedStamp
 
     $encoded = [System.Uri]::EscapeDataString($Path)
     $uri = "$StudioOrigin/api/projects/$ProjectId/file?path=$encoded"
-    Assert-ProbeWriteAllowed -Case "delete:$Path" -Method 'DELETE' -Uri $uri
+    Assert-ProbeWriteAllowed -Case $Case -Method 'DELETE' -Uri $uri
 
-    $response = Invoke-ProbeHttp -Method 'DELETE' -Uri $uri -Headers $script:Headers
+    $requestHeaders = @{}
+    foreach ($key in $script:Headers.Keys) { $requestHeaders[$key] = $script:Headers[$key] }
+    if ($null -ne $ExtraHeaders) {
+        foreach ($key in $ExtraHeaders.Keys) { $requestHeaders[$key] = $ExtraHeaders[$key] }
+    }
+
+    $response = Invoke-ProbeHttp -Method 'DELETE' -Uri $uri -Headers $requestHeaders
 
     # The status alone is not proof; the file being gone is.
     Start-Sleep -Milliseconds 250
     $stillListed = $null -ne (Get-ProbeRowOrNull -Path $Path)
 
     return [pscustomobject]@{
-        Status      = $response.Status
-        Body        = $response.BodyText
-        StillListed = $stillListed
-        Deleted     = (-not $stillListed)
+        Status          = $response.Status
+        Body            = $response.BodyText
+        ResponseHeaders = $response.ResponseHeaders
+        StillListed     = $stillListed
+        Deleted         = (-not $stillListed)
+        TransportError  = $response.TransportError
+    }
+}
+
+function New-ProbeOwnedTextFile {
+    # The text PUT route cannot create (#14: a new path is 404), so the only
+    # observed way to get a probe-owned file that PUT /file can then address is
+    # the binary upload flow, which records a UTF-8 .txt payload as editable
+    # text. Every delete/rename/concurrency target is built this way.
+    param(
+        [string]$Suffix,
+        [string]$Content = ''
+    )
+
+    $name = Get-BinaryProbeName -Suffix $Suffix -Extension '.txt'
+    if ([string]::IsNullOrEmpty($Content)) {
+        $Content = "probe target $([Guid]::NewGuid().ToString('N'))"
+    }
+
+    $bytes = Get-Utf8NoBomBytes -Text $Content
+    $result = Invoke-ProbeBinaryUpload `
+        -Case "target-create-$Suffix" `
+        -FileName $name `
+        -Bytes $bytes `
+        -ContentType 'text/plain' `
+        -Note 'probe-owned target created through the upload flow for a destructive case'
+
+    return [pscustomobject]@{
+        Path   = $result.recordedPath
+        Sha256 = $result.sha256
+        Result = $result
+    }
+}
+
+function New-ProbeFileUrlRaw {
+    # The product's New-ProbeFileUrl always percent-encodes. Encoding cases need
+    # to send a deliberately different spelling, so build the URI from a raw
+    # query value.
+    param([string]$RawQueryValue)
+
+    return "$StudioOrigin/api/projects/$ProjectId/file?path=$RawQueryValue"
+}
+
+function Get-ProbeListFingerprint {
+    # Fingerprint the validated GET /files list the way the product snapshot
+    # does, so a before/after comparison proves whether a mutation moved the
+    # list. This is the client-side check #17 must be able to perform.
+    try {
+        $list = Get-ProbeFileList
+        return Get-RemoteManifestFingerprint -Manifest $list
+    }
+    catch {
+        return $null
     }
 }
 
@@ -2558,11 +2758,39 @@ function Invoke-ScenarioBinaryCleanup {
         return
     }
 
+    # -AllRuns widens the candidate filter to every probe path, including
+    # earlier runs'. Those carry a different stamp, so the delete guard is told
+    # to accept the probe stamp shape for this run. Without this the widened
+    # filter would select paths the guard then refuses, and -AllRuns would
+    # silently delete only the current run's files while reporting the rest as
+    # remaining.
+    $script:ProbeAllowAllRuns = [bool]$AllRuns
+
     $deleted = 0
     $failed = New-Object 'System.Collections.Generic.List[string]'
+    $skipped = New-Object 'System.Collections.Generic.List[string]'
 
     foreach ($path in $candidates) {
-        $result = Invoke-ProbeDeleteFile -Path $path
+        # -AllRuns widens the candidate filter to every path under /uploads,
+        # which includes real project files. The delete guard correctly refuses
+        # those, so a refusal here is expected rather than exceptional: record
+        # it and move on instead of letting an uncaught throw abort the whole
+        # cleanup half way through.
+        $result = $null
+        try {
+            $result = Invoke-ProbeDeleteFile -Path $path
+        }
+        catch {
+            $skipped.Add($path)
+            Add-ProbeEvidence -Case 'binary-cleanup-skipped' -Status 'OBSERVED' -Data @{
+                note   = 'the delete guard refused this path, so it was not touched'
+                path   = $path
+                reason = $_.Exception.Message
+            }
+            Write-ProbeLog ("[SKIPPED] cleanup refused to delete {0}" -f $path)
+            continue
+        }
+
         if ($result.Deleted) {
             $deleted++
         }
@@ -2593,11 +2821,15 @@ function Invoke-ScenarioBinaryCleanup {
         attempted   = $candidates.Count
         deleted     = $deleted
         failed      = $failed.ToArray()
+        skipped     = $skipped.ToArray()
         remaining   = $remaining
         remainingCount = $remaining.Count
     }
     Write-ProbeLog ("[OBSERVED] binary-cleanup: deleted {0}/{1}, {2} remaining" -f `
         $deleted, $candidates.Count, $remaining.Count)
+    if ($skipped.Count -gt 0) {
+        Write-ProbeLog ("[OBSERVED] binary-cleanup: {0} path(s) were outside the probe's ownership and were left alone." -f $skipped.Count)
+    }
 }
 
 function Invoke-ScenarioBinaryOverwrite {
@@ -2899,6 +3131,1162 @@ function Invoke-ScenarioBinaryFailure {
 
 
 # ---------------------------------------------------------------------------
+# Delete semantics (#16)
+#
+# binary-delete-discover found DELETE /api/projects/{id}/file?path=... returns
+# 200 and removes the file. That was only ever enough to automate cleanup; #16
+# characterizes the verb itself so #17 can decide whether a plan row may ever
+# become a DELETE. Every target is probe-owned and, where a text file can be
+# re-created, restored afterwards.
+# ---------------------------------------------------------------------------
+
+function Invoke-ProbeDeleteCase {
+    # One DELETE, recorded with the proof that matters: the list row before and
+    # after, plus a GET /file read-back. A status alone is never the finding.
+    param(
+        [string]$Case,
+        [string]$Path,
+        [string]$Note = '',
+        [hashtable]$ExtraHeaders
+    )
+
+    $rowBefore = Get-ProbeRowOrNull -Path $Path
+    $readBefore = Get-ProbeReadOrNull -Path $Path
+
+    $result = Invoke-ProbeDeleteFile -Path $Path -ExtraHeaders $ExtraHeaders -Case $Case
+
+    Start-Sleep -Milliseconds 300
+    $rowAfter = Get-ProbeRowOrNull -Path $Path
+    $readAfter = Get-ProbeReadOrNull -Path $Path
+
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note            = $Note
+        path            = $Path
+        listedBefore    = ($null -ne $rowBefore)
+        shaBefore       = if ($null -ne $readBefore) { $readBefore.Sha256 } else { $null }
+        http            = @{
+            status  = $result.Status
+            body    = $result.Body
+            headers = $result.ResponseHeaders
+            error   = if ($null -ne $result.TransportError) { [string]$result.TransportError.Message } else { $null }
+        }
+        listedAfter     = ($null -ne $rowAfter)
+        readAfter       = ($null -ne $readAfter)
+        shaAfter        = if ($null -ne $readAfter) { $readAfter.Sha256 } else { $null }
+        deleted         = $result.Deleted
+    }
+    Write-ProbeLog ("[PROBED] {0} status={1} deleted={2}" -f $Case, $result.Status, $result.Deleted)
+
+    return $result
+}
+
+function Invoke-ScenarioDeleteFileBasic {
+    # Does DELETE remove exactly the named file, and is the proof the list, not
+    # the status? Create two probe-owned files so a directory-wide delete would
+    # be visible as collateral damage.
+    $target = New-ProbeOwnedTextFile -Suffix 'del-basic' -Content 'delete basic target'
+    $bystander = New-ProbeOwnedTextFile -Suffix 'del-bystander' -Content 'must survive the delete'
+
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] delete-file-basic: the target could not be created'
+        return
+    }
+
+    $result = Invoke-ProbeDeleteCase -Case 'delete-file-basic' -Path $target.Path `
+        -Note 'a single probe-owned file; the bystander proves the scope'
+
+    $bystanderAfter = Get-ProbeRowOrNull -Path $bystander.Path
+
+    Add-ProbeEvidence -Case 'delete-file-basic-scope' -Status 'OBSERVED' -Data @{
+        note              = 'did deleting one path leave a sibling alone?'
+        target            = $target.Path
+        targetDeleted     = $result.Deleted
+        bystander         = $bystander.Path
+        bystanderSurvived = ($null -ne $bystanderAfter)
+    }
+    Write-ProbeLog ("[OBSERVED] delete-file-basic bystanderSurvived={0}" -f ($null -ne $bystanderAfter))
+}
+
+function Invoke-ScenarioDeleteIdempotency {
+    # A retry after an ambiguous failure must not be destructive twice. Delete
+    # the same path twice and record what the second attempt returns.
+    $target = New-ProbeOwnedTextFile -Suffix 'del-idem' -Content 'delete idempotency target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] delete-idempotency: the target could not be created'
+        return
+    }
+
+    $first = Invoke-ProbeDeleteCase -Case 'delete-idempotency-first' -Path $target.Path `
+        -Note 'the first DELETE; the file is expected to be gone afterwards'
+    $second = Invoke-ProbeDeleteCase -Case 'delete-idempotency-second' -Path $target.Path `
+        -Note 'the same DELETE again; 200/404/410 each mean something different for retry safety'
+
+    Add-ProbeEvidence -Case 'delete-idempotency-summary' -Status 'OBSERVED' -Data @{
+        note             = 'is a repeated DELETE safe to retry?'
+        path             = $target.Path
+        firstStatus      = $first.Status
+        firstDeleted     = $first.Deleted
+        secondStatus     = $second.Status
+        secondDeleted    = $second.Deleted
+        secondBody       = $second.Body
+        idempotentStatus = ($first.Status -eq $second.Status)
+    }
+    Write-ProbeLog ("[OBSERVED] delete-idempotency first={0} second={1}" -f $first.Status, $second.Status)
+}
+
+function Invoke-ScenarioDeleteAbsent {
+    # A path that never existed. This is the shape a stale plan row would take
+    # if the remote file was already deleted by someone else.
+    $absentPath = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-never-existed.txt"
+
+    $result = Invoke-ProbeDeleteCase -Case 'delete-absent' -Path $absentPath `
+        -Note 'a path that was never created; the stale-plan case'
+
+    Add-ProbeEvidence -Case 'delete-absent-summary' -Status 'OBSERVED' -Data @{
+        note      = 'DELETE of a path that never existed'
+        path      = $absentPath
+        status    = $result.Status
+        body      = $result.Body
+        deleted   = $result.Deleted
+    }
+}
+
+function Invoke-ScenarioDeleteDirectory {
+    # Does DELETE accept a directory-shaped path, and if it does, does it
+    # recurse? A real parent directory is deliberately NOT the target: binary
+    # uploads flatten every file into /uploads (#15), so the only real
+    # directory this probe could reach is the project's own /uploads, and
+    # deleting that would destroy real project files.
+    #
+    # Instead: a probe-owned nested path that does not exist as a file, plus a
+    # run-stamped file sitting in /uploads so a recursive delete would show up
+    # as collateral damage.
+    $bystander = New-ProbeOwnedTextFile -Suffix 'del-dir-bystander' -Content 'must survive a directory-shaped delete'
+    if ($null -eq $bystander.Path) {
+        Write-ProbeLog '[STOPPED] delete-directory: the bystander could not be created'
+        return
+    }
+
+    $directoryShaped = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-dir"
+    $result = Invoke-ProbeDeleteCase -Case 'delete-directory-shaped-path' -Path $directoryShaped `
+        -Note 'a directory-shaped probe-owned path that is not a file'
+
+    $bystanderAfter = Get-ProbeRowOrNull -Path $bystander.Path
+
+    Add-ProbeEvidence -Case 'delete-directory-summary' -Status 'OBSERVED' -Data @{
+        note                = 'a directory-shaped path; 404 matches absent, and the bystander proves no recursion'
+        directoryPath       = $directoryShaped
+        status              = $result.Status
+        body                = $result.Body
+        bystanderPath       = $bystander.Path
+        bystanderSurvived   = ($null -ne $bystanderAfter)
+        realUploadsDirUntouched = $true
+    }
+    Write-ProbeLog ("[OBSERVED] delete-directory status={0} bystanderSurvived={1}" -f `
+        $result.Status, ($null -ne $bystanderAfter))
+}
+
+function Invoke-ScenarioDeleteReserved {
+    # #14 saw no server-side reserved-path guard on write: .git and .rundot
+    # returned the same 404 as any absent path. Re-check on delete, where the
+    # consequence of a guard gap is larger. These paths cannot exist (nothing
+    # creates under .git or .rundot), so the finding is whether the status is
+    # a distinct "forbidden" or the same 404 as any absent path.
+    foreach ($reserved in @(
+        "/.git/$($script:ProbeNamePrefix)-delete.txt",
+        "/.rundot/$($script:ProbeNamePrefix)-delete.txt"
+    )) {
+        $result = Invoke-ProbeDeleteCase -Case "delete-reserved$($reserved.Replace('/', '-'))" -Path $reserved `
+            -Note 'a reserved-shaped path; the same 404 as absent would mean no distinct guard'
+        Write-ProbeLog ("[PROBED] delete-reserved {0} status={1}" -f $reserved, $result.Status)
+    }
+
+    Add-ProbeEvidence -Case 'delete-reserved-summary' -Status 'OBSERVED' -Data @{
+        note = 'no distinct forbidden status would mean the client must enforce reserved paths itself'
+        paths = @(
+            "/.git/$($script:ProbeNamePrefix)-delete.txt",
+            "/.rundot/$($script:ProbeNamePrefix)-delete.txt"
+        )
+    }
+}
+
+function Invoke-ScenarioDeleteEncoding {
+    # The read and write routes require an absolute, percent-encoded path. Does
+    # DELETE share that rule, and does an unencoded or traversal spelling reach
+    # a different file?
+    $target = New-ProbeOwnedTextFile -Suffix 'del-encoding' -Content 'delete encoding target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] delete-encoding: the target could not be created'
+        return
+    }
+
+    # A relative spelling must be rejected the same way write rejects it.
+    $relativeUri = New-ProbeFileUrlRaw -RawQueryValue ([System.Uri]::EscapeDataString('relative-probe.txt'))
+    Assert-ProbeWriteAllowed -Case 'delete-encoding-relative' -Method 'DELETE' -Uri $relativeUri
+    $relative = Invoke-ProbeHttp -Method 'DELETE' -Uri $relativeUri -Headers $script:Headers
+    Add-ProbeEvidence -Case 'delete-encoding-relative' -Status 'PROBED' -Data @{
+        note = 'relative path on DELETE; 400 matches the write route rule'
+        http = @{ status = $relative.Status; body = $relative.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] delete-encoding-relative status={0}" -f $relative.Status)
+
+    # A space in the path: the encoded form must address the real file, which
+    # also proves the encoder is required rather than optional.
+    $spaceName = Get-BinaryProbeName -Suffix 'del space' -Extension '.txt'
+    $space = Invoke-ProbeBinaryUpload `
+        -Case 'delete-encoding-space-create' `
+        -FileName $spaceName `
+        -Bytes (Get-Utf8NoBomBytes -Text 'space in the name') `
+        -ContentType 'text/plain' `
+        -Note 'a probe-owned file whose name contains a space'
+
+    if ($null -ne $space.recordedPath) {
+        $spaceResult = Invoke-ProbeDeleteCase -Case 'delete-encoding-space' -Path $space.recordedPath `
+            -Note 'percent-encoded space; the encoded form must address the real file'
+        Write-ProbeLog ("[PROBED] delete-encoding-space status={0}" -f $spaceResult.Status)
+    }
+
+    # A traversal spelling that is already escaped, so the URI carries the
+    # literal ../ rather than a normalized path.
+    $traversalUri = New-ProbeFileUrlRaw -RawQueryValue '/%2e%2e/escaped.txt'
+    Assert-ProbeWriteAllowed -Case 'delete-encoding-traversal' -Method 'DELETE' -Uri $traversalUri
+    $traversal = Invoke-ProbeHttp -Method 'DELETE' -Uri $traversalUri -Headers $script:Headers
+    Add-ProbeEvidence -Case 'delete-encoding-traversal' -Status 'PROBED' -Data @{
+        note = 'traversal spelling on DELETE; a 400 matches the write route rule'
+        http = @{ status = $traversal.Status; body = $traversal.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] delete-encoding-traversal status={0}" -f $traversal.Status)
+
+    # The original target was never deleted by this scenario (the relative
+    # spelling was refused, the traversal spelling named a different path, and
+    # only the space-named file was actually removed). Record that so the
+    # summary is honest, and leave the target for the run's cleanup.
+    Add-ProbeEvidence -Case 'delete-encoding-summary' -Status 'OBSERVED' -Data @{
+        note            = 'which spellings were refused, and which file was actually deleted'
+        untouchedTarget = $target.Path
+        targetStillListed = ($null -ne (Get-ProbeRowOrNull -Path $target.Path))
+        relativeStatus  = $relative.Status
+        traversalStatus = $traversal.Status
+        spaceStatus     = if ($null -ne $space.recordedPath) { $spaceResult.Status } else { $null }
+    }
+}
+
+function Invoke-ScenarioDeleteAuth {
+    # Auth on DELETE. No header and a garbage token should both be 401, the
+    # same as every other mutating route.
+    $target = New-ProbeOwnedTextFile -Suffix 'del-auth' -Content 'delete auth target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] delete-auth: the target could not be created'
+        return
+    }
+
+    $encoded = [System.Uri]::EscapeDataString($target.Path)
+    $uri = "$StudioOrigin/api/projects/$ProjectId/file?path=$encoded"
+    Assert-ProbeWriteAllowed -Case 'delete-auth-no-header' -Method 'DELETE' -Uri $uri
+
+    $noHeader = Invoke-ProbeHttp -Method 'DELETE' -Uri $uri
+    $garbage = Invoke-ProbeHttp -Method 'DELETE' -Uri $uri -Headers @{ Authorization = 'Bearer not-a-real-token' }
+
+    Add-ProbeEvidence -Case 'delete-auth' -Status 'PROBED' -Data @{
+        note              = 'DELETE with no credential and with a garbage bearer token'
+        noHeaderStatus    = $noHeader.Status
+        noHeaderBody      = $noHeader.BodyText
+        garbageStatus     = $garbage.Status
+        garbageBody       = $garbage.BodyText
+    }
+    Write-ProbeLog ("[PROBED] delete-auth noHeader={0} garbage={1}" -f $noHeader.Status, $garbage.Status)
+
+    # Neither request should have deleted anything; the authenticated delete
+    # below both proves the target still exists and cleans it up.
+    $cleanup = Invoke-ProbeDeleteCase -Case 'delete-auth-cleanup' -Path $target.Path `
+        -Note 'authenticated delete after the unauthenticated attempts; also proves they did not delete it'
+    Write-ProbeLog ("[PROBED] delete-auth-cleanup status={0} deleted={1}" -f $cleanup.Status, $cleanup.Deleted)
+}
+
+function Invoke-ScenarioDeleteResponseHeaders {
+    # Is there any identity header on a DELETE response (ETag, Last-Modified)?
+    # Select-ProbeHeaders already keeps the ones that could carry meaning.
+    $target = New-ProbeOwnedTextFile -Suffix 'del-headers' -Content 'delete header target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] delete-response-headers: the target could not be created'
+        return
+    }
+
+    $result = Invoke-ProbeDeleteFile -Path $target.Path -Case 'delete-response-headers'
+
+    Add-ProbeEvidence -Case 'delete-response-headers' -Status 'PROBED' -Data @{
+        note    = 'any ETag or Last-Modified on a DELETE response?'
+        path    = $target.Path
+        status  = $result.Status
+        headers = $result.ResponseHeaders
+        body    = $result.Body
+    }
+    Write-ProbeLog ("[PROBED] delete-response-headers status={0}" -f $result.Status)
+}
+
+
+# ---------------------------------------------------------------------------
+# Rename / move (#16)
+#
+# No rename route is documented or observed. The classifier treats the path as
+# identity, so a rename is a delete plus a create unless the server offers a
+# move. These cases try the plausible shapes and record what each did; none of
+# them is trusted on status alone. rename-devtools-* is the authoritative
+# fallback: a real Studio UI rename captured from the Network panel.
+# ---------------------------------------------------------------------------
+
+function Invoke-ProbeRenameAttempt {
+    # Send one candidate rename request and record whether the old path
+    # disappeared and whether a new path appeared. The status is never the
+    # proof: a 200 that left both paths untouched is a no-op.
+    param(
+        [string]$Case,
+        [string]$Method,
+        [string]$Uri,
+        [string]$Body,
+        [string]$OldPath,
+        [string]$NewPath,
+        [string]$Note = ''
+    )
+
+    Assert-ProbeWriteAllowed -Case $Case -Method $Method -Uri $Uri
+
+    $bodyBytes = if ([string]::IsNullOrEmpty($Body)) { [byte[]]@() } else { Get-Utf8NoBomBytes -Text $Body }
+    $response = Invoke-ProbeHttp `
+        -Method $Method `
+        -Uri $Uri `
+        -Headers $script:Headers `
+        -BodyBytes $bodyBytes `
+        -ContentType 'application/json'
+
+    Start-Sleep -Milliseconds 400
+    $oldAfter = Get-ProbeRowOrNull -Path $OldPath
+    $newAfter = Get-ProbeRowOrNull -Path $NewPath
+    $newRead = Get-ProbeReadOrNull -Path $NewPath
+
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note             = $Note
+        method           = $Method
+        uri              = $Uri
+        requestBody      = $Body
+        oldPath          = $OldPath
+        newPath          = $NewPath
+        http             = @{
+            status  = $response.Status
+            body    = $response.BodyText
+            headers = $response.ResponseHeaders
+            error   = if ($null -ne $response.TransportError) { [string]$response.TransportError.Message } else { $null }
+        }
+        oldStillListed   = ($null -ne $oldAfter)
+        newNowListed     = ($null -ne $newAfter)
+        newSha           = if ($null -ne $newRead) { $newRead.Sha256 } else { $null }
+        looksLikeARename = ($null -eq $oldAfter -and $null -ne $newAfter)
+    }
+    Write-ProbeLog ("[PROBED] {0} {1} status={2} oldGone={3} newPresent={4}" -f `
+        $Method, $Case, $response.Status, ($null -eq $oldAfter), ($null -ne $newAfter))
+
+    return [pscustomobject]@{
+        Status   = $response.Status
+        OldGone  = ($null -eq $oldAfter)
+        NewPresent = ($null -ne $newAfter)
+        Body     = $response.BodyText
+    }
+}
+
+function Invoke-ScenarioRenameProbe {
+    # Guess-and-record the rename route. Each attempt gets a freshly created
+    # probe-owned target so a failed attempt cannot contaminate the next one.
+    #
+    # HISTORICAL: every shape below failed. The real route is
+    # POST /api/projects/{id}/move with { from, to } at the project root, found
+    # by capturing a UI rename and characterized in rename-move. This scenario
+    # is kept as the record of which sub-route shapes do NOT exist, so nobody
+    # re-guesses them.
+    $shapes = @(
+        @{
+            Case   = 'rename-probe-patch-file'
+            Suffix = 'patch'
+            Method = 'PATCH'
+            Relative = "/api/projects/$ProjectId/file"
+            Body   = '{"newPath":"/sync-probe/renamed.txt"}'
+            Note   = 'PATCH on the file route with a newPath field'
+        },
+        @{
+            Case   = 'rename-probe-post-file-rename'
+            Suffix = 'postfile'
+            Method = 'POST'
+            Relative = "/api/projects/$ProjectId/file/rename"
+            Body   = '{"path":"/sync-probe/x.txt","newPath":"/sync-probe/renamed.txt"}'
+            Note   = 'POST on a file/rename sub-route'
+        },
+        @{
+            Case   = 'rename-probe-post-file-move'
+            Suffix = 'postmove'
+            Method = 'POST'
+            Relative = "/api/projects/$ProjectId/file/move"
+            Body   = '{"path":"/sync-probe/x.txt","newPath":"/sync-probe/renamed.txt"}'
+            Note   = 'POST on a file/move sub-route'
+        },
+        @{
+            Case   = 'rename-probe-post-files-rename'
+            Suffix = 'postfiles'
+            Method = 'POST'
+            Relative = "/api/projects/$ProjectId/files/rename"
+            Body   = '{"from":"/sync-probe/x.txt","to":"/sync-probe/renamed.txt"}'
+            Note   = 'POST on a files/rename sub-route with from/to spellings'
+        },
+        @{
+            Case   = 'rename-probe-put-file-newpath'
+            Suffix = 'putfile'
+            Method = 'PUT'
+            Relative = "/api/projects/$ProjectId/file"
+            Body   = '{"newPath":"/sync-probe/renamed.txt"}'
+            Note   = 'PUT on the file route with only a newPath field; the text route is overwrite-only, so this is expected to fail'
+        }
+    )
+
+    foreach ($shape in $shapes) {
+        $target = New-ProbeOwnedTextFile -Suffix "rename-$($shape.Case)" -Content "rename probe target for $($shape.Case)"
+        if ($null -eq $target.Path) {
+            Write-ProbeLog ("[STOPPED] {0}: no target could be created" -f $shape.Case)
+            continue
+        }
+
+        $oldPath = $target.Path
+        # The new name must come from the run-stamped prefix, never an ad-hoc
+        # Guid: an unstamped name is invisible to cleanup and would be orphaned.
+        $shapeSuffix = $shape.Case -replace '^rename-probe-', ''
+        $newPath = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-renamed-$shapeSuffix.txt"
+
+        # Point the candidate body at this case's real paths.
+        $body = $shape.Body `
+            -replace [regex]::Escape('/sync-probe/x.txt'), $oldPath `
+            -replace [regex]::Escape('/sync-probe/renamed.txt'), $newPath
+
+        $uri = "$StudioOrigin$($shape.Relative)?path=$([System.Uri]::EscapeDataString($oldPath))"
+        $attempt = Invoke-ProbeRenameAttempt -Case $shape.Case -Method $shape.Method -Uri $uri `
+            -Body $body -OldPath $oldPath -NewPath $newPath -Note $shape.Note
+
+        # A candidate that moved nothing leaves the target behind; delete it so
+        # the project does not accumulate one file per guessed shape.
+        if (-not $attempt.NewPresent -and $attempt.OldGone) {
+            $script:CreatedPaths.Remove($oldPath)
+        }
+        elseif (-not $attempt.OldGone) {
+            Invoke-ProbeDeleteFile -Path $oldPath -Case "rename-probe-cleanup:$($shape.Case)" | Out-Null
+        }
+        if ($attempt.NewPresent) {
+            $script:CreatedPaths.Add($newPath)
+        }
+    }
+
+    # Record the composition question explicitly: a move without a server-side
+    # rename can only be delete + create, and create is unsolved for arbitrary
+    # paths (#14/#15).
+    Add-ProbeEvidence -Case 'rename-probe-composition-note' -Status 'OBSERVED' -Data @{
+        note = 'if no candidate moved a file, a rename can only compose as delete + create, and create is unsolved for arbitrary paths'
+    }
+}
+
+function Invoke-ProbeMoveRequest {
+    # POST /api/projects/{id}/move with { from, to }. The real route, captured
+    # from the Studio UI (the guessed sub-routes in rename-probe all failed
+    # because the route is at the project root, not under /file or /files).
+    param(
+        [string]$Case,
+        [string]$From,
+        [string]$To,
+        [string]$Note = ''
+    )
+
+    $uri = New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/move"
+    Assert-ProbeWriteAllowed -Case $Case -Method 'POST' -Uri $uri
+
+    $body = @{ from = $From; to = $To } | ConvertTo-Json -Compress
+    $response = Invoke-ProbeHttp `
+        -Method 'POST' `
+        -Uri $uri `
+        -Headers $script:Headers `
+        -BodyBytes (Get-Utf8NoBomBytes -Text $body) `
+        -ContentType 'application/json'
+
+    Start-Sleep -Milliseconds 400
+    $fromAfter = Get-ProbeRowOrNull -Path $From
+    $toAfter = Get-ProbeRowOrNull -Path $To
+
+    return [pscustomobject]@{
+        Case       = $Case
+        Uri        = $uri
+        Body       = $body
+        Status     = $response.Status
+        BodyText   = $response.BodyText
+        Headers    = $response.ResponseHeaders
+        Error      = $response.TransportError
+        FromListed = ($null -ne $fromAfter)
+        ToListed   = ($null -ne $toAfter)
+        Moved      = ($null -eq $fromAfter) -and ($null -ne $toAfter)
+    }
+}
+
+function Invoke-ScenarioRenameMove {
+    # Characterize the real rename route: POST /api/projects/{id}/move with
+    # { from, to }. Found by capturing a UI rename after the guessed
+    # sub-routes in rename-probe all failed.
+    #
+    # The questions that matter for #17: does it move between arbitrary paths
+    # or only within /uploads, does it preserve bytes, does it overwrite an
+    # existing destination or collide, and is it safe to retry.
+    $target = New-ProbeOwnedTextFile -Suffix 'move-basic' -Content 'move route basic target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] rename-move: the target could not be created'
+        return
+    }
+
+    $newPath = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-moved-basic.txt"
+    $readBefore = Get-ProbeReadOrNull -Path $target.Path
+
+    $move = Invoke-ProbeMoveRequest -Case 'rename-move-basic' -From $target.Path -To $newPath `
+        -Note 'the real route: POST /move with from/to; a cross-directory move also tests whether the destination path is honored'
+
+    $readAfter = Get-ProbeReadOrNull -Path $newPath
+
+    Add-ProbeEvidence -Case 'rename-move-basic' -Status 'PROBED' -Data @{
+        note            = 'the real rename route, with a /uploads -> /sync-probe destination'
+        uri             = $move.Uri
+        requestBody     = $move.Body
+        http            = @{
+            status  = $move.Status
+            body    = $move.BodyText
+            headers = $move.Headers
+            error   = if ($null -ne $move.Error) { [string]$move.Error.Message } else { $null }
+        }
+        fromPath        = $target.Path
+        toPath          = $newPath
+        fromStillListed = $move.FromListed
+        toNowListed     = $move.ToListed
+        moved           = $move.Moved
+        shaBefore       = if ($null -ne $readBefore) { $readBefore.Sha256 } else { $null }
+        shaAfter        = if ($null -ne $readAfter) { $readAfter.Sha256 } else { $null }
+        bytesPreserved  = ($null -ne $readBefore -and $null -ne $readAfter -and
+            [string]::Equals($readBefore.Sha256, $readAfter.Sha256, [System.StringComparison]::OrdinalIgnoreCase))
+    }
+    Write-ProbeLog ("[PROBED] rename-move-basic status={0} moved={1}" -f $move.Status, $move.Moved)
+
+    if ($move.ToListed) { $script:CreatedPaths.Add($newPath) }
+    if ($move.FromListed) { $script:CreatedPaths.Add($target.Path) }
+
+    # Does the destination path get honored, or is it flattened into /uploads
+    # the way the upload flow flattens? The basic case above already asked
+    # this, but a same-directory move isolates it.
+    $sameTarget = New-ProbeOwnedTextFile -Suffix 'move-samedir' -Content 'same directory move target'
+    if ($null -ne $sameTarget.Path) {
+        $sameNew = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-moved-samedir.txt"
+        $sameMove = Invoke-ProbeMoveRequest -Case 'rename-move-same-directory' -From $sameTarget.Path -To $sameNew `
+            -Note 'a move within one directory; isolates whether the destination path is honored'
+
+        Add-ProbeEvidence -Case 'rename-move-same-directory' -Status 'PROBED' -Data @{
+            note            = 'does /move honor a destination path, or flatten it?'
+            requestBody     = $sameMove.Body
+            http            = @{ status = $sameMove.Status; body = $sameMove.BodyText }
+            fromPath        = $sameTarget.Path
+            toPath          = $sameNew
+            fromStillListed = $sameMove.FromListed
+            toNowListed     = $sameMove.ToListed
+            moved           = $sameMove.Moved
+            destinationHonored = [string]::Equals($sameNew, $sameNew, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        Write-ProbeLog ("[PROBED] rename-move-same-directory status={0} moved={1}" -f $sameMove.Status, $sameMove.Moved)
+
+        if ($sameMove.ToListed) { $script:CreatedPaths.Add($sameNew) }
+        if ($sameMove.FromListed) { $script:CreatedPaths.Add($sameTarget.Path) }
+    }
+
+    # Failure shapes: a missing source, and a retry of an already-completed move.
+    $absentFrom = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-move-never-existed.txt"
+    $absentTo = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-move-absent-dest.txt"
+    $absent = Invoke-ProbeMoveRequest -Case 'rename-move-from-absent' -From $absentFrom -To $absentTo `
+        -Note 'a from path that does not exist; is it a 404 or a silent no-op?'
+
+    Add-ProbeEvidence -Case 'rename-move-from-absent' -Status 'PROBED' -Data @{
+        note            = 'moving a path that does not exist'
+        requestBody     = $absent.Body
+        http            = @{ status = $absent.Status; body = $absent.BodyText }
+        fromStillListed = $absent.FromListed
+        toNowListed     = $absent.ToListed
+    }
+    Write-ProbeLog ("[PROBED] rename-move-from-absent status={0}" -f $absent.Status)
+
+    # Retry: the same move a second time. Retry safety matters for #17.
+    $retryTarget = New-ProbeOwnedTextFile -Suffix 'move-retry' -Content 'move retry target'
+    if ($null -ne $retryTarget.Path) {
+        $retryNew = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-moved-retry.txt"
+        $first = Invoke-ProbeMoveRequest -Case 'rename-move-retry-first' -From $retryTarget.Path -To $retryNew `
+            -Note 'first move'
+        $second = Invoke-ProbeMoveRequest -Case 'rename-move-retry-second' -From $retryTarget.Path -To $retryNew `
+            -Note 'the same move again; the source is now gone, so this is the retry-after-ambiguous-failure shape'
+
+        Add-ProbeEvidence -Case 'rename-move-retry-summary' -Status 'OBSERVED' -Data @{
+            note        = 'is a repeated move safe, and does the destination survive?'
+            firstStatus = $first.Status
+            secondStatus = $second.Status
+            secondBody  = $second.BodyText
+            destinationStillListed = $second.ToListed
+            idempotentStatus = ($first.Status -eq $second.Status)
+        }
+        Write-ProbeLog ("[OBSERVED] rename-move-retry first={0} second={1}" -f $first.Status, $second.Status)
+
+        if ($second.ToListed) { $script:CreatedPaths.Add($retryNew) }
+        if ($second.FromListed) { $script:CreatedPaths.Add($retryTarget.Path) }
+    }
+
+    # Does a move overwrite an existing destination, or collide like the upload
+    # flow does? This decides whether a move can clobber a file silently.
+    $clobberFrom = New-ProbeOwnedTextFile -Suffix 'move-clobber-src' -Content 'clobber source content'
+    $clobberTo = New-ProbeOwnedTextFile -Suffix 'move-clobber-dst' -Content 'clobber destination content'
+    if ($null -ne $clobberFrom.Path -and $null -ne $clobberTo.Path) {
+        $destReadBefore = Get-ProbeReadOrNull -Path $clobberTo.Path
+        $clobber = Invoke-ProbeMoveRequest -Case 'rename-move-onto-existing' -From $clobberFrom.Path -To $clobberTo.Path `
+            -Note 'move onto an existing path; overwrite, collision-rename, or refuse?'
+
+        $destReadAfter = Get-ProbeReadOrNull -Path $clobberTo.Path
+        Add-ProbeEvidence -Case 'rename-move-onto-existing' -Status 'PROBED' -Data @{
+            note             = 'the destination already existed'
+            requestBody      = $clobber.Body
+            http             = @{ status = $clobber.Status; body = $clobber.BodyText }
+            fromPath         = $clobberFrom.Path
+            toPath           = $clobberTo.Path
+            fromStillListed  = $clobber.FromListed
+            toStillListed    = $clobber.ToListed
+            destShaBefore    = if ($null -ne $destReadBefore) { $destReadBefore.Sha256 } else { $null }
+            destShaAfter     = if ($null -ne $destReadAfter) { $destReadAfter.Sha256 } else { $null }
+            destOverwritten  = ($null -ne $destReadBefore -and $null -ne $destReadAfter -and
+                -not [string]::Equals($destReadBefore.Sha256, $destReadAfter.Sha256, [System.StringComparison]::OrdinalIgnoreCase))
+        }
+        Write-ProbeLog ("[PROBED] rename-move-onto-existing status={0} overwritten={1}" -f `
+            $clobber.Status, $clobber.Status)
+
+        if ($clobber.FromListed) { $script:CreatedPaths.Add($clobberFrom.Path) }
+        if ($clobber.ToListed) { $script:CreatedPaths.Add($clobberTo.Path) }
+    }
+
+    # Binary: does a move work on a binary file too, or only text?
+    $binName = Get-BinaryProbeName -Suffix 'move-binary'
+    $binUpload = Invoke-ProbeBinaryUpload -Case 'rename-move-binary-create' -FileName $binName `
+        -Bytes (Get-BinaryProbeBytes -Variant 13) `
+        -Note 'a binary target for the move route'
+    if ($null -ne $binUpload.recordedPath) {
+        $binNew = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-moved-binary.png"
+        $binReadBefore = Get-ProbeReadOrNull -Path $binUpload.recordedPath
+        $binMove = Invoke-ProbeMoveRequest -Case 'rename-move-binary' -From $binUpload.recordedPath -To $binNew `
+            -Note 'does the move route accept a binary file?'
+        $binReadAfter = Get-ProbeReadOrNull -Path $binNew
+
+        Add-ProbeEvidence -Case 'rename-move-binary' -Status 'PROBED' -Data @{
+            note            = 'a binary move; the upload flow cannot target a path, so this is the only way to relocate a binary'
+            requestBody     = $binMove.Body
+            http            = @{ status = $binMove.Status; body = $binMove.BodyText }
+            fromPath        = $binUpload.recordedPath
+            toPath          = $binNew
+            fromStillListed = $binMove.FromListed
+            toNowListed     = $binMove.ToListed
+            moved           = $binMove.Moved
+            shaBefore       = if ($null -ne $binReadBefore) { $binReadBefore.Sha256 } else { $null }
+            shaAfter        = if ($null -ne $binReadAfter) { $binReadAfter.Sha256 } else { $null }
+            bytesPreserved  = ($null -ne $binReadBefore -and $null -ne $binReadAfter -and
+                [string]::Equals($binReadBefore.Sha256, $binReadAfter.Sha256, [System.StringComparison]::OrdinalIgnoreCase))
+        }
+        Write-ProbeLog ("[PROBED] rename-move-binary status={0} moved={1}" -f $binMove.Status, $binMove.Moved)
+
+        if ($binMove.ToListed) { $script:CreatedPaths.Add($binNew) }
+        if ($binMove.FromListed) { $script:CreatedPaths.Add($binUpload.recordedPath) }
+    }
+}
+
+function Invoke-ScenarioRenameDevToolsPrepare {
+    # Mirrors text-concurrency-prepare: write a probe-owned target, then hand
+    # the human a precise instruction. The rename route has no documented
+    # shape, so a real UI rename captured from DevTools is the authoritative
+    # source when the guessed candidates fail.
+    #
+    # The content is unique per run so the file can be located by hash
+    # afterwards even if the human gives it an unrelated name.
+    $target = New-ProbeOwnedTextFile -Suffix 'rename-devtools'
+
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] rename-devtools-prepare: the target could not be created'
+        return
+    }
+
+    # The new name should keep the run stamp, because the delete guard only
+    # accepts a stamped /uploads path. A name without it is still detected by
+    # hash, but cannot be deleted automatically.
+    $suggestedName = "$($script:ProbeNamePrefix)-renamed.txt"
+
+    $stateFile = Join-Path $OutDir 'probe-rename-state.json'
+    @{
+        path       = $target.Path
+        sha256     = $target.Sha256
+        runStamp   = $script:ProbeRunStamp
+        preparedAt = (Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $stateFile -Encoding UTF8
+
+    Add-ProbeEvidence -Case 'rename-devtools-prepare' -Status 'PROBED' -Data @{
+        note          = 'target written; rename it by hand in Studio with DevTools open'
+        path          = $target.Path
+        sha256        = $target.Sha256
+        runStamp      = $script:ProbeRunStamp
+        suggestedName = $suggestedName
+        stateFile     = $stateFile
+    }
+
+    Write-ProbeLog ''
+    Write-ProbeLog 'NEXT (human step):'
+    Write-ProbeLog "  1. In Studio, rename $($target.Path)"
+    Write-ProbeLog "     Suggested new name: $suggestedName"
+    Write-ProbeLog '     Keep the probe-<stamp> prefix: a stamped name can be deleted'
+    Write-ProbeLog '     automatically, and a name without it has to be removed by hand.'
+    Write-ProbeLog '  2. With DevTools > Network open, repeat the rename if needed.'
+    Write-ProbeLog '     Right-click the rename request > Copy > Copy as fetch.'
+    Write-ProbeLog '     For the response too, use Save all as HAR instead.'
+    Write-ProbeLog '  3. Save that text to a file, e.g. %TEMP%\rundot-rename-capture.txt'
+    Write-ProbeLog '  4. Run -Scenario rename-devtools-apply -CapturePath <that file>'
+    Write-ProbeLog ''
+    Write-ProbeLog 'The apply step locates the file by content hash and deletes it, so the'
+    Write-ProbeLog 'project is left clean. Do not delete it yourself before running apply.'
+    Write-ProbeLog ''
+}
+
+function Invoke-ScenarioRenameDevToolsApply {
+    # Read the human's captured request and record the real route, method, and
+    # body. The capture is never parsed into a replayed request: it is evidence
+    # about the shape, and a probe that replayed a copied auth header would be
+    # storing a credential.
+    #
+    # This runs in a SEPARATE process from rename-devtools-prepare, so the
+    # per-process run stamp is useless here. The prepare run's stamp is read
+    # back out of the state file's path, and the renamed file is located by
+    # CONTENT HASH rather than by name: the human picks the new name, and a
+    # copy-as-fetch capture does not reliably show the path the server recorded.
+    param([string]$CapturePath)
+
+    $stateFile = Join-Path $OutDir 'probe-rename-state.json'
+    $state = $null
+    if (Test-Path -LiteralPath $stateFile) {
+        $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+    }
+
+    $oldPath = if ($null -ne $state) { [string]$state.path } else { $null }
+    $oldSha = if ($null -ne $state) { [string]$state.sha256 } else { $null }
+
+    # Recover the prepare run's stamp from the path it wrote. A filename built
+    # by Get-BinaryProbeName looks like probe-<yyyyMMdd-HHmmss>-<suffix>.txt.
+    $prepareStamp = $null
+    if (-not [string]::IsNullOrWhiteSpace($oldPath)) {
+        $stampMatch = [regex]::Match($oldPath, 'probe-(\d{8}-\d{6})')
+        if ($stampMatch.Success) { $prepareStamp = $stampMatch.Groups[1].Value }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($prepareStamp)) {
+        Add-ProbeEvidence -Case 'rename-devtools-apply' -Status 'STOPPED' -Data @{
+            note      = 'the prepare state file is missing or names no run-stamped path'
+            stateFile = $stateFile
+            oldPath   = $oldPath
+        }
+        Write-ProbeLog ("[STOPPED] rename-devtools-apply: run rename-devtools-prepare first; {0} is missing or unusable." -f $stateFile)
+        return
+    }
+
+    $oldStillListed = $null -ne (Get-ProbeRowOrNull -Path $oldPath)
+
+    # Every probe path from the PREPARE run, not this one.
+    $ownedNow = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$prepareStamp*" })
+
+    # Locate the renamed file by content. The path may have changed, the bytes
+    # did not, so a hash match identifies it without trusting the new name.
+    $renamedPath = $null
+    $hashMatches = @()
+    foreach ($candidate in $ownedNow) {
+        if ($null -ne $oldPath -and [string]::Equals($candidate, $oldPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $read = Get-ProbeReadOrNull -Path $candidate
+        if ($null -eq $read) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($oldSha) -and
+            [string]::Equals($read.Sha256, $oldSha, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $hashMatches += $candidate
+            if ($null -eq $renamedPath) { $renamedPath = $candidate }
+        }
+    }
+
+    $captureText = $null
+    $captureLines = $null
+    $captureRoutes = $null
+    $captureHadResponse = $false
+    if (-not [string]::IsNullOrWhiteSpace($CapturePath) -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
+        $captureText = (Get-Content -LiteralPath $CapturePath -Raw)
+        # Record the request shape only. A copied fetch carries an
+        # Authorization header, which must never reach evidence, and a HAR
+        # carries the whole exchange, so anything credential-shaped is
+        # redacted rather than recorded.
+        #
+        # The method/URL pairs are extracted explicitly. Matching on "method"
+        # alone is not enough: the URL lives on its own line, so a naive filter
+        # records that a request happened without recording where it went,
+        # which is the one thing this scenario exists to capture.
+        $redact = {
+            param([string]$Text)
+            $t = $Text
+            $t = $t -replace '(?i)(authorization|bearer|token|cookie|api[-_]?key)("?\s*[:=]\s*"?)[^",\s]+', '$1$2<redacted>'
+            $t = $t -replace 'eyJ[A-Za-z0-9_\-]{5,}', '<redacted-jwt>'
+            return $t
+        }
+
+        $captureLines = @($captureText -split "`r?`n" |
+            Where-Object { $_ -match '(?i)fetch\(|"method"|"url"|\bmethod:|https?://' } |
+            Select-Object -First 60 |
+            ForEach-Object { & $redact $_ })
+
+        # The route index: every URL with its method, so the evidence names the
+        # real route rather than just proving that some request occurred.
+        #
+        # The URL is read ONLY from a fetch() call or a HAR "url" field. A
+        # blanket https?:// match picks up the "referrer" line, which sits
+        # between the URL and the method in a copied fetch and would replace
+        # the real route with "https://run.world/".
+        $routes = New-Object 'System.Collections.Generic.List[object]'
+        $lastUrl = $null
+        foreach ($line in ($captureText -split "`r?`n")) {
+            $fetchMatch = [regex]::Match($line, 'fetch\(\s*[''"](https?://[^''"]+)[''"]')
+            $harUrlMatch = [regex]::Match($line, '"(?:url|requestUrl)"\s*:\s*"(https?://[^"]+)"')
+
+            if ($fetchMatch.Success) {
+                $lastUrl = & $redact $fetchMatch.Groups[1].Value
+                continue
+            }
+            if ($harUrlMatch.Success) {
+                $lastUrl = & $redact $harUrlMatch.Groups[1].Value
+                continue
+            }
+
+            $methodMatch = [regex]::Match($line, '"method"\s*:\s*"([A-Za-z]+)"')
+            if ($methodMatch.Success -and $null -ne $lastUrl) {
+                $routes.Add([pscustomobject]@{
+                    method = $methodMatch.Groups[1].Value
+                    url    = $lastUrl
+                })
+                $lastUrl = $null
+            }
+        }
+        $captureRoutes = $routes.ToArray()
+        $captureHadResponse = ($captureText -match '(?i)"status"\s*:')
+    }
+
+    Add-ProbeEvidence -Case 'rename-devtools-apply' -Status 'OBSERVED' -Data @{
+        note              = 'the real rename route, as captured from the Studio UI'
+        prepareStamp      = $prepareStamp
+        oldPath           = $oldPath
+        oldStillListed    = $oldStillListed
+        oldSha256         = $oldSha
+        ownedPathsNow     = $ownedNow
+        renamedPathByHash = $renamedPath
+        hashMatches       = $hashMatches
+        contentMoved      = ($null -ne $renamedPath)
+        captureProvided   = (-not [string]::IsNullOrWhiteSpace($captureText))
+        captureHadResponse = $captureHadResponse
+        captureRoutes     = $captureRoutes
+        captureLines      = $captureLines
+    }
+
+    Write-ProbeLog ("[OBSERVED] rename-devtools-apply oldStillListed={0} prepareStamp={1}" -f $oldStillListed, $prepareStamp)
+    if ($null -ne $renamedPath) {
+        Write-ProbeLog ("[OBSERVED] rename-devtools-apply the bytes now live at {0} (matched by content hash)" -f $renamedPath)
+    }
+    elseif ($oldStillListed) {
+        Write-ProbeLog '[OBSERVED] rename-devtools-apply: the original path is still listed and no hash match appeared; the rename may not have happened, or the file was moved out of /uploads.'
+    }
+    if ($null -eq $captureText) {
+        Write-ProbeLog '[WARNING] rename-devtools-apply: no -CapturePath was given, so only the path change was recorded.'
+    }
+    elseif (-not $captureHadResponse) {
+        Write-ProbeLog '[NOTE] rename-devtools-apply: the capture looks like a request only (copy-as-fetch), so the response body is not in it.'
+        Write-ProbeLog '       If the renamed path is unknown, re-capture with DevTools > Network > right-click > Save all as HAR.'
+    }
+
+    # Leave the project as found. The renamed file is deletable only when it
+    # kept a run-stamped name under /uploads, because that is all the delete
+    # guard accepts. Anything else is reported for manual removal rather than
+    # forced, so the guard is never weakened for convenience.
+    $cleanupTargets = @()
+    if ($null -ne $renamedPath) { $cleanupTargets += $renamedPath }
+    if ($oldStillListed) { $cleanupTargets += $oldPath }
+
+    $deleted = @()
+    $manual = @()
+    foreach ($cleanupPath in ($cleanupTargets | Sort-Object -Unique)) {
+        try {
+            # The prepare run's stamp is the one on these files, and it is
+            # recovered above, so it is passed as the explicit allowance.
+            $result = Invoke-ProbeDeleteFile -Path $cleanupPath -Case "rename-devtools-cleanup" `
+                -AllowedStamp @($prepareStamp)
+            if ($result.Deleted) {
+                $deleted += $cleanupPath
+            }
+            else {
+                $manual += $cleanupPath
+            }
+        }
+        catch {
+            # The delete guard refused it, which means the human renamed the
+            # file to a name the probe does not own. That is expected, not an
+            # error, so record it for manual cleanup instead of failing.
+            $manual += $cleanupPath
+        }
+    }
+
+    Add-ProbeEvidence -Case 'rename-devtools-cleanup' -Status 'OBSERVED' -Data @{
+        note           = 'the hand-off leaves the project as found where the guard allows it'
+        attempted      = @($cleanupTargets | Sort-Object -Unique)
+        deleted        = $deleted
+        needsManual    = $manual
+    }
+
+    if ($deleted.Count -gt 0) {
+        Write-ProbeLog ("[CLEANUP] rename-devtools-apply deleted {0} path(s)." -f $deleted.Count)
+    }
+    if ($manual.Count -gt 0) {
+        Write-ProbeLog '[CLEANUP] rename-devtools-apply could not delete these; remove them in the Studio UI:'
+        foreach ($path in $manual) { Write-ProbeLog "  $path" }
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# Concurrency, revision identity, ETag, and conditional delete (#16)
+#
+# #14 proved a stale PUT silently clobbers a concurrent Studio edit and that
+# no ETag / version / If-Match exists on the text route. #16 extends that to
+# the delete and rename verbs and to the response headers themselves.
+# ---------------------------------------------------------------------------
+
+function Invoke-ScenarioConcurrencyDeleteVsWrite {
+    # A plan row computed against a file that is then deleted remotely: does
+    # the stale write 404 (safe) or resurrect the file (a silent undelete)?
+    $target = New-ProbeOwnedTextFile -Suffix 'conc-delwrite' -Content 'concurrency delete-vs-write target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] concurrency-delete-vs-write: the target could not be created'
+        return
+    }
+
+    $staleRead = Get-ProbeReadOrNull -Path $target.Path
+    $staleText = if ($null -ne $staleRead) { [string]$staleRead.Content } else { 'stale content' }
+
+    $deleted = Invoke-ProbeDeleteFile -Path $target.Path -Case 'concurrency-delete-vs-write-delete'
+    $goneAfterDelete = $null -eq (Get-ProbeRowOrNull -Path $target.Path)
+
+    # Now send the bytes that were read before the delete.
+    $putResponse = Invoke-ProbeTextPut `
+        -Path $target.Path `
+        -ContentBytes (New-JsonContentBody -Text $staleText)
+
+    Start-Sleep -Milliseconds 400
+    $afterRead = Get-ProbeReadOrNull -Path $target.Path
+    $afterRow = Get-ProbeRowOrNull -Path $target.Path
+
+    $resurrected = $null -ne $afterRow
+
+    Add-ProbeEvidence -Case 'concurrency-delete-vs-write' -Status 'PROBED' -Data @{
+        note             = 'a write computed before a remote delete; 404 is safe, a re-created file is a silent undelete'
+        path             = $target.Path
+        deleteStatus     = $deleted.Status
+        goneAfterDelete  = $goneAfterDelete
+        putStatus        = $putResponse.Status
+        putBody          = $putResponse.BodyText
+        listedAfterPut   = $resurrected
+        shaAfterPut      = if ($null -ne $afterRead) { $afterRead.Sha256 } else { $null }
+        resurrected      = $resurrected
+    }
+    Write-ProbeLog ("[PROBED] concurrency-delete-vs-write delete={0} put={1} resurrected={2}" -f `
+        $deleted.Status, $putResponse.Status, $resurrected)
+
+    if ($resurrected) { $script:CreatedPaths.Add($target.Path) }
+}
+
+function Invoke-ScenarioConcurrencyDeleteWhileListed {
+    # The #17-relevant window: capture the list, delete a path, then compare
+    # the list fingerprint. This is the client-side check that must run before
+    # any write, because the server cannot refuse a stale one.
+    $target = New-ProbeOwnedTextFile -Suffix 'conc-window' -Content 'concurrency window target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] concurrency-delete-while-listed: the target could not be created'
+        return
+    }
+
+    $fingerprintBefore = Get-ProbeListFingerprint
+    $rowBefore = Get-ProbeRowOrNull -Path $target.Path
+
+    $deleted = Invoke-ProbeDeleteFile -Path $target.Path -Case 'concurrency-delete-while-listed-delete'
+
+    Start-Sleep -Milliseconds 400
+    $fingerprintAfter = Get-ProbeListFingerprint
+    $rowAfter = Get-ProbeRowOrNull -Path $target.Path
+
+    Add-ProbeEvidence -Case 'concurrency-delete-while-listed' -Status 'PROBED' -Data @{
+        note                 = 'a captured list is invalidated by a delete; the fingerprint must move'
+        path                 = $target.Path
+        listedBefore         = ($null -ne $rowBefore)
+        deleteStatus         = $deleted.Status
+        listedAfter          = ($null -ne $rowAfter)
+        fingerprintBefore    = $fingerprintBefore
+        fingerprintAfter     = $fingerprintAfter
+        fingerprintChanged   = (-not [string]::Equals($fingerprintBefore, $fingerprintAfter, [System.StringComparison]::OrdinalIgnoreCase))
+    }
+    Write-ProbeLog ("[PROBED] concurrency-delete-while-listed fingerprintChanged={0}" -f `
+        (-not [string]::Equals($fingerprintBefore, $fingerprintAfter, [System.StringComparison]::OrdinalIgnoreCase)))
+}
+
+function Invoke-ScenarioRevisionIdentity {
+    # Tighten #14's finding: the only fields a text row exposes are path, type,
+    # and size. Diff the field set across create, overwrite, and delete so a
+    # newly added identity field would be caught rather than assumed away.
+    $target = New-ProbeOwnedTextFile -Suffix 'revision' -Content 'revision identity baseline'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] revision-identity: the target could not be created'
+        return
+    }
+
+    $afterCreate = Get-ProbeRowFingerprint -Row (Get-ProbeRowOrNull -Path $target.Path)
+
+    $overwrite = Invoke-ProbeTextPut -Path $target.Path `
+        -ContentBytes (New-JsonContentBody -Text "revision identity overwrite $([Guid]::NewGuid().ToString('N'))")
+    Start-Sleep -Milliseconds 300
+    $afterOverwrite = Get-ProbeRowFingerprint -Row (Get-ProbeRowOrNull -Path $target.Path)
+
+    $beforeDelete = Get-ProbeRowFingerprint -Row (Get-ProbeRowOrNull -Path $target.Path)
+    $deleted = Invoke-ProbeDeleteFile -Path $target.Path -Case 'revision-identity-delete'
+    $afterDeleteRow = Get-ProbeRowOrNull -Path $target.Path
+
+    $allNames = @()
+    foreach ($set in @($afterCreate, $afterOverwrite, $beforeDelete)) {
+        if ($null -ne $set) { $allNames += @($set.Keys) }
+    }
+
+    Add-ProbeEvidence -Case 'revision-identity' -Status 'OBSERVED' -Data @{
+        note              = 'the field set a text row exposes across create, overwrite, and delete'
+        path              = $target.Path
+        fieldsAfterCreate = $afterCreate
+        fieldsAfterWrite  = $afterOverwrite
+        fieldsBeforeDelete = $beforeDelete
+        fieldNames        = @($allNames | Sort-Object -Unique)
+        hasIdentityField  = [bool](@($allNames | Where-Object {
+            $_ -match '(?i)^(etag|hash|sha256|contentHash|version|revision|id|updatedAt)$'
+        }).Count -gt 0)
+        overwriteStatus   = $overwrite.Status
+        deleteStatus      = $deleted.Status
+        listedAfterDelete = ($null -ne $afterDeleteRow)
+    }
+    Write-ProbeLog ("[OBSERVED] revision-identity fields: {0}" -f (($allNames | Sort-Object -Unique) -join ', '))
+}
+
+function Invoke-ScenarioEtagHeaders {
+    # Record whether any response carries an ETag or Last-Modified, across read,
+    # list, write, and delete. Select-ProbeHeaders keeps ETag already; add
+    # Last-Modified here so the check is explicit.
+    $target = New-ProbeOwnedTextFile -Suffix 'etag' -Content 'etag header target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] etag-headers: the target could not be created'
+        return
+    }
+
+    # GET /file
+    $fileUri = New-ProbeFileUrl -Path $target.Path
+    $fileGet = Invoke-ProbeHttp -Method 'GET' -Uri $fileUri -Headers $script:Headers
+
+    # GET /files
+    $listUri = New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/files"
+    $listGet = Invoke-ProbeHttp -Method 'GET' -Uri $listUri -Headers $script:Headers
+
+    # PUT /file
+    $put = Invoke-ProbeTextPut -Path $target.Path `
+        -ContentBytes (New-JsonContentBody -Text 'etag header write')
+
+    # DELETE /file
+    $delete = Invoke-ProbeDeleteFile -Path $target.Path -Case 'etag-headers-delete'
+
+    Add-ProbeEvidence -Case 'etag-headers' -Status 'PROBED' -Data @{
+        note            = 'any identity header on read, list, write, or delete?'
+        path            = $target.Path
+        getFileHeaders  = $fileGet.ResponseHeaders
+        getFilesHeaders = $listGet.ResponseHeaders
+        putHeaders      = $put.ResponseHeaders
+        deleteHeaders   = $delete.ResponseHeaders
+        putStatus       = $put.Status
+        deleteStatus    = $delete.Status
+    }
+    Write-ProbeLog '[PROBED] etag-headers recorded for read, list, write, and delete'
+}
+
+function Invoke-ScenarioConditionalDelete {
+    # #14 tested If-Match on PUT and found it ignored. The delete verb is the
+    # one precondition that could still exist, and it is the one that matters
+    # most: an enforced If-Match on DELETE would let #17 refuse a stale delete.
+    $target = New-ProbeOwnedTextFile -Suffix 'cond-del' -Content 'conditional delete target'
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] conditional-delete: the target could not be created'
+        return
+    }
+
+    $row = Get-ProbeRowOrNull -Path $target.Path
+    $fields = Get-ProbeRowFingerprint -Row $row
+    $etagCandidate = $null
+    if ($null -ne $fields) {
+        foreach ($candidate in @('etag', 'version', 'revision', 'id')) {
+            if ($fields.Contains($candidate)) { $etagCandidate = $fields[$candidate]; break }
+        }
+    }
+
+    $cases = @(
+        @{ Case = 'conditional-delete-if-match-wrong'; Value = '"definitely-not-the-current-etag"'; Note = 'a value that cannot match; 412 would mean the header is enforced' },
+        @{ Case = 'conditional-delete-if-match-garbage'; Value = 'not-an-etag'; Note = 'malformed If-Match' },
+        @{ Case = 'conditional-delete-if-none-match-star'; Value = '*'; Note = 'If-None-Match: * against an existing resource' }
+    )
+
+    $allDeleted = $true
+    foreach ($case in $cases) {
+        # Each case needs its own file, since an honoured precondition would
+        # leave the target in place and a delete would remove it.
+        $caseTarget = New-ProbeOwnedTextFile -Suffix "cond-del-$($case.Case)" -Content "target for $($case.Case)"
+        if ($null -eq $caseTarget.Path) { continue }
+
+        $headerName = if ($case.Case -like '*if-none-match*') { 'If-None-Match' } else { 'If-Match' }
+        $result = Invoke-ProbeDeleteFile -Path $caseTarget.Path `
+            -ExtraHeaders @{ $headerName = $case.Value } `
+            -Case $case.Case
+
+        $stillListed = $null -ne (Get-ProbeRowOrNull -Path $caseTarget.Path)
+        if ($stillListed) { $allDeleted = $false }
+
+        Add-ProbeEvidence -Case $case.Case -Status 'PROBED' -Data @{
+            note        = $case.Note
+            path        = $caseTarget.Path
+            header      = $headerName
+            headerValue = $case.Value
+            status      = $result.Status
+            body        = $result.Body
+            stillListed = $stillListed
+            enforced    = $stillListed
+        }
+        Write-ProbeLog ("[PROBED] {0} status={1} stillListed={2}" -f $case.Case, $result.Status, $stillListed)
+    }
+
+    Add-ProbeEvidence -Case 'conditional-delete-summary' -Status 'OBSERVED' -Data @{
+        note             = 'no precondition was enforced if every delete succeeded'
+        etagCandidate    = $etagCandidate
+        anyPreconditionEnforced = (-not $allDeleted)
+    }
+}
+
+
+# ---------------------------------------------------------------------------
 # Whole-investigation runners
 #
 # One command per issue instead of seven, for the human running the probe.
@@ -2968,6 +4356,45 @@ function Invoke-ScenarioRunBinaryAll {
     }
 }
 
+function Invoke-ScenarioRunDeleteRenameAll {
+    # The #16 characterization, in evidence order: establish the delete verb
+    # and its failure shapes, then the identity and concurrency questions that
+    # decide what #17 may do with a DELETE, then try to find a rename route.
+    Invoke-ProbeStep 'delete-file-basic' { Invoke-ScenarioDeleteFileBasic }
+    Invoke-ProbeStep 'delete-idempotency' { Invoke-ScenarioDeleteIdempotency }
+    Invoke-ProbeStep 'delete-absent' { Invoke-ScenarioDeleteAbsent }
+    Invoke-ProbeStep 'delete-directory' { Invoke-ScenarioDeleteDirectory }
+    Invoke-ProbeStep 'delete-reserved' { Invoke-ScenarioDeleteReserved }
+    Invoke-ProbeStep 'delete-encoding' { Invoke-ScenarioDeleteEncoding }
+    Invoke-ProbeStep 'delete-auth' { Invoke-ScenarioDeleteAuth }
+    Invoke-ProbeStep 'delete-response-headers' { Invoke-ScenarioDeleteResponseHeaders }
+    Invoke-ProbeStep 'revision-identity' { Invoke-ScenarioRevisionIdentity }
+    Invoke-ProbeStep 'etag-headers' { Invoke-ScenarioEtagHeaders }
+    Invoke-ProbeStep 'conditional-delete' { Invoke-ScenarioConditionalDelete }
+    Invoke-ProbeStep 'concurrency-delete-while-listed' { Invoke-ScenarioConcurrencyDeleteWhileListed }
+    Invoke-ProbeStep 'concurrency-delete-vs-write' { Invoke-ScenarioConcurrencyDeleteVsWrite }
+    Invoke-ProbeStep 'rename-move' { Invoke-ScenarioRenameMove }
+    Invoke-ProbeStep 'rename-probe' { Invoke-ScenarioRenameProbe }
+    Invoke-ProbeStep 'delete-rename-survey' { Invoke-ScenarioSurvey }
+
+    # Cleanup last, so a full run leaves the project as it found it. Pass
+    # -SkipCleanup to keep the artifacts for inspection.
+    if (-not $SkipCleanup) {
+        Invoke-ProbeStep 'binary-cleanup' { Invoke-ScenarioBinaryCleanup }
+    }
+    else {
+        Write-ProbeLog ''
+        Write-ProbeLog '[SKIPPED] binary-cleanup: -SkipCleanup was set; the created paths remain.'
+    }
+
+    # The rename hand-off is deliberately not automated: it needs a human in
+    # the Studio UI. Print the instruction rather than silently skipping it.
+    Write-ProbeLog ''
+    Write-ProbeLog 'MANUAL STEP for rename (not run by this runner):'
+    Write-ProbeLog '  -Scenario rename-devtools-prepare  (creates a target and prints instructions)'
+    Write-ProbeLog '  ...rename that path by hand in Studio, then -Scenario rename-devtools-apply -CapturePath <file>.'
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -2995,8 +4422,27 @@ switch ($Scenario) {
     'binary-idempotency'         { Invoke-ScenarioBinaryIdempotency }
     'binary-failure'             { Invoke-ScenarioBinaryFailure }
     'binary-survey'              { Invoke-ScenarioSurvey }
+    'delete-file-basic'          { Invoke-ScenarioDeleteFileBasic }
+    'delete-idempotency'         { Invoke-ScenarioDeleteIdempotency }
+    'delete-absent'              { Invoke-ScenarioDeleteAbsent }
+    'delete-directory'           { Invoke-ScenarioDeleteDirectory }
+    'delete-reserved'            { Invoke-ScenarioDeleteReserved }
+    'delete-encoding'            { Invoke-ScenarioDeleteEncoding }
+    'delete-auth'                { Invoke-ScenarioDeleteAuth }
+    'delete-response-headers'    { Invoke-ScenarioDeleteResponseHeaders }
+    'rename-probe'               { Invoke-ScenarioRenameProbe }
+    'rename-move'                { Invoke-ScenarioRenameMove }
+    'rename-devtools-prepare'    { Invoke-ScenarioRenameDevToolsPrepare }
+    'rename-devtools-apply'      { Invoke-ScenarioRenameDevToolsApply -CapturePath $CapturePath }
+    'concurrency-delete-vs-write' { Invoke-ScenarioConcurrencyDeleteVsWrite }
+    'concurrency-delete-while-listed' { Invoke-ScenarioConcurrencyDeleteWhileListed }
+    'revision-identity'          { Invoke-ScenarioRevisionIdentity }
+    'etag-headers'               { Invoke-ScenarioEtagHeaders }
+    'conditional-delete'         { Invoke-ScenarioConditionalDelete }
+    'delete-rename-survey'       { Invoke-ScenarioSurvey }
     'run-text-all'               { Invoke-ScenarioRunTextAll }
     'run-binary-all'             { Invoke-ScenarioRunBinaryAll }
+    'run-delete-rename-all'      { Invoke-ScenarioRunDeleteRenameAll }
     default {
         throw "Scenario '$Scenario' is not implemented."
     }

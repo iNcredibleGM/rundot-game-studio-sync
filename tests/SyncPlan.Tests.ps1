@@ -453,9 +453,9 @@ try {
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"
     Assert-Equal $false $binaryUpload.applicable "a binary upload must not be applicable"
     Assert-Equal `
-        'Remote binary replacement semantics are unverified.' `
+        'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
         ([string]$binaryUpload.reason) `
-        "a binary upload must keep the fixed unverified-semantics reason"
+        "a binary upload must keep the fixed replacement-impossible reason"
 
     $download = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/dl.ts'
     Assert-Equal 'download' $download.status "a remote-only change keeps the download status"
