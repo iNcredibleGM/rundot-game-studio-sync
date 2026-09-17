@@ -35,6 +35,10 @@ $httpPutPattern = '(?i)(?:-Method\s+[''"]?PUT\b|(?:\.Method|\bMethod)\s*=\s*[''"
 $httpDeletePattern = '(?i)(?:-Method\s+[''"]?DELETE\b|(?:\.Method|\bMethod)\s*=\s*[''"]DELETE[''"])'
 $setFunctionPattern = '(?im)^\s*function\s+Set-'
 $removeFunctionPattern = '(?im)^\s*function\s+Remove-'
+# tools/StudioProbe.ps1 is the one opt-in, non-product probe allowed to perform
+# a Studio write. Product code must never reach it: dot-sourcing it would defeat
+# this ban without tripping any pattern above.
+$probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
 
 $violations = @()
 
@@ -55,6 +59,16 @@ foreach ($file in $productFiles) {
     $lineMatches = [regex]::Matches($text, $httpDeletePattern)
     foreach ($match in $lineMatches) {
         $violations += "${relative}: HTTP DELETE '$($match.Value)'"
+    }
+
+    $lineMatches = [regex]::Matches($text, $probeReachabilityPattern)
+    foreach ($match in $lineMatches) {
+        $violations += "${relative}: reaches the non-product Studio probe '$($match.Value)'"
+    }
+
+    $lineMatches = [regex]::Matches($text, $probeReachabilityPattern)
+    foreach ($match in $lineMatches) {
+        $violations += "${relative}: reference to the non-product Studio probe '$($match.Value)'"
     }
 
     $isRemoteApi = $relative -replace "\\", "/" -eq "lib/RemoteApi.ps1"
