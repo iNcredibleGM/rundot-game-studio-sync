@@ -266,6 +266,69 @@ all — the request failed at the transport layer before a response existed. A
 client must treat a transport failure here as a hard failure, not as an
 ambiguous write to retry blindly.
 
+## Text files can be created through the upload flow
+
+This is the one place where the binary flow is strictly more capable than the
+text route. #14 established that `PUT /file` **cannot create** a text file: a
+path that is not already in the project returns `404`, and `POST` on the same
+route is `405`
+([text-write-protocol.md](text-write-protocol.md)).
+
+The upload flow *can* create one. A UTF-8 `.txt` payload sent through
+`upload-url` → presigned PUT → `upload-adopt` is recorded as a normal text
+file:
+
+| Property | Result |
+| --- | --- |
+| `upload-url` | `200` |
+| Presigned PUT | `200` |
+| `upload-adopt` | `200`, recorded `mimeType: "text/plain"` |
+| Read back via `GET /file` | `encoding: "utf8"` |
+| Sent vs read-back bytes | 66 = 66, content identical |
+| `GET /files` row | `path`, `type`, `size` |
+
+It is **not** a base64 blob with a `.txt` name: the server recognizes the
+content type and stores it as editable text. And because the file now exists,
+`PUT /file` can subsequently overwrite it in place:
+
+```text
+PUT /api/projects/{projectId}/file?path=/uploads/<name>.txt
+200
+{ "path": "/uploads/<name>.txt", "encoding": "utf8",
+  "content": "overwritten through the text route", "mimeType": "text/plain", "size": 34 }
+```
+
+So the two routes compose:
+
+```mermaid
+flowchart LR
+    Local["New local text file"] --> UploadUrl["POST /upload-url"]
+    UploadUrl --> Put["PUT presigned URL"]
+    Put --> Adopt["POST /upload-adopt"]
+    Adopt -->|"creates /uploads/&lt;name&gt;"| Exists["File now exists"]
+    Exists --> TextPut["PUT /file overwrites it"]
+    Exists --> Collision["A second upload of the same name creates a sibling, not a replace"]
+```
+
+### The limits of this avenue
+
+It does **not** solve the create case in general, because the path is still
+ignored:
+
+- A new local file at `uploads/new.txt` **can** be created this way.
+- A new local file at `src/new.ts` **cannot**. The upload flow would record it
+  at `/uploads/new.ts`, which is a different path than the plan promised.
+- A text file created this way is subject to the same collision rename as any
+  other upload: a second one with the same name creates `new-1.txt` rather than
+  replacing `new.txt`. Replacement of an existing text file must use `PUT
+  /file`, which does replace in place.
+
+For [#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17)
+this is a narrow, real create mechanism: it can serve an `upload` row only when
+the planned path is `/uploads/{basename}` and no file of that name already
+exists. Any other new-file row still has no create path, and must be refused
+explicitly rather than attempted.
+
 ## Summary for `Push` design
 
 | Question | Answer from evidence |
@@ -274,6 +337,7 @@ ambiguous write to retry blindly.
 | Can it choose the project path? | **No.** `path` is ignored; the file always lands in `/uploads/<basename>`. |
 | Does a repeated name replace the file? | **No.** It creates a sibling with a numeric suffix. Replacement was not achievable by any attempt. |
 | Is it idempotent? | **No.** Identical bytes and name create a second file. Only the presigned PUT is idempotent. |
+| Can it create a **text** file? | **Yes**, where `PUT /file` cannot. A UTF-8 `.txt` payload reads back as `encoding: utf8`, and `PUT /file` can then overwrite it. |
 | Are bytes preserved? | Yes, exactly; read-back SHA-256 matches. |
 | Are there identity fields? | No hash, etag, version, or revision. Path and size only. |
 | Is `declaredSize` verified? | **No.** A mismatched declaration is accepted and the real size is recorded. |
@@ -308,6 +372,16 @@ cannot work around them.
    to be `/uploads/<basename>`, refuse when that name already exists rather
    than silently accepting a collision rename, and never claim to have
    satisfied a plan row whose path differs from what the server recorded.
+
+5. **The create gap from #14 is partly closed, but only for `/uploads`.**
+   `PUT /file` cannot create anything, and the upload flow can create a file
+   only at `/uploads/{basename}`. A new local file planned at `uploads/x.txt`
+   is publishable; one planned at `src/x.ts` is not. `Push` must therefore
+   treat the two cases differently rather than refusing every new file, and it
+   must still refuse any new-file row whose path is not `/uploads/{basename}`.
+   Because a second upload of the same name collides rather than replaces,
+   `Push` must check the remote first and use `PUT /file` for any path that
+   already exists.
 
 Any change to the classifier or plan text belongs to a follow-up issue, not to
 this evidence-only record.

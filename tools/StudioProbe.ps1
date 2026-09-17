@@ -72,6 +72,7 @@ param(
         'binary-discover',
         'binary-create',
         'binary-path-control',
+        'binary-text-via-upload',
         'binary-collision',
         'binary-overwrite',
         'binary-idempotency',
@@ -1322,6 +1323,7 @@ function Get-ProbeScenarioPlan {
         'binary-discover'          = @('POST /upload-url (several candidate bodies)', 'POST /upload-adopt (several candidate bodies)')
         'binary-create'            = @('POST /upload-url', 'PUT presigned URL (raw bytes)', 'POST /upload-adopt', 'GET /file (read back)')
         'binary-path-control'      = @('POST /upload-url + PUT + adopt, requesting several different project paths')
+        'binary-text-via-upload'   = @('POST /upload-url + PUT + adopt with UTF-8 text, then read back and try PUT /file')
         'binary-collision'         = @('POST /upload-url + PUT + adopt, repeated with identical filenames and edge-case names')
         'binary-overwrite'         = @('POST /upload-url + PUT + adopt against an existing binary path', 'POST /upload-adopt (re-adopt)')
         'binary-idempotency'       = @('POST /upload-url + PUT + adopt, twice', 'PUT the same presigned URL twice')
@@ -2320,7 +2322,77 @@ function Invoke-ScenarioBinaryPathControl {
     Write-ProbeLog ("[OBSERVED] upload-url with path={0} without path={1}" -f $withPath.Status, $noPath.Status)
 }
 
-function Invoke-ScenarioBinaryOverwrite {    # Can an existing binary be replaced, or does every upload add a sibling?
+function Invoke-ScenarioBinaryTextViaUpload {
+    # #14 found the text route cannot create: PUT /file 404s for a path that is
+    # not already in the project, and POST is 405. This asks whether the binary
+    # upload flow can create a text file instead, which would be an avenue for
+    # the create case that Push currently cannot serve.
+    #
+    # A text file is only useful here if it reads back as utf8. If it reads
+    # back as base64 it is a binary blob with a .txt name, which does not help.
+    $textContent = "text via upload flow $([Guid]::NewGuid().ToString('N'))`nsecond line`n"
+    $textBytes = Get-Utf8NoBomBytes -Text $textContent
+    $textName = "probe-$([Guid]::NewGuid().ToString('N').Substring(0,8))-viaupload.txt"
+
+    $result = Invoke-ProbeBinaryUpload `
+        -Case 'binary-text-via-upload' `
+        -FileName $textName `
+        -Bytes $textBytes `
+        -ContentType 'text/plain' `
+        -Note 'a UTF-8 text file sent through the binary upload flow'
+
+    $recorded = $result.recordedPath
+    if ($null -eq $recorded) { return }
+
+    $read = Get-ProbeReadOrNull -Path $recorded
+    $readBackText = $null
+    if ($null -ne $read) {
+        try { $readBackText = [System.Text.Encoding]::UTF8.GetString($read.Bytes) } catch { }
+    }
+
+    $isUtf8 = ($null -ne $read -and $read.Encoding -eq 'utf8')
+    $contentMatches = (
+        $null -ne $readBackText -and
+        [string]::Equals($readBackText, $textContent, [System.StringComparison]::Ordinal)
+    )
+
+    Add-ProbeEvidence -Case 'binary-text-via-upload-readback' -Status 'PROBED' -Data @{
+        note             = 'does a text file uploaded this way read back as editable text?'
+        recordedPath     = $recorded
+        encoding         = if ($null -ne $read) { $read.Encoding } else { $null }
+        byteCount        = if ($null -ne $read) { $read.ByteCount } else { $null }
+        sentBytes        = $textBytes.Length
+        readBackIsUtf8   = $isUtf8
+        contentMatches   = $contentMatches
+        fields           = Get-ProbeRowFingerprint -Row (Get-ProbeRowOrNull -Path $recorded)
+        pathHonored      = $result.pathHonored
+    }
+    Write-ProbeLog ("[PROBED] binary-text-via-upload encoding={0} utf8={1} contentMatches={2}" -f `
+        $(if ($null -ne $read) { $read.Encoding } else { '-' }), $isUtf8, $contentMatches)
+
+    # Can the text route now OVERWRITE that file? If the upload flow creates a
+    # path that PUT /file can then see, the two flows compose into the create
+    # case #17 needs.
+    if (-not $isUtf8) {
+        Add-ProbeEvidence -Case 'binary-text-via-upload-then-put' -Status 'SKIPPED' -Data @{
+            note = 'the uploaded text file did not read back as utf8, so PUT /file cannot target it'
+        }
+        return
+    }
+
+    $putResponse = Invoke-ProbeTextPut `
+        -Path $recorded `
+        -ContentBytes (New-JsonContentBody -Text 'overwritten through the text route')
+    Add-ProbeEvidence -Case 'binary-text-via-upload-then-put' -Status 'PROBED' -Data @{
+        note       = 'PUT /file against the path the upload flow created'
+        path       = $recorded
+        http       = @{ status = $putResponse.Status; body = $putResponse.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] binary-text-via-upload-then-put status={0}" -f $putResponse.Status)
+}
+
+function Invoke-ScenarioBinaryOverwrite {
+    # Can an existing binary be replaced, or does every upload add a sibling?
     # Create a probe-owned binary first, then try every plausible replace
     # mechanism against it.
     $fileName = Get-BinaryProbeName -Suffix 'replace'
@@ -2668,6 +2740,8 @@ function Invoke-ScenarioRunBinaryAll {
     Invoke-ProbeStep 'binary-discover' { Invoke-ScenarioBinaryDiscover }
     Invoke-ProbeStep 'binary-create' { Invoke-ScenarioBinaryCreate }
     Invoke-ProbeStep 'binary-path-control' { Invoke-ScenarioBinaryPathControl }
+    Invoke-ProbeStep 'binary-text-via-upload' { Invoke-ScenarioBinaryTextViaUpload }
+    Invoke-ProbeStep 'binary-text-via-upload' { Invoke-ScenarioBinaryTextViaUpload }
     Invoke-ProbeStep 'binary-collision' { Invoke-ScenarioBinaryCollision }
     Invoke-ProbeStep 'binary-overwrite' { Invoke-ScenarioBinaryOverwrite }
     Invoke-ProbeStep 'binary-idempotency' { Invoke-ScenarioBinaryIdempotency }
@@ -2694,6 +2768,8 @@ switch ($Scenario) {
     'binary-discover'            { Invoke-ScenarioBinaryDiscover }
     'binary-create'              { Invoke-ScenarioBinaryCreate }
     'binary-path-control'        { Invoke-ScenarioBinaryPathControl }
+    'binary-text-via-upload'     { Invoke-ScenarioBinaryTextViaUpload }
+    'binary-text-via-upload'     { Invoke-ScenarioBinaryTextViaUpload }
     'binary-collision'           { Invoke-ScenarioBinaryCollision }
     'binary-overwrite'           { Invoke-ScenarioBinaryOverwrite }
     'binary-idempotency'         { Invoke-ScenarioBinaryIdempotency }

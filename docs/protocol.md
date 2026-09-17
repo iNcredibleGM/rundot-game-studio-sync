@@ -48,8 +48,9 @@ Observed flow:
 
 Status: observed and characterized in
 [binary-upload-protocol.md](binary-upload-protocol.md), but not part of the
-supported tool. Two findings dominate: the requested `path` is **ignored**, and
-the file is always recorded at `/uploads/{basename}`; and a repeated filename
+supported tool. Three findings dominate: the requested `path` is **ignored**,
+so the file is always recorded at `/uploads/{basename}`; a repeated filename
 **never replaces** the existing file, it creates a numeric-suffixed sibling
-(`name-1.png`). Replacement was not achievable by any attempt. Nothing in the
-product calls these routes.
+(`name-1.png`); and the flow **can create a text file** at that path, which
+`PUT /file` cannot. Replacement was not achievable by any attempt. Nothing in
+the product calls these routes.
