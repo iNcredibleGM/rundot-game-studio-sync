@@ -124,6 +124,44 @@ Assert-True (
 ) "probe path ownership must compare on a segment boundary, not a raw string prefix"
 
 # ---------------------------------------------------------------------------
+# #16: DELETE is the one mutation that can destroy a file the probe did not
+# create, so the target itself is guarded, not just the write gate.
+# ---------------------------------------------------------------------------
+
+Assert-True (
+    $probeText -match 'function Assert-ProbeDeleteTarget'
+) "every DELETE must route through Assert-ProbeDeleteTarget"
+
+Assert-True (
+    $probeText -match 'Refusing to DELETE a path the probe does not own'
+) "the delete guard must refuse a path the probe does not own"
+
+# A bare directory such as /uploads must never be an eligible delete target:
+# binary uploads flatten into /uploads, so a directory DELETE there could
+# destroy real project files.
+Assert-True (
+    $probeText -match 'a bare directory like /uploads is never eligible'
+) "the delete guard must state that a bare directory is never eligible"
+
+# The rename capture is a copied fetch, which carries an Authorization header.
+# It must be redacted rather than recorded.
+Assert-True (
+    $probeText -match '(?i)authorization\|bearer\|token\|cookie'
+) "the rename DevTools capture must redact credential-shaped text"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioRunDeleteRenameAll'
+) "the #16 investigation must be runnable with one command"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioConditionalDelete'
+) "the delete verb's precondition behavior must be probed"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioRenameDevToolsApply'
+) "the DevTools rename capture must have a recording scenario"
+
+# ---------------------------------------------------------------------------
 # The restore discipline that #14 learned the hard way.
 # ---------------------------------------------------------------------------
 
