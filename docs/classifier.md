@@ -101,9 +101,26 @@ side.
 | A | — | — | `settledAbsent` |
 
 `A / — / —` is `settledAbsent`: a deletion already agreed on by both sides is
-not a standing `DELETE`. Deletions are classification only; real deletion is
-an open investigation
-([#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)).
+not a standing `DELETE`. Deletions are classification only; the delete verb is
+characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md), and nothing in this
+milestone emits one.
+
+A delete candidate carries the reason that constrains a future `Apply`:
+
+```text
+Reason   : Deletion is classification-only in this milestone.
+           No local or remote file is deleted.
+           Studio cannot make a delete conditional: there is no ETag or
+           version field and If-Match is ignored, so a stale delete cannot be
+           refused server-side.
+```
+
+That third line is the observed constraint, not a policy statement. Studio
+exposes no ETag, no version, and no honoured `If-Match` on the delete route, so
+a delete computed against content that has since changed cannot be refused by
+the server. Any guard has to run on the client, immediately before the request
+([delete-rename-protocol.md](delete-rename-protocol.md)).
 
 ## Ignore precedence
 
@@ -179,5 +196,7 @@ plan promised. Text uploads, by contrast, are `Applicable = $true`.
   the snapshot retries and then aborts, so a partial map is never classified.
 - `Plan` must call `Assert-BaseOwnership` before reading BASE
   ([base-schema.md](base-schema.md)).
+- Why a delete candidate stays classification-only, and what the delete verb
+  actually does: [delete-rename-protocol.md](delete-rename-protocol.md).
 
 Unit coverage lives in `tests/SyncEngine.Tests.ps1` and requires no network.

@@ -32,6 +32,21 @@ tool. It is **overwrite-only**: a path that is not already in the project
 returns 404, and there is no ETag, version field, or honoured `If-Match`. Nothing
 in the product calls this route.
 
+## Delete file
+
+DELETE /api/projects/{projectId}/file?path={encodedPath}
+
+Status: observed and characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md), but not part of the
+supported tool. It removes exactly the named file and returns
+`{"success":true,"data":{"deleted":"<path>"}}`. A repeated delete returns 404
+rather than an error, a directory-shaped path is 404 rather than recursive, and
+`If-Match` / `If-None-Match` are ignored exactly as they are on the write
+route. **No rename or move route was found**; a rename would have to compose as
+delete + create, and create is unsolved outside `/uploads/{basename}`. Nothing
+in the product calls this route, and `deleteRemoteCandidate` remains
+classification-only.
+
 ## Threads
 
 GET /api/projects/{projectId}/threads

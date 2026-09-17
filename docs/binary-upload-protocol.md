@@ -12,8 +12,8 @@ permit a write.
 
 Read paths are in [protocol.md](protocol.md). The text write route is
 [text-write-protocol.md](text-write-protocol.md); this document covers only the
-binary upload flow. Delete and rename are
-[#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16).
+binary upload flow. Delete, rename, and concurrency are characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md).
 
 ## Endpoints
 
@@ -180,9 +180,10 @@ The original file was byte-for-byte unchanged in every case.
 | Fresh `upload-url` + PUT + adopt against an existing name | New sibling; original unchanged |
 | Re-adopt with a newly minted `uploadId` and the same `name` | New sibling; original unchanged |
 
-The only way to change a binary is create-a-new-name plus delete-the-old, and
-**delete is not established by this investigation** — it belongs to
-[#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16).
+The only way to change a binary is create-a-new-name plus delete-the-old. Delete
+is characterized in [delete-rename-protocol.md](delete-rename-protocol.md): it
+removes exactly the named path, and no rename or move route exists, so a
+create-plus-delete pair cannot be collapsed into a move either.
 
 This is the opposite of the text route, where `PUT` replaces in place with no
 collision rename ([text-write-protocol.md](text-write-protocol.md)).
@@ -388,8 +389,8 @@ this evidence-only record.
 
 ## Cleanup and the delete route
 
-Delete was unverified (#16 owns it), so a probe run left its files behind and
-cleanup was a manual to-do list. That is no longer necessary:
+Delete was unverified when this investigation began, so a probe run left its
+files behind and cleanup was a manual to-do list. That is no longer necessary:
 
 ```text
 DELETE /api/projects/{projectId}/file?path={encodedPath}
@@ -400,11 +401,12 @@ The status alone is not proof — the proof is that the path disappears from
 `GET /files`. `DELETE` on the `/file` route is the one that works; the other
 plausible shapes were tried and did not remove the file.
 
-This is recorded here only because automated cleanup needs it. It is **not** a
-general statement about delete semantics: what happens to a directory, a
-path that is already absent, a reserved path, or a file the probe did not
-create is [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)'s
-question, and `Push` must not use this route until that investigation lands.
+Delete semantics are now characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md): it removes exactly the
+named path, a repeated delete returns `404` rather than an error, a
+directory-shaped path is `404` rather than recursive, and `If-Match` is
+ignored. `Push` must still not use this route in v0.1.3, because
+`deleteRemoteCandidate` remains classification-only.
 
 Two safeguards keep cleanup safe:
 
