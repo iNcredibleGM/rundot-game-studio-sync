@@ -73,6 +73,8 @@ param(
         'binary-create',
         'binary-path-control',
         'binary-text-via-upload',
+        'binary-delete-discover',
+        'binary-cleanup',
         'binary-collision',
         'binary-overwrite',
         'binary-idempotency',
@@ -102,6 +104,13 @@ param(
     # Refuse the interactive fallback instead of prompting.
     [switch]$NoInteractiveAuth,
 
+    # Keep the files a run creates instead of deleting them at the end. Useful
+    # when inspecting artifacts; the default is to leave the project as found.
+    [switch]$SkipCleanup,
+
+    # Cleanup scope: only this run's files by default, or every probe file.
+    [switch]$AllRuns,
+
     # The one switch that permits a remote write.
     [switch]$ConfirmRemoteWrite
 )
@@ -129,6 +138,12 @@ $script:ProbeNestedPath = "$($script:ProbeDir)/nested/deep.txt"
 # under /uploads/ regardless of what was asked for. Probe-owned binary paths
 # are therefore matched by filename under this directory.
 $script:ProbeUploadDir = '/uploads'
+
+# Every file this run creates carries this stamp, so cleanup is exact rather
+# than a guess about which /uploads entries are ours. The stamp is fixed for
+# the process so one run cannot be confused with another.
+$script:ProbeRunStamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
+$script:ProbeNamePrefix = "probe-$($script:ProbeRunStamp)"
 
 $script:LogPath = $null
 $script:EvidencePath = $null
@@ -796,15 +811,18 @@ function Get-BinaryProbeBytes {
 }
 
 function Get-BinaryProbeName {
-    # Collision-suffix survey name. Unique per run so a leftover from a
-    # previous run does not masquerade as a collision.
-    param([string]$Suffix = '')
+    # Namespaced per run, so every file a run creates is identifiable and
+    # removable without guessing. The run stamp is fixed for the process, so a
+    # leftover from an earlier run never masquerades as a collision in this one.
+    param(
+        [string]$Suffix = '',
+        [string]$Extension = '.png'
+    )
 
-    $stamp = [Guid]::NewGuid().ToString('N').Substring(0, 8)
     if ([string]::IsNullOrEmpty($Suffix)) {
-        return "probe-$stamp.png"
+        return "$($script:ProbeNamePrefix)$Extension"
     }
-    return "probe-$stamp-$Suffix.png"
+    return "$($script:ProbeNamePrefix)-$Suffix$Extension"
 }
 
 function Invoke-ProbeUploadUrlRequest {
@@ -1324,6 +1342,8 @@ function Get-ProbeScenarioPlan {
         'binary-create'            = @('POST /upload-url', 'PUT presigned URL (raw bytes)', 'POST /upload-adopt', 'GET /file (read back)')
         'binary-path-control'      = @('POST /upload-url + PUT + adopt, requesting several different project paths')
         'binary-text-via-upload'   = @('POST /upload-url + PUT + adopt with UTF-8 text, then read back and try PUT /file')
+        'binary-delete-discover'   = @('POST /upload-url + PUT + adopt a target, then try candidate DELETE routes against it')
+        'binary-cleanup'           = @('DELETE every path this run created, then verify none remain')
         'binary-collision'         = @('POST /upload-url + PUT + adopt, repeated with identical filenames and edge-case names')
         'binary-overwrite'         = @('POST /upload-url + PUT + adopt against an existing binary path', 'POST /upload-adopt (re-adopt)')
         'binary-idempotency'       = @('POST /upload-url + PUT + adopt, twice', 'PUT the same presigned URL twice')
@@ -2391,6 +2411,175 @@ function Invoke-ScenarioBinaryTextViaUpload {
     Write-ProbeLog ("[PROBED] binary-text-via-upload-then-put status={0}" -f $putResponse.Status)
 }
 
+function Invoke-ScenarioBinaryDeleteDiscover {
+    # Cleanup needs a delete route, and none is documented: #16 owns delete and
+    # has not run. Try the plausible shapes against a probe-owned file so the
+    # probe can offer automated cleanup instead of a manual to-do list.
+    #
+    # Every target here is a file this run created. Nothing outside the probe
+    # namespace is touched, and a failure is recorded rather than retried.
+    $fileName = Get-BinaryProbeName -Suffix 'deltest'
+    $targetPath = "$($script:ProbeDir)/$fileName"
+    $bytes = Get-BinaryProbeBytes -Variant 12
+
+    $create = Invoke-ProbeBinaryUpload -Case 'binary-delete-discover-target' -FileName $fileName `
+        -Bytes $bytes -Note 'a probe-owned file to attempt deletion against'
+    $victim = $create.recordedPath
+    if ($null -eq $victim) {
+        Write-ProbeLog '[STOPPED] binary-delete-discover: no file was created to delete'
+        return
+    }
+
+    $encoded = [System.Uri]::EscapeDataString($victim)
+
+    $candidates = @(
+        @{ Case = 'delete-file-route'; Method = 'DELETE'; Uri = "$StudioOrigin/api/projects/$ProjectId/file?path=$encoded"; Body = $null },
+        @{ Case = 'delete-files-route'; Method = 'DELETE'; Uri = "$StudioOrigin/api/projects/$ProjectId/files?path=$encoded"; Body = $null },
+        @{ Case = 'delete-post-file'; Method = 'POST'; Uri = "$StudioOrigin/api/projects/$ProjectId/file/delete?path=$encoded"; Body = '{}' },
+        @{ Case = 'delete-post-delete'; Method = 'POST'; Uri = "$StudioOrigin/api/projects/$ProjectId/delete"; Body = (@{ path = $victim } | ConvertTo-Json -Compress) }
+    )
+
+    foreach ($candidate in $candidates) {
+        # A delete is a mutation, so it passes the same gate as everything else.
+        Assert-ProbeWriteAllowed -Case $candidate.Case -Method $candidate.Method -Uri $candidate.Uri
+
+        $bodyBytes = if ($null -ne $candidate.Body) { Get-Utf8NoBomBytes -Text $candidate.Body } else { [byte[]]@() }
+        $response = Invoke-ProbeHttp `
+            -Method $candidate.Method `
+            -Uri $candidate.Uri `
+            -Headers $script:Headers `
+            -BodyBytes $bodyBytes `
+            -ContentType 'application/json'
+
+        # A delete that worked is proved by the file being gone, not by the
+        # status code alone.
+        Start-Sleep -Milliseconds 300
+        $stillListed = $null -ne (Get-ProbeRowOrNull -Path $victim)
+
+        Add-ProbeEvidence -Case $candidate.Case -Status 'PROBED' -Data @{
+            note        = 'candidate delete route; the file being gone is the proof'
+            method      = $candidate.Method
+            uri         = $candidate.Uri
+            target      = $victim
+            http        = @{ status = $response.Status; body = $response.BodyText }
+            stillListed = $stillListed
+            deleted     = (-not $stillListed)
+        }
+        Write-ProbeLog ("[PROBED] {0} {1} status={2} stillListed={3}" -f `
+            $candidate.Method, $candidate.Case, $response.Status, $stillListed)
+
+        if (-not $stillListed) {
+            Write-ProbeLog ("[FOUND] delete works: {0} {1}" -f $candidate.Method, $candidate.Uri)
+            break
+        }
+    }
+
+    # Whatever happened, report the outcome so cleanup can be planned.
+    $remaining = @(Get-ProbeProbeOwnedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" })
+    Add-ProbeEvidence -Case 'binary-delete-discover-summary' -Status 'OBSERVED' -Data @{
+        note          = 'delete route availability decides whether cleanup can be automated'
+        deleteWorked  = ($null -eq (Get-ProbeRowOrNull -Path $victim))
+        thisRunPaths  = $remaining
+        thisRunCount  = $remaining.Count
+    }
+    Write-ProbeLog ("[OBSERVED] binary-delete-discover: this run created {0} path(s)" -f $remaining.Count)
+}
+
+function Invoke-ProbeDeleteFile {
+    # DELETE /api/projects/{id}/file?path=... returns 200 and removes the file.
+    # Discovered by binary-delete-discover; #16 still owns the full semantics.
+    param([string]$Path)
+
+    $encoded = [System.Uri]::EscapeDataString($Path)
+    $uri = "$StudioOrigin/api/projects/$ProjectId/file?path=$encoded"
+    Assert-ProbeWriteAllowed -Case "delete:$Path" -Method 'DELETE' -Uri $uri
+
+    $response = Invoke-ProbeHttp -Method 'DELETE' -Uri $uri -Headers $script:Headers
+
+    # The status alone is not proof; the file being gone is.
+    Start-Sleep -Milliseconds 250
+    $stillListed = $null -ne (Get-ProbeRowOrNull -Path $Path)
+
+    return [pscustomobject]@{
+        Status      = $response.Status
+        Body        = $response.BodyText
+        StillListed = $stillListed
+        Deleted     = (-not $stillListed)
+    }
+}
+
+function Invoke-ScenarioBinaryCleanup {
+    # Delete everything this run created, so the project is left as found and
+    # the next run starts from a known state. Only paths carrying this run's
+    # stamp are touched, so an earlier run's leftovers are never deleted by
+    # surprise and no real project file can be caught by the filter.
+    param([switch]$AllRuns)
+
+    # Both directories are in scope because binary uploads land in /uploads
+    # regardless of the requested path. The stamp narrows to this run by
+    # default; -AllRuns widens to every probe file.
+    $candidates = @(Get-ProbeListedPaths | Where-Object {
+        $inScope = ($_ -like "$($script:ProbeUploadDir)/*" -or $_ -like "$($script:ProbeDir)/*")
+        if (-not $inScope) { return $false }
+        if ($AllRuns) { return $true }
+        return ($_ -like "*$($script:ProbeRunStamp)*")
+    } | Sort-Object -Unique)
+
+    Add-ProbeEvidence -Case 'binary-cleanup-plan' -Status 'OBSERVED' -Data @{
+        note       = 'paths selected for deletion'
+        runStamp   = $script:ProbeRunStamp
+        allRuns    = [bool]$AllRuns
+        pattern    = if ($AllRuns) { 'all probe paths' } else { "*$($script:ProbeRunStamp)*" }
+        candidates = $candidates
+        count      = $candidates.Count
+    }
+    Write-ProbeLog ("[OBSERVED] binary-cleanup: {0} path(s) to delete (stamp {1})" -f `
+        $candidates.Count, $script:ProbeRunStamp)
+
+    if ($candidates.Count -eq 0) {
+        Write-ProbeLog 'Nothing to delete.'
+        return
+    }
+
+    $deleted = 0
+    $failed = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($path in $candidates) {
+        $result = Invoke-ProbeDeleteFile -Path $path
+        if ($result.Deleted) {
+            $deleted++
+        }
+        else {
+            $failed.Add($path)
+        }
+
+        Add-ProbeEvidence -Case 'binary-cleanup-delete' -Status 'PROBED' -Data @{
+            path        = $path
+            http        = @{ status = $result.Status; body = $result.Body }
+            deleted     = $result.Deleted
+            stillListed = $result.StillListed
+        }
+    }
+
+    $remaining = @(Get-ProbeListedPaths | Where-Object {
+        $inScope = ($_ -like "$($script:ProbeUploadDir)/*" -or $_ -like "$($script:ProbeDir)/*")
+        if (-not $inScope) { return $false }
+        if ($AllRuns) { return $true }
+        return ($_ -like "*$($script:ProbeRunStamp)*")
+    })
+
+    Add-ProbeEvidence -Case 'binary-cleanup-summary' -Status 'OBSERVED' -Data @{
+        note        = 'cleanup result'
+        attempted   = $candidates.Count
+        deleted     = $deleted
+        failed      = $failed.ToArray()
+        remaining   = $remaining
+        remainingCount = $remaining.Count
+    }
+    Write-ProbeLog ("[OBSERVED] binary-cleanup: deleted {0}/{1}, {2} remaining" -f `
+        $deleted, $candidates.Count, $remaining.Count)
+}
+
 function Invoke-ScenarioBinaryOverwrite {
     # Can an existing binary be replaced, or does every upload add a sibling?
     # Create a probe-owned binary first, then try every plausible replace
@@ -2741,12 +2930,22 @@ function Invoke-ScenarioRunBinaryAll {
     Invoke-ProbeStep 'binary-create' { Invoke-ScenarioBinaryCreate }
     Invoke-ProbeStep 'binary-path-control' { Invoke-ScenarioBinaryPathControl }
     Invoke-ProbeStep 'binary-text-via-upload' { Invoke-ScenarioBinaryTextViaUpload }
-    Invoke-ProbeStep 'binary-text-via-upload' { Invoke-ScenarioBinaryTextViaUpload }
+    Invoke-ProbeStep 'binary-delete-discover' { Invoke-ScenarioBinaryDeleteDiscover }
     Invoke-ProbeStep 'binary-collision' { Invoke-ScenarioBinaryCollision }
     Invoke-ProbeStep 'binary-overwrite' { Invoke-ScenarioBinaryOverwrite }
     Invoke-ProbeStep 'binary-idempotency' { Invoke-ScenarioBinaryIdempotency }
     Invoke-ProbeStep 'binary-failure' { Invoke-ScenarioBinaryFailure }
     Invoke-ProbeStep 'binary-survey' { Invoke-ScenarioSurvey }
+
+    # Cleanup last, so a full run leaves the project as it found it. Pass
+    # -SkipCleanup to keep the artifacts for inspection.
+    if (-not $SkipCleanup) {
+        Invoke-ProbeStep 'binary-cleanup' { Invoke-ScenarioBinaryCleanup }
+    }
+    else {
+        Write-ProbeLog ''
+        Write-ProbeLog '[SKIPPED] binary-cleanup: -SkipCleanup was set; the created paths remain.'
+    }
 }
 
 
@@ -2769,7 +2968,8 @@ switch ($Scenario) {
     'binary-create'              { Invoke-ScenarioBinaryCreate }
     'binary-path-control'        { Invoke-ScenarioBinaryPathControl }
     'binary-text-via-upload'     { Invoke-ScenarioBinaryTextViaUpload }
-    'binary-text-via-upload'     { Invoke-ScenarioBinaryTextViaUpload }
+    'binary-delete-discover'     { Invoke-ScenarioBinaryDeleteDiscover }
+    'binary-cleanup'             { Invoke-ScenarioBinaryCleanup -AllRuns:$AllRuns }
     'binary-collision'           { Invoke-ScenarioBinaryCollision }
     'binary-overwrite'           { Invoke-ScenarioBinaryOverwrite }
     'binary-idempotency'         { Invoke-ScenarioBinaryIdempotency }

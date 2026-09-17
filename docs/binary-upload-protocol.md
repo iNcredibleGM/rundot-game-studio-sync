@@ -386,6 +386,36 @@ cannot work around them.
 Any change to the classifier or plan text belongs to a follow-up issue, not to
 this evidence-only record.
 
+## Cleanup and the delete route
+
+Delete was unverified (#16 owns it), so a probe run left its files behind and
+cleanup was a manual to-do list. That is no longer necessary:
+
+```text
+DELETE /api/projects/{projectId}/file?path={encodedPath}
+200
+```
+
+The status alone is not proof — the proof is that the path disappears from
+`GET /files`. `DELETE` on the `/file` route is the one that works; the other
+plausible shapes were tried and did not remove the file.
+
+This is recorded here only because automated cleanup needs it. It is **not** a
+general statement about delete semantics: what happens to a directory, a
+path that is already absent, a reserved path, or a file the probe did not
+create is [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)'s
+question, and `Push` must not use this route until that investigation lands.
+
+Two safeguards keep cleanup safe:
+
+- Only paths under `/uploads/` or the probe directory are eligible.
+- By default only paths carrying **this run's** stamp are deleted, so an
+  earlier run's leftovers are never removed by surprise. `-AllRuns` widens it
+  deliberately.
+
+A full `run-binary-all` now deletes what it created as its final step and
+verifies that none remain. `-SkipCleanup` keeps the artifacts for inspection.
+
 ## How this was observed
 
 Every case ran through `tools/StudioProbe.ps1`, the opt-in probe committed for
@@ -393,10 +423,13 @@ this investigation, against a disposable Studio project only. The probe
 refuses to send anything without `-ConfirmRemoteWrite`, and its text cases
 restore what they touch and verify the restore by SHA-256.
 
-Binary cases cannot be restored: delete is not available until #16, and
-replacement is impossible, so a created binary is permanent. The probe
-therefore records every path it creates and prints a `CLEANUP` list for manual
-deletion in the Studio UI. Those paths were removed after the run.
+Binary cases cannot be restored: delete was unavailable when this
+investigation began, and replacement is impossible, so a created binary is
+permanent. The probe therefore records every path it creates. Once the delete
+route was found (above), cleanup became automated: a full run deletes what it
+created as its final step and verifies none remain. The 177 files left by the
+earlier exploratory runs were removed the same way, and the project was
+confirmed to hold only its original files afterwards.
 
 Evidence files contain status codes, sizes, hashes, and response bodies only.
 No tokens, credentials, or project file contents are recorded. The presigned
