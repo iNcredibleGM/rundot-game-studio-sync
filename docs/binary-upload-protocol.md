@@ -361,11 +361,11 @@ cannot work around them.
    are the bytes the plan observed. It would be creating a new file, not
    replacing a known one.
 
-3. **The existing classifier reason is still correct.** Binary uploads remain
-   `applicable: false` with `Remote binary replacement semantics are
-   unverified.` The verification is now done, and the answer is that
-   replacement is not possible — so the reason is accurate but could be
-   sharpened in a follow-up to say so explicitly.
+3. **The existing classifier reason is now accurate.** Binary uploads remain
+   `applicable: false`. The reason previously said replacement semantics were
+   "unverified"; the verification is done and the answer is that replacement
+   is not possible, so the reason was sharpened to say so explicitly in the
+   same change that recorded this evidence.
 
 4. **A future binary `Push` would need a different shape entirely**: treat
    binaries as additive-only (create, never replace), require the remote path

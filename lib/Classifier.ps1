@@ -22,10 +22,13 @@ $script:SyncStatusIgnored               = 'ignored'
 $script:SyncStatusDeleteRemoteCandidate = 'deleteRemoteCandidate'
 $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
 
-# Binary uploads are displayed as UPLOAD but never marked applicable in this
-# milestone: the remote replacement semantics for binary files are unverified
-# until the push investigation lands.
-$script:SyncBinaryUploadReason = 'Remote binary replacement semantics are unverified.'
+# Binary uploads are displayed as UPLOAD but never marked applicable: the
+# upload flow cannot choose a project path and cannot replace a file. #15
+# verified this — the requested path is ignored (the file always lands at
+# /uploads/{basename}) and a repeated name creates a numeric-suffixed sibling
+# rather than replacing the existing file. So a binary upload cannot satisfy a
+# plan row whose path differs from what the server records.
+$script:SyncBinaryUploadReason = 'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.'
 
 $script:SyncDeletionCandidateReason = @(
     'Deletion is classification-only in this milestone.',

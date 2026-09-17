@@ -146,13 +146,19 @@ never relabelled as a skip — but is marked `Applicable = $false`:
 ```text
 Status   : upload
 Applicable: False
-Reason   : Remote binary replacement semantics are unverified.
+Reason   : Remote binary replacement is not possible: the upload flow ignores
+           the requested path and a repeated name creates a sibling instead of
+           replacing.
 ```
 
-Remote binary replacement is not verified until the push investigation
-([#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15)), so
-every binary upload candidate is conservative here, including a brand-new
-`— / A / —` file. Text uploads, by contrast, are `Applicable = $true`.
+Binary replacement was verified **impossible** in
+[#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15): the
+upload flow ignores the requested path (a file always lands at
+`/uploads/{basename}`) and a repeated name creates a numeric-suffixed sibling
+rather than replacing the existing file ([binary-upload-protocol.md](binary-upload-protocol.md)).
+Every binary upload candidate is therefore conservative, including a brand-new
+`— / A / —` file, because publishing it would create a different path than the
+plan promised. Text uploads, by contrast, are `Applicable = $true`.
 
 ## Determinism and purity
 

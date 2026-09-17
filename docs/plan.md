@@ -39,7 +39,7 @@ the path actionable in principle:
 | Status | Applicable | Why |
 | --- | --- | --- |
 | `upload` (text) | no | Remote mutation is not implemented in this milestone. |
-| `upload` (binary) | no | Remote binary replacement semantics are unverified. |
+| `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
 | `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
