@@ -30,9 +30,19 @@ $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
 # plan row whose path differs from what the server records.
 $script:SyncBinaryUploadReason = 'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.'
 
+# The delete verb is now characterized (docs/delete-rename-protocol.md): it
+# removes exactly the named path, a repeated delete returns 404 rather than an
+# error, and a stale write against a deleted path is refused rather than
+# resurrecting it. What it cannot do is refuse a stale delete: there is no
+# ETag, no version field, and If-Match is ignored, so nothing server-side can
+# reject a delete computed against content that has since changed. That is why
+# a delete candidate stays classification-only — the client would have to
+# re-verify on its own, immediately before the request, and this milestone
+# emits no remote mutation at all.
 $script:SyncDeletionCandidateReason = @(
     'Deletion is classification-only in this milestone.',
-    'No local or remote file is deleted.'
+    'No local or remote file is deleted.',
+    'Studio cannot make a delete conditional: there is no ETag or version field and If-Match is ignored, so a stale delete cannot be refused server-side.'
 ) -join "`n"
 
 $script:SyncIgnoredReason = 'Matches the default ignore set, so it is out of sync scope.'

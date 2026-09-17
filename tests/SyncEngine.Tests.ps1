@@ -325,6 +325,12 @@ Assert-True `
     ([string]$deleteRemoteRow.Reason -match '(?i)classification-only') `
     "a delete candidate reason should say deletion is classification-only"
 Assert-True `
+    ([string]$deleteRemoteRow.Reason -match '(?i)etag') `
+    "a delete candidate reason should name the missing ETag that makes a stale delete unrefusable"
+Assert-True `
+    ([string]$deleteRemoteRow.Reason -match '(?i)if-match') `
+    "a delete candidate reason should name the ignored If-Match precondition"
+Assert-True `
     ([string]$deleteRemoteRow.Reason -notmatch '(?i)bearer|token') `
     "a delete candidate reason must never contain credentials"
 
