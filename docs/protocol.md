@@ -18,8 +18,6 @@ GET /api/projects/{projectId}/file?path={encodedPath}
 
 ## Write text file
 
-Observed:
-
 PUT /api/projects/{projectId}/file?path={encodedPath}
 
 Content-Type: application/json
@@ -28,7 +26,11 @@ Content-Type: application/json
   "content": "..."
 }
 
-Status: observed, not yet part of the supported tool.
+Status: observed and characterized in
+[text-write-protocol.md](text-write-protocol.md), but not part of the supported
+tool. It is **overwrite-only**: a path that is not already in the project
+returns 404, and there is no ETag, version field, or honoured `If-Match`. Nothing
+in the product calls this route.
 
 ## Threads
 
