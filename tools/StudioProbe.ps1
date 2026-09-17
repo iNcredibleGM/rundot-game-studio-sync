@@ -2224,12 +2224,13 @@ function Invoke-ScenarioBinaryCollision {
     Write-ProbeLog ("[OBSERVED] binary-collision family ({0}): {1}" -f $family.Count, ($family -join ', '))
 
     # Suffix edge cases: extensionless, multi-dot, leading dot, and a name
-    # that already ends in a numeric suffix.
+    # that already ends in a numeric suffix. Every name carries the run stamp
+    # so cleanup can find it; only the extension shape varies.
     foreach ($edge in @(
-        @{ Suffix = 'noext'; Name = "probe-$([Guid]::NewGuid().ToString('N').Substring(0,8))-noext" },
-        @{ Suffix = 'multidot'; Name = "probe.$([Guid]::NewGuid().ToString('N').Substring(0,8)).tar.png" },
-        @{ Suffix = 'dotfile'; Name = ".probe-$([Guid]::NewGuid().ToString('N').Substring(0,8))" },
-        @{ Suffix = 'numbered'; Name = "probe-$([Guid]::NewGuid().ToString('N').Substring(0,8))-1.png" }
+        @{ Suffix = 'noext'; Name = "$($script:ProbeNamePrefix)-noext" },
+        @{ Suffix = 'multidot'; Name = "probe.$($script:ProbeRunStamp).tar.png" },
+        @{ Suffix = 'dotfile'; Name = ".$($script:ProbeNamePrefix)" },
+        @{ Suffix = 'numbered'; Name = "$($script:ProbeNamePrefix)-1.png" }
     )) {
         $first = Invoke-ProbeBinaryUpload -Case "binary-collision-edge-$($edge.Suffix)-1" -FileName $edge.Name `
             -Bytes (Get-BinaryProbeBytes -Variant 3) `
@@ -2275,10 +2276,10 @@ function Invoke-ScenarioBinaryPathControl {
     $bytes = Get-BinaryProbeBytes -Variant 11
 
     $targets = @(
-        @{ Case = 'binary-path-control-uploads-dir'; Path = "$($script:ProbeDir)/pc-uploads.png"; Note = 'requested a /sync-probe path' },
-        @{ Case = 'binary-path-control-root'; Path = '/pc-root.png'; Note = 'requested a project-root path' },
-        @{ Case = 'binary-path-control-nested'; Path = '/sync-probe/deep/pc-nested.png'; Note = 'requested a nested directory' },
-        @{ Case = 'binary-path-control-src'; Path = '/src/pc-src.png'; Note = 'requested a path inside src' }
+        @{ Case = 'binary-path-control-uploads-dir'; Path = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-pc-uploads.png"; Note = 'requested a /sync-probe path' },
+        @{ Case = 'binary-path-control-root'; Path = "/$($script:ProbeNamePrefix)-pc-root.png"; Note = 'requested a project-root path' },
+        @{ Case = 'binary-path-control-nested'; Path = "$($script:ProbeDir)/deep/$($script:ProbeNamePrefix)-pc-nested.png"; Note = 'requested a nested directory' },
+        @{ Case = 'binary-path-control-src'; Path = "/src/$($script:ProbeNamePrefix)-pc-src.png"; Note = 'requested a path inside src' }
     )
 
     foreach ($target in $targets) {
@@ -2352,7 +2353,7 @@ function Invoke-ScenarioBinaryTextViaUpload {
     # back as base64 it is a binary blob with a .txt name, which does not help.
     $textContent = "text via upload flow $([Guid]::NewGuid().ToString('N'))`nsecond line`n"
     $textBytes = Get-Utf8NoBomBytes -Text $textContent
-    $textName = "probe-$([Guid]::NewGuid().ToString('N').Substring(0,8))-viaupload.txt"
+    $textName = "$($script:ProbeNamePrefix)-viaupload.txt"
 
     $result = Invoke-ProbeBinaryUpload `
         -Case 'binary-text-via-upload' `
@@ -2470,6 +2471,9 @@ function Invoke-ScenarioBinaryDeleteDiscover {
 
         if (-not $stillListed) {
             Write-ProbeLog ("[FOUND] delete works: {0} {1}" -f $candidate.Method, $candidate.Uri)
+            # It is already gone, so drop it from the cleanup list rather than
+            # listing a file for manual deletion that no longer exists.
+            [void]$script:CreatedPaths.Remove($victim)
             break
         }
     }

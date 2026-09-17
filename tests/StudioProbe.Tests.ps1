@@ -93,6 +93,26 @@ Assert-True (
     $probeText -match 'function Assert-ProbeOwnedPath'
 ) "the probe must confine destructive cases to a probe-owned path"
 
+# Every created file must carry the per-run stamp, or cleanup silently misses
+# it. An unstamped name (a bare random Guid) is invisible to the run filter,
+# which is how 13 files survived a cleanup that reported success.
+Assert-True (
+    $probeText -match 'function Get-ProbeProbeOwnedPaths'
+) "the probe must have a single definition of what it owns"
+
+Assert-Equal 0 ([regex]::Matches(
+    $probeText,
+    "Guid\]::NewGuid\(\)\.ToString\('N'\)\.Substring"
+).Count) "probe filenames must use the run stamp, not an ad-hoc random Guid"
+
+Assert-True (
+    $probeText -match '\$script:ProbeRunStamp = '
+) "the probe must fix one run stamp per process"
+
+Assert-True (
+    $probeText -match '\$script:ProbeNamePrefix'
+) "probe filenames must be built from the run-stamped prefix"
+
 Assert-True (
     $probeText -match "\`$script:ProbeDir = '/sync-probe'"
 ) "the probe-owned prefix must be /sync-probe"
