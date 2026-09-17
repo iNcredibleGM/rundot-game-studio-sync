@@ -180,10 +180,13 @@ The original file was byte-for-byte unchanged in every case.
 | Fresh `upload-url` + PUT + adopt against an existing name | New sibling; original unchanged |
 | Re-adopt with a newly minted `uploadId` and the same `name` | New sibling; original unchanged |
 
-The only way to change a binary is create-a-new-name plus delete-the-old. Delete
-is characterized in [delete-rename-protocol.md](delete-rename-protocol.md): it
-removes exactly the named path, and no rename or move route exists, so a
-create-plus-delete pair cannot be collapsed into a move either.
+The only way to change a binary is create-a-new-name plus delete-the-old, or a
+move. Delete is characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md): it removes exactly the
+named path. **A move is the only way to relocate a binary to an arbitrary
+path**, because the upload flow cannot choose a path and cannot replace a file,
+while `POST /move` honors any destination, preserves the bytes, and refuses to
+overwrite an existing file (`409 ALREADY_EXISTS`).
 
 This is the opposite of the text route, where `PUT` replaces in place with no
 collision rename ([text-write-protocol.md](text-write-protocol.md)).
@@ -373,6 +376,14 @@ cannot work around them.
    to be `/uploads/<basename>`, refuse when that name already exists rather
    than silently accepting a collision rename, and never claim to have
    satisfied a plan row whose path differs from what the server recorded.
+
+   Since this record was written, [#16](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/16)
+   characterized `POST /move`, which changes the picture: the upload flow can
+   still only *create* at `/uploads/<basename>`, but a **move can then relocate
+   that file to any path**. So a binary can reach an arbitrary path in two
+   steps — upload, then move — with the move refusing to overwrite an existing
+   destination. That is a viable path for a binary `upload` row, and it is
+   recorded in [delete-rename-protocol.md](delete-rename-protocol.md).
 
 5. **The create gap from #14 is partly closed, but only for `/uploads`.**
    `PUT /file` cannot create anything, and the upload flow can create a file

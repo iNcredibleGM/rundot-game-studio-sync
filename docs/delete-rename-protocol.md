@@ -16,14 +16,19 @@ Read paths are in [protocol.md](protocol.md). The text write route is
 [binary-upload-protocol.md](binary-upload-protocol.md); this document covers
 the delete verb, rename, and the concurrency controls.
 
-## Endpoint
+## Endpoints
 
 ```text
 DELETE /api/projects/{projectId}/file?path={encodedPath}
+
+POST   /api/projects/{projectId}/move
+Content-Type: application/json
+
+{ "from": "{absolute path}", "to": "{absolute path}" }
 ```
 
-No request body. `path` is percent-encoded and must be absolute, exactly as on
-the read and write routes.
+`DELETE` takes no body. `path` is percent-encoded and must be absolute, exactly
+as on the read and write routes.
 
 A successful delete returns `200` with the path it removed:
 
@@ -32,7 +37,9 @@ A successful delete returns `200` with the path it removed:
 ```
 
 `Content-Type: application/json`. This is the same `/file` route that serves
-`GET` and `PUT`, so the verb is the whole difference.
+`GET` and `PUT`, so the verb is the whole difference. The move route is
+separate and sits at the project root; it is covered under
+[Rename / move](#rename--move).
 
 ### The status is not the proof
 
@@ -123,56 +130,112 @@ the same `401` the other mutating routes return.
 
 ## Rename / move
 
-**No rename route was found.** Five plausible shapes were tried against a
-freshly created probe-owned file each time, and every one failed without moving
-anything:
+**A rename route exists**, and it is at the **project root**, not under `/file`
+or `/files`:
 
-| Attempt | Status | Body | Old path gone | New path present |
+```text
+POST /api/projects/{projectId}/move
+Content-Type: application/json
+
+{ "from": "/uploads/a.txt", "to": "/sync-probe/b.txt" }
+```
+
+```json
+{ "success": true,
+  "data": { "from": "/uploads/a.txt", "to": "/sync-probe/b.txt" } }
+```
+
+It was found by capturing a real UI rename from the DevTools Network panel.
+Five guessed shapes had failed first, and they are worth recording because they
+show where the route is *not*:
+
+| Attempt | Status | Body |
+| --- | --- | --- |
+| `PATCH /file?path=…` with `newPath` | `405` | `method not allowed` |
+| `POST /file/rename` with `path` + `newPath` | `404` | `not found` |
+| `POST /file/move` with `path` + `newPath` | `404` | `not found` |
+| `POST /files/rename` with `from` + `to` | `404` | `not found` |
+| `PUT /file?path=…` with only `newPath` | `400` | `content must be a string` |
+
+The `PUT` case is the most telling of the failures: the body carried `newPath`,
+and the server rejected it for a missing `content` string, which proves it
+looked for `content` and **ignored `newPath` entirely**.
+
+### It honors an arbitrary destination path
+
+This is the opposite of the upload flow, which discards the requested directory
+and always lands at `/uploads/{basename}`
+([binary-upload-protocol.md](binary-upload-protocol.md)). A move takes the
+destination literally:
+
+| Move | Result |
+| --- | --- |
+| `/uploads/a.txt` → `/sync-probe/b.txt` | `200`, moved; destination honored |
+| `/uploads/a.txt` → `/sync-probe/b.txt` (same directory) | `200`, moved; destination honored |
+
+A file can be relocated **out of `/uploads` entirely**, into any directory. This
+is the only observed way to place a file at an arbitrary path, since `PUT /file`
+cannot create and the upload flow cannot choose a path.
+
+### Bytes are preserved exactly
+
+| Kind | SHA-256 before | SHA-256 after | Preserved |
+| --- | --- | --- | --- |
+| Text | `5b2e1b13…` | `5b2e1b13…` | yes |
+| Binary (`image/png`) | `443059c4…` | `443059c4…` | yes |
+
+A move works on binaries as well as text, and it does not re-encode. For
+binaries this matters more than for text: the upload flow cannot target a path
+and cannot replace a file, so **a move is the only way to relocate a binary**
+short of delete + re-upload, which cannot restore the original path.
+
+### It refuses to overwrite an existing destination
+
+| Attempt | Status | Body | Source after | Destination after |
 | --- | --- | --- | --- | --- |
-| `PATCH /file?path=…` with `newPath` | `405` | `method not allowed` | no | no |
-| `POST /file/rename` with `path` + `newPath` | `404` | `not found` | no | no |
-| `POST /file/move` with `path` + `newPath` | `404` | `not found` | no | no |
-| `POST /files/rename` with `from` + `to` | `404` | `not found` | no | no |
-| `PUT /file?path=…` with only `newPath` | `400` | `{"success":false,"error":{"message":"content must be a string","code":"VALIDATION_ERROR","field":"content"}}` | no | no |
+| Move onto an existing path | `409` | `Something already exists at that destination.` | still listed | unchanged (`c28eafda…` before and after) |
 
-Two of these are informative beyond the failure:
+This is a genuine safety property, and it is the opposite of `PUT /file`, which
+silently replaces in place. A move **cannot clobber a file**, so it is not a
+silent-destruction risk the way a write is. The destination's bytes were
+byte-for-byte identical before and after the attempt.
 
-- `PATCH` returns `405`, which means the route exists but does not accept that
-  verb. The `/file` route is `GET`/`PUT`/`DELETE` only.
-- The `PUT` case is the most telling. The body carried `newPath`, and the
-  server rejected it with "content must be a string" — it looked for `content`
-  and **ignored `newPath` entirely**. There is no rename shape on the write
-  route.
+### Failure and retry behavior
 
-### A rename can only compose as delete + create, and create is unsolved
+| Case | Status | Body |
+| --- | --- | --- |
+| Move from a path that does not exist | `404` | `not found` |
+| Move a second time, after the first succeeded | `404` | `not found` |
+| Move onto an existing destination | `409` | `ALREADY_EXISTS` |
 
-Because no server-side move exists, a rename has to be expressed as
-delete-the-old-path plus create-the-new-path. The create half is the problem:
+A retry after an ambiguous failure returns `404` because the source is already
+gone, and the destination **survives** — the retry does not undo or duplicate
+the first move. As with delete, the effect is idempotent even though the status
+is not: `404` here means "the move already happened", not "the move failed".
 
-- `PUT /file` **cannot create** a file. A path that is not already in the
-  project returns `404`, and `POST` on the same route is `405`
-  ([text-write-protocol.md](text-write-protocol.md)).
-- The binary upload flow can create a file, but it **cannot choose the path** —
-  the requested path is ignored and the file always lands at
-  `/uploads/{basename}` ([binary-upload-protocol.md](binary-upload-protocol.md)).
+Note the difference in body shape: `404` is `text/plain` with the literal
+`not found`, while `409` is JSON with an `error.code` of `ALREADY_EXISTS`. A
+client must not assume JSON on every status.
 
-So for any path outside `/uploads/{basename}`, a rename is not expressible at
-all today. `Push` must treat a local rename as a delete candidate plus an
-upload that it cannot serve, rather than silently performing half of it.
+### Consequences for `Push`
 
-**The route is not proven absent, only unfound.** A real rename performed in
-the Studio UI would settle it, and the probe supports capturing one from the
-DevTools Network panel (`rename-devtools-prepare` / `rename-devtools-apply`).
-That capture is the outstanding step for this section; until it exists, treat
-"Studio has no rename API" as strongly suggested but not established.
+This reverses the earlier conclusion for this section. A rename **is**
+expressible, and it is safer than a write:
 
-To complete it, `rename-devtools-prepare` writes a probe-owned target and
-prints instructions; the rename is then performed by hand in Studio with
-DevTools open, and `rename-devtools-apply` records the captured request and
-locates the moved bytes by content hash (the human chooses the new name, so the
-path cannot be assumed). Capture a HAR rather than a copied fetch if the
-response body is wanted — a request-only capture does not show the path the
-server recorded.
+- A local rename can be published as a single `POST /move`, not as a delete
+  plus a create. The create half is no longer needed.
+- It cannot silently clobber, because a move onto an existing destination is
+  refused with `409` rather than replacing it.
+- It preserves bytes exactly, for text and binaries alike.
+- It can target any path, which is the one capability the upload flow lacks.
+
+The remaining caveat is the same one that applies to every other route here:
+there is no ETag, no version, and no honoured `If-Match`
+([below](#etag-and-conditional-requests)), so a move cannot be made
+conditional. A client must still verify that `from` is the file it expects
+immediately before sending the request, and must still keep a recoverable copy,
+because the server cannot refuse a move computed against a changed source.
+
 
 ## Revision identity
 
@@ -299,13 +362,16 @@ protocol.
 | Does it echo what it removed? | Yes, `{"success":true,"data":{"deleted":"<path>"}}` on success. |
 | What refuses a delete? | `400` non-absolute path, `401` auth, `404` absent path. |
 | Does a failed delete damage anything? | No. Every rejection left the file in place. |
-| Is a rename possible? | **No route found.** Delete + create, and create is unsolved. |
+| Is a rename possible? | **Yes.** `POST /api/projects/{id}/move` with `{from,to}`. |
+| Does a move honor the destination path? | Yes, including moving out of `/uploads` entirely. |
+| Can a move clobber an existing file? | **No.** It returns `409 ALREADY_EXISTS` and changes nothing. |
+| Does a move preserve bytes? | Yes, exactly, for text and binaries alike. |
 | Is there any revision identity? | No. `path`, `type`, `size` only. |
 | Does a stale write over a deleted file resurrect it? | **No.** It returns `404`. |
 
 ## Summary for `Push` design
 
-The three constraints that matter:
+The four constraints that matter:
 
 1. **A delete is unguarded and unversioned.** Nothing server-side prevents
    deleting a file that changed since the plan was made. Any safety has to be
@@ -319,16 +385,23 @@ The three constraints that matter:
    the opposite of the write case, and it means `Push` may retry a delete
    without risking a duplicate or a resurrection.
 
-3. **A rename is not expressible.** With no move route, a rename is a delete
-   plus a create, and create is unsolved for any path outside
-   `/uploads/{basename}`. `Push` must refuse a rename it cannot express rather
-   than performing the delete half and stranding the content.
+3. **A rename is expressible and is safer than a write.** A local rename can be
+   published as one `POST /move`, and a move cannot clobber: it refuses an
+   existing destination with `409` instead of replacing it. It also preserves
+   bytes exactly and can target any path, which makes it the only way to
+   relocate a binary.
+
+4. **A move is still unversioned.** No ETag and no honoured `If-Match` means a
+   move cannot be made conditional either, so the source must be verified
+   client-side immediately before the request, exactly as for a write or a
+   delete.
 
 For [#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17)
 this means a `deleteRemoteCandidate` row could in principle be applied with a
 client-side re-fingerprint immediately before the `DELETE`, plus a backup of
 the bytes being removed — but only once the milestone permits remote mutation.
-Nothing in this evidence authorizes emitting a standing `DELETE` today.
+Nothing in this evidence authorizes emitting a standing `DELETE` today, and
+`deleteRemoteCandidate` remains classification-only.
 
 ## How this was observed
 
@@ -352,10 +425,12 @@ Two safeguards made the delete cases safe to run:
 - The directory case deliberately does not target a real parent directory, for
   the same reason.
 
-The rename section is the one incomplete part. The five guessed shapes were
-tried and all failed; the DevTools capture of a real UI rename has not been
-performed yet, so "no rename route exists" is a strong inference from the
-probe results rather than a confirmed absence.
+The rename section is complete. The route was found by capturing a real UI
+rename from the DevTools Network panel after five guessed shapes failed, then
+characterized live. Two probe bugs surfaced during that work and were fixed:
+the capture extractor recorded the request method without its URL, and the
+`-AllRuns` cleanup selected paths its own guard refused. Both are pinned by
+assertions now.
 
 Evidence files contain status codes, sizes, hashes, and response bodies only.
 No tokens, credentials, or project file contents are recorded, and the probe
