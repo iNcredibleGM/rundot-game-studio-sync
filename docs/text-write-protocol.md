@@ -140,9 +140,23 @@ not implement preconditions on this route.
 ### Consequence: concurrent modification cannot be detected server-side
 
 Because there is no ETag, no version field, and no honoured `If-Match`, the
-server has no way to reject a write that was computed against stale content. A
-write sent after someone else changed the file is expected to **silently
-clobber** that change, and nothing in the response will say so.
+server has no way to reject a write that was computed against stale content.
+
+**This was confirmed live.** The sequence was:
+
+1. Write a known baseline to `/README.md`.
+2. Change `/README.md` to different content through the Studio editor and save.
+3. Send the step-1 baseline bytes back through `PUT`, without any precondition.
+
+| Step | Result |
+| --- | --- |
+| Remote content at step 3 (sha `a4c3ed04…`) | differs from the stale bytes (`c6f267dd…`) |
+| `PUT` of the stale bytes | `200`, and the response echoes the stale content |
+| Remote content after the write | sha `c6f267dd…` — the human edit is gone |
+
+The write succeeded with no error, no warning, and no field in the response
+indicating that the content it replaced was not what the writer expected. A
+concurrent Studio edit is **silently clobbered**.
 
 This is the single most important constraint for `Push`. The v0.1.3 plan
 artifact records `expectedRemoteHash` and `remoteManifestHash` precisely so a
@@ -150,14 +164,10 @@ future `Apply` can re-verify before writing
 ([plan.md](plan.md)). This evidence shows that re-verification must happen
 **entirely on the client, immediately before the write**, and that it can never
 be delegated to the server. The window between "re-check remote hash" and "send
-PUT" is unprotected; the only mitigation available is to keep it as small as
-possible and to compare hashes again afterwards.
-
-The live two-step concurrency observation (write stale bytes over a manual
-Studio edit) is still outstanding and is tracked on
-[#14](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/14). The
-inference above follows from the absent preconditions, but it should be
-confirmed before `Push` relies on it.
+PUT" is unprotected; the only mitigations available are to keep that window as
+small as possible, to compare the hash again after the write, and to keep a
+backup of the bytes being replaced so a clobber is recoverable rather than
+silent.
 
 ## Failure behavior
 
@@ -241,15 +251,15 @@ defense-in-depth.
 | Are bytes preserved? | Yes, exactly: CRLF, BOM, emoji, empty, no trailing newline. |
 | Is it idempotent? | Yes. Identical writes converge, no duplicates. |
 | Can a write be made conditional? | No. No ETag, no version, `If-Match` ignored. |
-| Can a stale write be detected server-side? | No. Expect silent clobber. |
+| Can a stale write be detected server-side? | No. Confirmed live: a concurrent Studio edit is silently clobbered. |
 | Does it return the new state? | Yes, the response echoes path/encoding/content/size/mimeType. |
 | What refuses a write? | `400` body validation, `401` auth, `413` over 2,000,000 chars, `404` absent path. |
 | Does a rejected write damage the file? | No partial write observed; prior content survived a `413`. |
 | Are reserved paths protected server-side? | No guard observed; a client must enforce its own. |
 
 The two hard constraints are that **create is unsolved** and that **staleness is
-undetectable server-side**. Both must be resolved or explicitly refused before
-`Push` can claim a safe overwrite.
+undetectable server-side, confirmed by a live silent clobber**. Both must be
+resolved or explicitly refused before `Push` can claim a safe overwrite.
 
 ## How this was observed
 
@@ -257,8 +267,11 @@ A local probe script outside the repository sent the requests and recorded statu
 codes, response bodies, and read-back hashes. It ran against a disposable Studio
 project only. Every mutating case read the original bytes first and restored them
 afterwards, verifying the restore by SHA-256; the probe reported any path it
-could not restore. No tokens, credentials, or project file contents are recorded
-here, and the evidence files contain only status codes, sizes, and hashes.
+could not restore. The concurrency case additionally required a manual edit in
+the Studio editor between two probe runs, so that observation is a live
+end-to-end result rather than a simulated one. No tokens, credentials, or
+project file contents are recorded here, and the evidence files contain only
+status codes, sizes, and hashes.
 
 The probe is deliberately not committed: this milestone's mutation ban covers
 product PowerShell, and shipping a working `PUT` helper would sit awkwardly
