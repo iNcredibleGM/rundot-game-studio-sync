@@ -150,6 +150,8 @@ $script:EvidencePath = $null
 $script:Evidence = New-Object 'System.Collections.Generic.List[object]'
 $script:CreatedPaths = New-Object 'System.Collections.Generic.List[string]'
 $script:Unrestored = New-Object 'System.Collections.Generic.List[string]'
+$script:CleanupRan = $false
+$script:CleanupRemaining = -1
 $script:Token = $null
 $script:Headers = $null
 $script:WriteEnabled = $false
@@ -247,9 +249,20 @@ function Save-ProbeEvidence {
 
     if ($script:CreatedPaths.Count -gt 0) {
         Write-ProbeLog ''
-        Write-ProbeLog 'CLEANUP - the probe created these paths; delete them in the Studio UI:'
-        foreach ($path in @($script:CreatedPaths | Sort-Object -Unique)) {
-            Write-ProbeLog "  $path"
+        if ($script:CleanupRan -and $script:CleanupRemaining -eq 0) {
+            # Everything created was deleted and verified gone. Do not print a
+            # manual-delete list: telling a human to remove files that no longer
+            # exist is how the list stops being trusted.
+            Write-ProbeLog 'CLEANUP - every path this run created was deleted and verified gone.'
+        }
+        else {
+            Write-ProbeLog 'CLEANUP - the probe created these paths; delete them in the Studio UI:'
+            foreach ($path in @($script:CreatedPaths | Sort-Object -Unique)) {
+                Write-ProbeLog "  $path"
+            }
+            if ($script:CleanupRan) {
+                Write-ProbeLog "  ($($script:CleanupRemaining) still listed after cleanup; see the log)"
+            }
         }
     }
 
@@ -2571,6 +2584,9 @@ function Invoke-ScenarioBinaryCleanup {
         if ($AllRuns) { return $true }
         return ($_ -like "*$($script:ProbeRunStamp)*")
     })
+
+    $script:CleanupRan = $true
+    $script:CleanupRemaining = $remaining.Count
 
     Add-ProbeEvidence -Case 'binary-cleanup-summary' -Status 'OBSERVED' -Data @{
         note        = 'cleanup result'
