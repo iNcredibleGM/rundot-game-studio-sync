@@ -185,6 +185,85 @@ Assert-True (
 ) "the DevTools rename capture must have a recording scenario"
 
 # ---------------------------------------------------------------------------
+# Every declared scenario must be dispatchable, and every scenario must also
+# appear in the dry-run plan. A scenario that is in the ValidateSet but not the
+# dispatch switch fails at run time, after -ConfirmRemoteWrite was supplied,
+# which is the worst moment to discover a typo. A scenario missing from the
+# plan text would make a dry run under-report what it would send.
+# ---------------------------------------------------------------------------
+
+$validateSetMatch = [regex]::Match(
+    $probeText,
+    '(?s)\[ValidateSet\((.*?)\)\]\s*\[string\]\$Scenario'
+)
+Assert-True $validateSetMatch.Success "the probe must declare a scenario ValidateSet"
+
+$declaredScenarios = @()
+if ($validateSetMatch.Success) {
+    $declaredScenarios = @(
+        [regex]::Matches($validateSetMatch.Groups[1].Value, "'([a-z0-9-]+)'") |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+    )
+}
+
+Assert-True (
+    $declaredScenarios.Count -gt 20
+) "the scenario list must include the #16 delete/rename/concurrency scenarios"
+
+$dispatchMatch = [regex]::Match($probeText, '(?s)switch \(\$Scenario\) \{(.*?)\n\}')
+Assert-True $dispatchMatch.Success "the probe must have a scenario dispatch switch"
+
+$undispatched = @()
+if ($dispatchMatch.Success) {
+    foreach ($scenarioName in $declaredScenarios) {
+        if ($dispatchMatch.Groups[1].Value -notmatch [regex]::Escape("'$scenarioName'")) {
+            $undispatched += $scenarioName
+        }
+    }
+}
+
+Assert-Equal 0 $undispatched.Count (
+    "every declared scenario must be dispatched; missing: $($undispatched -join ', ')"
+)
+
+# The runner functions are the documented entry points; they must exist and be
+# reachable from the dispatch switch.
+foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all')) {
+    Assert-True (
+        $dispatchMatch.Success -and
+        $dispatchMatch.Groups[1].Value -match [regex]::Escape("'$runnerName'")
+    ) "the $runnerName runner must be dispatched"
+}
+
+# Every scenario must also have a dry-run plan entry, so a dry run reports what
+# it would send. Read-only survey scenarios are the deliberate exception.
+$planMatch = [regex]::Match($probeText, '(?s)\$plans = @\{(.*?)\n    \}')
+$missingPlans = @()
+if ($planMatch.Success) {
+    foreach ($scenarioName in $declaredScenarios) {
+        if ($scenarioName -like '*-survey') { continue }
+        if ($planMatch.Groups[1].Value -notmatch [regex]::Escape("'$scenarioName'")) {
+            $missingPlans += $scenarioName
+        }
+    }
+}
+
+Assert-Equal 0 $missingPlans.Count (
+    "every mutating scenario must have a dry-run plan entry; missing: $($missingPlans -join ', ')"
+)
+
+# A dispatch arm that is present but empty would satisfy the reachability check
+# above while sending nothing, so the arm must call a scenario function.
+if ($dispatchMatch.Success) {
+    $emptyArms = [regex]::Matches(
+        $dispatchMatch.Groups[1].Value,
+        "(?m)^\s*'[a-z0-9-]+'\s*\{\s*\}"
+    )
+    Assert-Equal 0 $emptyArms.Count "a probe dispatch arm must call a scenario function, not be empty"
+}
+
+# ---------------------------------------------------------------------------
 # The restore discipline that #14 learned the hard way.
 # ---------------------------------------------------------------------------
 
