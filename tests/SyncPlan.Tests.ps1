@@ -286,7 +286,7 @@ try {
         -Snapshot $snapshot
 
     Assert-Equal 1 $artifact.schemaVersion "the artifact schemaVersion must be 1"
-    Assert-Equal '0.1.3' $artifact.toolVersion "the artifact toolVersion must be the milestone"
+    Assert-Equal '0.2.0' $artifact.toolVersion "the artifact toolVersion must be the milestone"
     Assert-SyncPlanTestIsGuid -Value $artifact.planId
     Assert-Equal 'proj-test-1' $artifact.projectId "the artifact must record projectId"
     Assert-Equal `

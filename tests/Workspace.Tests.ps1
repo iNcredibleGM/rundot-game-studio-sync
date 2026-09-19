@@ -103,7 +103,7 @@ try {
 
     $base = Read-BaseManifest -WorkspaceRoot $workspace
     Assert-Equal 1 $base.schemaVersion "BASE schemaVersion should be 1"
-    Assert-Equal "0.1.3" $base.toolVersion "BASE toolVersion should be the v0.1.3 milestone"
+    Assert-Equal "0.2.0" $base.toolVersion "BASE toolVersion should be the v0.2.0 milestone"
     Assert-Equal $projectId $base.projectId "BASE should persist projectId"
     Assert-Equal $fingerprint $base.localRootFingerprint "BASE should persist the workspace fingerprint"
     Assert-True (-not [string]::IsNullOrEmpty($base.capturedAt)) "BASE should record capturedAt"

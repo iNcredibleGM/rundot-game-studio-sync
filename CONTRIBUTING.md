@@ -44,4 +44,4 @@ Tests must not require Pester to be installed.
 
 - Never print, log, or commit access tokens, refresh tokens, or auth files (`%APPDATA%\.rundot\`).
 - Do not include those values in bug reports, PR bodies, or issue comments.
-- Until the v0.2.0 push work, do not add Studio mutation helpers (`PUT`, `DELETE`, `upload-url`, `upload-adopt`). Firebase `securetoken` POST for token refresh is allowed.
+- v0.2.0 push work may add the documented text overwrite route only: `PUT /api/projects/{projectId}/file` in `lib/RemoteWrite.ps1`. Do not add `DELETE`, `upload-url`, `upload-adopt`, or `POST /move`. Firebase `securetoken` POST for token refresh is allowed.
