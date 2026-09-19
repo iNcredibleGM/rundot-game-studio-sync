@@ -11,7 +11,9 @@ The classifier is a pure function over three in-memory maps. It performs no
 network access and no filesystem access of its own, and it never mutates BASE
 or any input map. `Plan`/`Status` ([#9](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/9))
 compose it ([plan.md](plan.md)); `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
-filters its rows for applicable work.
+filters its rows for applicable downloads, and `Push`
+([#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17))
+filters plan rows for applicable utf8 text overwrites ([push.md](push.md)).
 
 `Applicable` is the classifier's own view of a path. `Plan` is stricter for
 publish work: only a utf8 text **overwrite** may stay `applicable: true` in the

@@ -4,11 +4,9 @@ Observed behavior of the one Studio route that can change a text file. These
 are undocumented implementation details captured from a disposable project and
 may change without notice.
 
-This document is **evidence only**. Nothing in the product calls this route yet:
-`game-studio-sync.ps1` remains GET-only, and `Push`/`Apply` do not exist. The
-purpose of the record is to constrain the design of
-[#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17), not to
-permit a write.
+This document is **evidence** for the one route `Push` may call: documented
+`PUT /file` for utf8 text overwrites only ([push.md](push.md)). There is still
+no `Apply` shortcut, and no binary create or adopt route is used.
 
 Read paths are in [protocol.md](protocol.md); this document covers only the
 write side. Binary create/overwrite is [#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15),

@@ -11,12 +11,14 @@ sides that can drift apart, and helps you move changes **from Studio to your
 machine** without guessing:
 
 - **Init** builds a workspace and records a verified BASE
-- **Plan** / **Status** show what a future sync would do, without writing
+- **Plan** / **Status** show what a sync would do, without writing
 - **Pull** applies clean remote-only changes, with a backup of everything it replaces
+- **Push** publishes clean local text overwrites to Studio when you pass `-ConfirmPush`
 
-**This version is read-only against Studio.** There is no `Push` and no
-`Apply`. The tool never creates, replaces, renames, or deletes anything in
-Studio.
+**Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
+text files only. It never creates files, never uploads binaries, and never
+deletes anything on Studio. There is no `Apply` shortcut that skips the plan
+fingerprint gates.
 
 If all you want is a plain raw copy of a project, the original exporter
 (`game-studio-export.ps1`) still does that into a new or empty directory —
@@ -85,9 +87,10 @@ an ordinary folder of project files.
 (your files), and **REMOTE** (Studio now). Neither LOCAL nor REMOTE is
 authoritative — any ambiguity is reported as a conflict rather than guessed at.
 
-Your local edits show up as `UPLOAD` candidates. Because this version cannot
-push, they are reported but never actionable: **a plan is never permission to
-write.**
+Your local edits show up as `UPLOAD` candidates. Only a clean utf8 text
+overwrite may be actionable, and only after you run `Push -ConfirmPush`.
+**A plan is never permission to write** — Push re-verifies every fingerprint
+before any `PUT`.
 
 ### 4. Pull clean remote-only changes
 
@@ -103,6 +106,20 @@ Before replacing anything it copies the original into
 `.rundot-sync/backups/<timestamp>/`, prints the backup root, and asks you to
 type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
 backup.
+
+### 5. Push clean local text overwrites
+
+Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
+Push will check:
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ConfirmPush
+```
+
+`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`). Text
+creates, binaries, conflicts, and deletions are reported and left alone. If
+anything changed since `Plan`, Push refuses the whole run and asks you to plan
+again.
 
 ## Your workspace metadata
 
@@ -164,13 +181,15 @@ each keep their own independent BASE.
 | `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
 | `Status` | nothing | The same report, without saving an artifact |
 | `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
+| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan |
 
 Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
-[Pull](docs/pull.md), [BASE schema](docs/base-schema.md).
+[Pull](docs/pull.md), [Push](docs/push.md), [BASE schema](docs/base-schema.md).
 
-`Plan` and `Pull` **refuse without a BASE** and point you at `Init`: without a
-recorded shared state there is no verified direction. The refusal happens before
-authentication, so a workspace that cannot plan never asks for a token.
+`Plan`, `Pull`, and `Push` **refuse without a BASE** and point you at `Init`:
+without a recorded shared state there is no verified direction. The refusal
+happens before authentication, so a workspace that cannot plan never asks for a
+token.
 
 Every dry run ends with:
 
@@ -300,8 +319,8 @@ That is the intended behavior. See
 
 Deliberately out of scope, so nothing here does them by accident:
 
-- Pushing or applying local changes to Studio (`Push`, `Apply`)
-- Remote create, replace, rename, or delete
+- Applying local changes without a fresh `Plan` (`Apply`)
+- Remote create, binary upload, rename, or delete
 - Binary upload or adopt
 - Deleting anything automatically, locally or remotely
 - `.rundotignore` custom patterns
