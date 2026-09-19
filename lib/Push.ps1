@@ -21,7 +21,7 @@
 
 function Assert-RundotSyncPushPlanArtifact {
     param(
-        [Parameter(Mandatory)]
+        [AllowNull()]
         $Artifact,
 
         [Parameter(Mandatory)]
@@ -230,7 +230,11 @@ function Get-SyncPushSelection {
             continue
         }
 
-        $change = Get-SyncPlanChange -Path $path -Base $Base -Local $Local -Remote $Remote
+        $change = Get-SyncPlanChange `
+            -Path $path `
+            -Base (Get-SyncMapEntry -Map $Base -Path $path) `
+            -Local (Get-SyncMapEntry -Map $Local -Path $path) `
+            -Remote (Get-SyncMapEntry -Map $Remote -Path $path)
         $liveStatus = [string]$change.Status
 
         if ($liveStatus -ne $script:SyncStatusUpload) {
@@ -709,7 +713,7 @@ function Invoke-RundotSyncPush {
         [Parameter(Mandatory)]
         $Resolution,
 
-        [Parameter(Mandatory)]
+        [AllowNull()]
         $Artifact,
 
         $Local,
