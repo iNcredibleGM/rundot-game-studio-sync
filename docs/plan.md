@@ -32,21 +32,23 @@ runs the identical engine and persists nothing.
 
 ## No plan is permission to write
 
-This milestone has **no `Apply` and no `Push`**. Every remote-mutating
-operation is forced to `applicable: false`, even when the classifier considers
-the path actionable in principle:
+`Push` consumes this artifact and re-verifies every fingerprint before
+writing. A plan is still only a point-in-time observation: it never grants
+permission to skip those checks or to bypass `-ConfirmPush`.
+
+The plan layer marks only one remote-mutating row as applicable:
 
 | Status | Applicable | Why |
 | --- | --- | --- |
-| `upload` (text) | no | Remote mutation is not implemented in this milestone. |
+| `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
+| `upload` (text create) | no | `PUT /file` is overwrite-only; a missing remote path returns `404`. |
 | `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
-| `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. Studio cannot make a delete conditional: there is no ETag or version field and If-Match is ignored, so a stale delete cannot be refused server-side. |
+| `deleteRemoteCandidate` | no | `Push` does not delete remote files. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
-A text upload stays `Status = upload` so the plan still shows the candidate,
-but it is never marked applicable, and it always carries a reason. The
-[classifier](classifier.md) still reports text uploads as applicable for a
-future `Push`; the plan layer is what blocks them here.
+Every blocked remote-mutating row carries an explicit reason. The
+[classifier](classifier.md) still marks text overwrites as applicable; the
+plan layer refuses text creates, all binaries, and every delete candidate.
 
 ## Console layout
 
@@ -118,9 +120,9 @@ contents, no tokens, no staging paths, no absolute local paths.
       "status": "upload",
       "kind": "utf8",
       "kinds": { "base": "utf8", "local": "utf8", "remote": "utf8" },
-      "applicable": false,
+      "applicable": true,
       "remoteMutating": true,
-      "reason": "Remote mutation is not implemented in this milestone.",
+      "reason": null,
       "warning": null,
       "ignored": false,
       "kindChange": false,

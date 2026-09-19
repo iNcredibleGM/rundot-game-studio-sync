@@ -13,10 +13,11 @@ or any input map. `Plan`/`Status` ([#9](https://github.com/iNcredibleGM/rundot-g
 compose it ([plan.md](plan.md)); `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
 filters its rows for applicable work.
 
-`Applicable` is the classifier's own view of a path. `Plan` is stricter: it
-forces `applicable: false` on every remote-mutating status, so a plan never
-implies write permission ([plan.md](plan.md)). A text upload the classifier
-calls applicable is still blocked in the plan artifact.
+`Applicable` is the classifier's own view of a path. `Plan` is stricter for
+publish work: only a utf8 text **overwrite** may stay `applicable: true` in the
+artifact. Text creates, binary uploads, and delete candidates are forced to
+`applicable: false` with explicit reasons ([plan.md](plan.md)). A plan is never
+permission to write: `Push` must still re-verify every fingerprint.
 
 ## Inputs
 
