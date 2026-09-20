@@ -286,7 +286,7 @@ try {
         -Snapshot $snapshot
 
     Assert-Equal 1 $artifact.schemaVersion "the artifact schemaVersion must be 1"
-    Assert-Equal '0.1.3' $artifact.toolVersion "the artifact toolVersion must be the milestone"
+    Assert-Equal '0.2.0' $artifact.toolVersion "the artifact toolVersion must be the milestone"
     Assert-SyncPlanTestIsGuid -Value $artifact.planId
     Assert-Equal 'proj-test-1' $artifact.projectId "the artifact must record projectId"
     Assert-Equal `
@@ -400,20 +400,21 @@ try {
 
 
     # --------------------------------------------------------------------------
-    # No remote-mutating operation may be applicable in this milestone
+    # Publish policy: only a utf8 text overwrite may be applicable
     # --------------------------------------------------------------------------
 
     $guardBase = @{
-        'src/text.ts'   = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
-        'public/x.png'  = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA -Kind 'binary')
-        'src/dl.ts'     = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
-        'src/gone.ts'   = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+        'src/text.ts'     = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+        'public/x.png'    = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA -Kind 'binary')
+        'src/dl.ts'       = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+        'src/gone.ts'     = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
         'src/localdel.ts' = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
     }
     $guardLocal = @{
-        'src/text.ts'   = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB)
-        'public/x.png'  = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary')
-        'src/dl.ts'     = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
+        'src/text.ts'     = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB)
+        'src/new.ts'      = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC)
+        'public/x.png'    = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary')
+        'src/dl.ts'       = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
         'src/localdel.ts' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
     }
     $guardRemote = @{
@@ -444,10 +445,16 @@ try {
     $textUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/text.ts'
     Assert-Equal 'upload' $textUpload.status "the text upload row must keep its upload status"
     Assert-Equal $true $textUpload.remoteMutating "a text upload is remote-mutating"
-    Assert-Equal $false $textUpload.applicable "a text upload must not be applicable in this milestone"
-    Assert-True `
-        (-not [string]::IsNullOrEmpty([string]$textUpload.reason)) `
-        "a blocked text upload must explain why it is not applicable"
+    Assert-Equal $true $textUpload.applicable "a text overwrite must be applicable for Push"
+    Assert-Null $textUpload.reason "a publishable text overwrite must not carry a block reason"
+
+    $textCreate = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/new.ts'
+    Assert-Equal 'upload' $textCreate.status "a new local text file must still display as upload"
+    Assert-Equal $false $textCreate.applicable "a text create must not be applicable"
+    Assert-Equal `
+        'PUT /file cannot create a new path; a missing remote file returns 404.' `
+        ([string]$textCreate.reason) `
+        "a text create must explain that PUT is overwrite-only"
 
     $binaryUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'public/x.png'
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"
@@ -466,6 +473,10 @@ try {
     Assert-Equal 'deleteRemoteCandidate' $remoteDelete.status "a remote deletion keeps its status"
     Assert-Equal $true $remoteDelete.remoteMutating "a remote delete candidate is remote-mutating"
     Assert-Equal $false $remoteDelete.applicable "a remote delete candidate must not be applicable"
+    Assert-Equal `
+        'Push does not delete remote files.' `
+        ([string]$remoteDelete.reason) `
+        "a remote delete candidate must carry the Push refusal reason"
 
     $localDelete = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/localdel.ts'
     Assert-Equal 'deleteLocalCandidate' $localDelete.status "a local deletion keeps its status"
@@ -473,11 +484,7 @@ try {
     Assert-Equal $false $localDelete.applicable "a local delete candidate must not be applicable"
 
     foreach ($op in $guardOps) {
-        if ($op.remoteMutating) {
-            Assert-Equal `
-                $false `
-                $op.applicable `
-                "no remote-mutating operation may be applicable ('$($op.path)')"
+        if ($op.remoteMutating -and -not $op.applicable) {
             Assert-True `
                 (-not [string]::IsNullOrEmpty([string]$op.reason)) `
                 "a blocked remote-mutating operation must carry a reason ('$($op.path)')"

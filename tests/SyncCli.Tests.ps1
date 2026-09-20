@@ -20,8 +20,8 @@ if (Test-Path -LiteralPath $syncCliPath) {
 # --------------------------------------------------------------------------
 
 Assert-True `
-    ($syncCliSource -match "ValidateSet\(\s*'Init'\s*,\s*'Plan'\s*,\s*'Status'\s*,\s*'Pull'\s*\)") `
-    "the CLI should expose Init, Plan, Status, and Pull on a validated -Command"
+    ($syncCliSource -match "ValidateSet\(\s*'Init'\s*,\s*'Plan'\s*,\s*'Status'\s*,\s*'Pull'\s*,\s*'Push'\s*\)") `
+    "the CLI should expose Init, Plan, Status, Pull, and Push on a validated -Command"
 
 Assert-True `
     ($syncCliSource -match "ValidateSet\(\s*'FromRemote'\s*,\s*'Adopt'\s*\)") `
@@ -254,8 +254,8 @@ Assert-True `
     "the CLI must not reference Studio upload endpoints"
 
 Assert-True `
-    ($syncCliSource -notmatch "ValidateSet\(\s*'Apply'|ValidateSet\(\s*'Push'") `
-    "the CLI must not expose Apply or Push in this milestone"
+    ($syncCliSource -notmatch "ValidateSet\(\s*'Apply'") `
+    "the CLI must not expose Apply in this milestone"
 
 Assert-True `
     ($syncCliSource -notmatch '(?i)Authorization\s*=\s*''Bearer\s+[A-Za-z0-9]') `
@@ -351,7 +351,7 @@ Assert-True `
     ($pullFunctionText -match [regex]::Escape('-Force')) `
     "the CLI should forward -ForcePull into the engine"
 
-# Pull is the only mutating command, and it must never reach a Studio write.
+# Pull mutates LOCAL only and must never reach a Studio write.
 Assert-True `
     ($pullFunctionText -notmatch '(?i)upload-url|upload-adopt') `
     "Pull must never reference a Studio upload endpoint"
@@ -380,3 +380,74 @@ Assert-True `
 Assert-True `
     ($syncCliSource -match [regex]::Escape('Invoke-SyncPullCommand')) `
     "the dispatch should route Pull to Invoke-SyncPullCommand"
+
+
+# --------------------------------------------------------------------------
+# Push wiring: remote writes stay explicit and confirmed
+# --------------------------------------------------------------------------
+
+Assert-True `
+    ($syncCliSource -match '\$ConfirmPush') `
+    "the CLI should accept -ConfirmPush"
+
+foreach ($requiredPushFunction in @(
+    'Invoke-RundotSyncPush',
+    'Read-PlanArtifact'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredPushFunction)) `
+        "the CLI should call $requiredPushFunction rather than duplicating its logic"
+}
+
+foreach ($requiredPushLibrary in @(
+    'RemoteWrite.ps1',
+    'Push.ps1'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredPushLibrary)) `
+        "the CLI should load lib\$requiredPushLibrary"
+}
+
+$pushFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncPushCommand'
+Assert-True `
+    (-not [string]::IsNullOrEmpty($pushFunctionText)) `
+    "the CLI must define Invoke-SyncPushCommand for Push"
+
+$pushGateIndex = $pushFunctionText.IndexOf('Resolve-RundotSyncPlanBase')
+$pushAuthIndex = $pushFunctionText.IndexOf('Get-RundotAccessToken')
+Assert-True `
+    ($pushGateIndex -ge 0 -and $pushAuthIndex -ge 0 -and $pushGateIndex -lt $pushAuthIndex) `
+    "the Push no-BASE gate should be consulted before requesting Studio authentication"
+
+$pushArtifactIndex = $pushFunctionText.IndexOf('Read-PlanArtifact')
+Assert-True `
+    ($pushArtifactIndex -ge 0 -and $pushArtifactIndex -lt $pushAuthIndex) `
+    "Push should read last-plan.json before requesting Studio authentication"
+
+foreach ($pushFunction in @(
+    'Get-LocalManifest',
+    'Get-StableRemoteSnapshot',
+    'Invoke-RundotSyncPush',
+    'Clear-RemoteSnapshotTemp'
+)) {
+    Assert-True `
+        ($pushFunctionText -match [regex]::Escape($pushFunction)) `
+        "Invoke-SyncPushCommand should call $pushFunction"
+}
+
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmPush')) `
+    "the CLI should forward -ConfirmPush into the engine"
+
+Assert-True `
+    ($pushFunctionText -notmatch '(?i)upload-url|upload-adopt') `
+    "Push must never reference a Studio upload-adopt endpoint"
+
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Invoke-SyncPushCommand')) `
+    "the dispatch should route Push to Invoke-SyncPushCommand"
+
+$pushAuthClearCount = ([regex]::Matches($pushFunctionText, 'Authorization\s*=\s*\$null')).Count
+Assert-True `
+    ($pushAuthClearCount -ge 1) `
+    "Invoke-SyncPushCommand should clear the Authorization header before exiting"

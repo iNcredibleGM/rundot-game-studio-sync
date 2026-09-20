@@ -11,9 +11,11 @@
 $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
-# Every remote-mutating operation is blocked in this milestone. There is no
-# Apply and no Push, so a plan can never be permission to write.
-$script:SyncPlanRemoteMutationBlockedReason = 'Remote mutation is not implemented in this milestone.'
+# Push consumes plan fingerprints but a plan is never permission to write.
+# Only a clean text overwrite may be marked applicable; creates, binaries, and
+# deletes stay blocked with explicit reasons.
+$script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
+$script:SyncPlanDeleteRemoteBlockedReason = 'Push does not delete remote files.'
 
 $script:SyncPlanDryRunClosingLines = @(
     'Dry run only. No remote files were modified.'
@@ -138,8 +140,8 @@ function Get-SyncLocalManifestFingerprint {
 
 function Get-SyncPlanOperationRows {
     # Display-ready operation rows. The classifier decides status; Plan adds
-    # the milestone's write policy on top: a remote-mutating status is never
-    # applicable here, and always carries a reason.
+    # the publish policy on top: only a utf8 text overwrite may be applicable,
+    # and every blocked remote-mutating row carries a reason.
     param(
         [object[]]$Changes,
         $Base,
@@ -161,19 +163,29 @@ function Get-SyncPlanOperationRows {
 
         $applicable = [bool]$change.Applicable
         $reason = $change.Reason
+        $remoteSha = [string]$change.RemoteSha256
 
         if ($remoteMutating) {
-            $applicable = $false
-
-            # A binary upload keeps the classifier's fixed unverified-semantics
-            # reason; every other remote-mutating row gets the milestone block.
-            $isBinaryUpload = (
-                $status -eq $script:SyncStatusUpload -and
-                $localKind -eq 'binary'
-            )
-
-            if (-not $isBinaryUpload) {
-                $reason = $script:SyncPlanRemoteMutationBlockedReason
+            if ($status -eq $script:SyncStatusUpload) {
+                if ($localKind -eq 'binary') {
+                    $applicable = $false
+                }
+                elseif ($localKind -eq 'utf8') {
+                    if ([string]::IsNullOrEmpty($remoteSha)) {
+                        $applicable = $false
+                        $reason = $script:SyncPlanTextCreateReason
+                    }
+                }
+                else {
+                    $applicable = $false
+                }
+            }
+            elseif ($status -eq $script:SyncStatusDeleteRemoteCandidate) {
+                $applicable = $false
+                $reason = $script:SyncPlanDeleteRemoteBlockedReason
+            }
+            else {
+                $applicable = $false
             }
         }
 

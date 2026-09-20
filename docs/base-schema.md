@@ -7,15 +7,17 @@ bytes. `mtime` never decides direction.
 This schema is hashes and metadata only. It does not store file contents,
 access tokens, refresh tokens, or `%APPDATA%\.rundot\` auth paths.
 
-`Plan` and `Pull` must call `Assert-BaseOwnership` before using a BASE. Both do
-so through `Resolve-RundotSyncPlanBase`, which also applies the no-BASE gate
-([plan.md](plan.md)). `Pull` additionally refuses `-AllowNoBase`: it has no
-untrusted mode ([pull.md](pull.md)).
+`Plan`, `Pull`, and `Push` must call `Assert-BaseOwnership` before using a
+BASE. All three do so through `Resolve-RundotSyncPlanBase`, which also applies
+the no-BASE gate ([plan.md](plan.md)). `Pull` and `Push` additionally refuse
+`-AllowNoBase`: they have no untrusted mode ([pull.md](pull.md),
+[push.md](push.md)).
 
 ## Writers
 
-Two commands write BASE: `Init` creates it, and `Pull` replaces it after a
-fully verified success ([init.md](init.md), [pull.md](pull.md)).
+Three commands write BASE: `Init` creates it, `Pull` overlays it after verified
+local writes, and `Push` overlays it after verified remote writes
+([init.md](init.md), [pull.md](pull.md), [push.md](push.md)).
 
 - `Init -InitMode FromRemote` records every verified remote file.
 - `Init -InitMode Adopt` records only paths whose content hash matched
@@ -25,11 +27,14 @@ fully verified success ([init.md](init.md), [pull.md](pull.md)).
 - `Pull` overlays the re-verified identity of each path it applied onto the
   existing entries, additively. It writes BASE only after every written file
   has been re-hashed against REMOTE, and never drops an existing entry.
+- `Push` overlays the published local identity of each path it wrote onto the
+  existing entries, additively. It writes BASE only after every `PUT` has been
+  echo-verified, and never drops an existing entry.
 
 `Plan` reads BASE but never writes it. It persists only
 `.rundot-sync/last-plan.json` ([plan.md](plan.md)), so a plan can never change
-recorded shared state. A failed `Pull`, like a failed `Init`, leaves the
-previous BASE authoritative.
+recorded shared state. A failed `Pull`, `Push`, or `Init` leaves the previous
+BASE authoritative.
 
 ## Layout
 

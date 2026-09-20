@@ -92,7 +92,7 @@ Editing one tracked file in place, leaving BASE and REMOTE untouched, is the
 | Evidence | Location |
 | --- | --- |
 | `A / B / A` classifies as `upload` | `tests/SyncEngine.Tests.ps1`, three-way table |
-| A text upload keeps `status: upload` but is `applicable: false` | `tests/SyncPlan.Tests.ps1`, remote-mutation guard |
+| A text overwrite keeps `status: upload` and is `applicable: true`; a text create is `applicable: false` | `tests/SyncPlan.Tests.ps1`, publish policy |
 | A path present in BASE and LOCAL is never a delete candidate | `tests/SyncEngine.Tests.ps1`, deletion cases |
 
 **Zero invented deletes** is structural, not incidental: `deleteRemoteCandidate`
@@ -205,10 +205,10 @@ prints it so expiry is visible rather than buried in the JSON.
 `PUT`, HTTP `DELETE`, `upload-url`, `upload-adopt`, and any `Set-*` / `Remove-*`
 function in the remote API library. This milestone ships none.
 
-The plan layer enforces the same rule at runtime:
-`tests/SyncPlan.Tests.ps1` asserts that **no remote-mutating operation is
-applicable**, that every one of them carries a reason, and that a download is
-not remote-mutating.
+The plan layer enforces publish policy at runtime:
+`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite may be
+applicable among remote-mutating rows, that every blocked remote-mutating row
+carries a reason, and that a download is not remote-mutating.
 
 ## What this milestone deliberately does not do
 

@@ -431,7 +431,9 @@ function Initialize-RundotSyncFromRemote {
         -WorkspaceRoot $LocalDir `
         -StudioOrigin $StudioOrigin `
         -ProjectId $ProjectId `
-        -Headers $Headers
+        -Headers $Headers `
+        -ShowProgress `
+        -ProgressActivity 'Init FromRemote'
 
     return Import-RundotRemoteSnapshot `
         -LocalDir $LocalDir `
@@ -704,7 +706,9 @@ function Initialize-RundotSyncByAdopt {
         -WorkspaceRoot $LocalDir `
         -StudioOrigin $StudioOrigin `
         -ProjectId $ProjectId `
-        -Headers $Headers
+        -Headers $Headers `
+        -ShowProgress `
+        -ProgressActivity 'Init Adopt'
 
     $comparisons = @(
         Get-RundotSyncAdoptComparisons `

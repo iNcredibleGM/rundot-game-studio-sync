@@ -6,7 +6,7 @@ param(
     [string]$LocalDir,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Init', 'Plan', 'Status', 'Pull')]
+    [ValidateSet('Init', 'Plan', 'Status', 'Pull', 'Push')]
     [string]$Command,
 
     [ValidateSet('FromRemote', 'Adopt')]
@@ -19,7 +19,10 @@ param(
     [switch]$AllowNoBase,
 
     # Pull only: skip the overwrite confirmation prompt. Never skips backups.
-    [switch]$ForcePull
+    [switch]$ForcePull,
+
+    # Push only: confirm publishing clean text overwrites to Studio.
+    [switch]$ConfirmPush
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,10 +44,10 @@ $ErrorActionPreference = "Stop"
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status
 #   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull
+#   .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ConfirmPush
 #
-# Plan and Status are dry runs. They show what a future Apply would consider,
-# but no operation is applicable in this milestone and no plan is permission
-# to write. Add -Verbose to also list unchanged paths.
+# Plan and Status are dry runs. They show what a sync would consider, but a
+# plan is never permission to write. Add -Verbose to also list unchanged paths.
 #
 # Pull is the only command that writes LOCAL. It applies clean remote-only
 # changes, backs up every overwritten file into .rundot-sync/backups first,
@@ -53,8 +56,10 @@ $ErrorActionPreference = "Stop"
 # prompt but never a backup, and never bypasses the concurrent-edit guard.
 # Pull never deletes anything, locally or remotely.
 #
-# This script is GET-only. It does not create, replace, rename, or delete
-# anything on Studio.
+# Push is the only command that writes REMOTE. It consumes the last Plan
+# artifact, re-verifies every fingerprint, and publishes only clean utf8 text
+# overwrites via documented PUT /file. Pass -ConfirmPush to proceed. Push never
+# creates files, never uploads binaries, and never deletes anything.
 # ============================================================================
 
 
@@ -85,6 +90,8 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Backup.ps1")
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
+. (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
 
@@ -124,6 +131,7 @@ function Stop-WithUsageError {
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull -ForcePull"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ConfirmPush"
     Write-Host ""
 
     Clear-SensitiveVariables
@@ -168,8 +176,7 @@ function Get-ResolvedInitMode {
 # a token. Authentication happens only once the run can actually proceed.
 #
 # Both commands run the same engine. Plan persists a dry-run plan artifact;
-# Status persists nothing. Neither mutates Studio, and no operation in this
-# milestone is applicable.
+# Status persists nothing. Neither mutates Studio or BASE.
 # ============================================================================
 
 function Get-RundotSyncVerboseRequested {
@@ -483,6 +490,136 @@ function Invoke-SyncPullCommand {
 
 
 # ============================================================================
+# Push
+#
+# Push is the only command that writes REMOTE. It consumes last-plan.json,
+# re-verifies every fingerprint against the live tree, and publishes only clean
+# utf8 text overwrites. -ConfirmPush is required before any PUT runs.
+# ============================================================================
+
+function Invoke-SyncPushCommand {
+    param(
+        [string]$WorkspaceRoot,
+        [string]$StudioProjectId,
+        [bool]$Confirm,
+        [string]$Origin,
+        [string]$SyncAuthDir,
+        [string]$SyncAuthPath,
+        [string]$CliSessionPath
+    )
+
+    # 1. BASE gate, before authentication. Push has no untrusted mode.
+    $resolution = $null
+
+    try {
+        $resolution = Resolve-RundotSyncPlanBase `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        Clear-SensitiveVariables
+        exit 1
+    }
+
+    $artifact = $null
+    try {
+        $artifact = Read-PlanArtifact -WorkspaceRoot $WorkspaceRoot
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        Clear-SensitiveVariables
+        exit 1
+    }
+
+    # 2. Authenticate. Push reads REMOTE before each PUT and writes via PUT.
+    Write-Section "Push - RUN Studio authentication"
+
+    $authResult = Get-RundotAccessToken `
+        -StudioOrigin $Origin `
+        -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir `
+        -AuthPath $SyncAuthPath `
+        -RundotCliSessionPath $CliSessionPath
+
+    $script:Token = $authResult.AccessToken
+    $script:RefreshToken = $authResult.RefreshToken
+
+    $Headers = @{
+        Authorization = "Bearer $script:Token"
+        Accept        = "*/*"
+    }
+
+    $script:Headers = $Headers
+
+    try {
+        # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
+        Write-Section "Push - LOCAL and REMOTE"
+
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+
+        $snapshot = Get-StableRemoteSnapshot `
+            -WorkspaceRoot $WorkspaceRoot `
+            -StudioOrigin $Origin `
+            -ProjectId $StudioProjectId `
+            -Headers $Headers
+
+        Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
+
+        # 4. Select, confirm, GET+PUT+echo verify, and update BASE.
+        $result = Invoke-RundotSyncPush `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId `
+            -Resolution $resolution `
+            -Artifact $artifact `
+            -Local $localManifest `
+            -Remote $snapshot.Files `
+            -Snapshot $snapshot `
+            -StudioOrigin $Origin `
+            -Headers $Headers `
+            -ConfirmPush:$Confirm
+
+        Write-Host ""
+        Write-Host $result.Report
+        Write-Host ""
+
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Cleanup is best effort.
+        }
+
+        Clear-SensitiveVariables
+    }
+    catch {
+        Write-Host ""
+        Write-Host $_.Exception.Message
+        Write-Host ""
+        try {
+            Clear-RemoteSnapshotTemp -WorkspaceRoot $WorkspaceRoot
+        }
+        catch {
+            # Cleanup is best effort.
+        }
+        Clear-SensitiveVariables
+        exit 1
+    }
+    finally {
+        $Headers.Authorization = $null
+        Clear-SensitiveVariables
+    }
+
+    exit 0
+}
+
+
+# ============================================================================
 # Init
 # ============================================================================
 function Invoke-SyncInit {
@@ -597,6 +734,10 @@ if ($Command -eq 'Init') {
         Stop-WithUsageError "-ForcePull applies to Pull only."
     }
 
+    if ($ConfirmPush) {
+        Stop-WithUsageError "-ConfirmPush applies to Push only."
+    }
+
     $resolvedInitMode = Get-ResolvedInitMode `
         -RequestedInitMode $InitMode `
         -FromRemoteAlias ([bool]$FromRemote) `
@@ -634,8 +775,30 @@ if ($Command -eq 'Pull') {
         -CliSessionPath $RundotCliSessionPath
 }
 
+if ($Command -eq 'Push') {
+    if ($AllowNoBase) {
+        Stop-WithUsageError (
+            "-AllowNoBase applies to Plan and Status, not Push.`n" +
+            "Push requires a verified BASE: without one there is no shared state to push against."
+        )
+    }
+
+    Invoke-SyncPushCommand `
+        -WorkspaceRoot $LocalDir `
+        -StudioProjectId $ProjectId `
+        -Confirm ([bool]$ConfirmPush) `
+        -Origin $StudioOrigin `
+        -SyncAuthDir $AuthDir `
+        -SyncAuthPath $AuthPath `
+        -CliSessionPath $RundotCliSessionPath
+}
+
 if ($ForcePull) {
     Stop-WithUsageError "-ForcePull applies to Pull only."
+}
+
+if ($ConfirmPush) {
+    Stop-WithUsageError "-ConfirmPush applies to Push only."
 }
 
 Invoke-SyncPlanCommand `
