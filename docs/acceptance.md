@@ -176,6 +176,11 @@ deliberate:
   `Get-LocalManifest` runs before `New-RundotSyncPlanAnalysis`, and the failure
   path exits non-zero.
 
+At startup the harness prints the canonical gate map (numbers 1–13) and the
+**execution order** for the current run (offline gates first, then live gates
+2→9→3→6→4→11–13). Gate numbers are not execution order: 5–10 are Pull-era
+offline checks; 11–13 were added for Push without renumbering.
+
 7b is an order assertion rather than a live end-to-end abort because `Plan`
 authenticates **before** it reads LOCAL. Triggering the real abort through the
 CLI therefore needs a token, and asserting only on the exit code would be a
@@ -228,9 +233,10 @@ carries a reason, and that a download is not remote-mutating.
 | No backup set, journal, or BASE move on decline | `tests/Push.Tests.ps1`, orchestrator cases |
 
 **Live check:** after Gates 2–4 and a fresh `Plan`, run `Push` in a child
-process without `-ForcePush`. Expect a non-zero exit, unchanged BASE
-`capturedAt`, no new backup set, and no new `push` / `push-backup` journal
-records.
+process with `-NonInteractive` and without `-ForcePush`. Expect a non-zero
+exit, unchanged BASE `capturedAt`, no new backup set, and no new `push` /
+`push-backup` journal records. The harness uses `-NonInteractive` so the child
+cannot prompt for `yes` on the parent console.
 
 ### 12. Push `-ForcePush` applies with remote backup and BASE update
 
@@ -241,10 +247,10 @@ records.
 | The backup holds remote bytes, not the local publish payload | `tests/Push.Tests.ps1`, backup content |
 | BASE moves only after verified apply | `tests/Push.Tests.ps1`, BASE update cases |
 
-**Live check:** run `Push -ForcePush` on the post-Pull plan from Gate 2's upload.
-Expect `applied ≥ 1`, `BASE updated: true`, a printed backup root and this-run
-set, and a backup copy that restores by plain file copy and does not match the
-local file bytes.
+**Live check:** run `Push -ForcePush` on a **fresh** post-decline `Plan` (the
+harness re-plans before gate 12). Expect `applied ≥ 1`, `BASE updated: true`, a
+printed backup root and this-run set, and a backup copy that restores by plain
+file copy and does not match the local file bytes.
 
 ### 13. Push journals success and `push-backup` without secrets
 
