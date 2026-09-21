@@ -141,9 +141,9 @@ counts, and set names. It never records file contents, access tokens, refresh
 tokens, or `Authorization` headers. Fields are written from a fixed allowlist,
 and an absolute path is refused rather than recorded.
 
-`Pull` is the only writer of the journal. A no-op pull writes no record. The
-journal lives under `.rundot-sync/`, which is in the default ignore set, so it
-is never an upload candidate.
+`Pull` and `Push` append metadata-only records to the journal. A no-op pull
+writes no record. The journal lives under `.rundot-sync/`, which is in the
+default ignore set, so it is never an upload candidate.
 
 ## BASE update
 

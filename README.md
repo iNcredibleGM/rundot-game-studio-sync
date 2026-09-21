@@ -13,7 +13,8 @@ machine** without guessing:
 - **Init** builds a workspace and records a verified BASE
 - **Plan** / **Status** show what a sync would do, without writing
 - **Pull** applies clean remote-only changes, with a backup of everything it replaces
-- **Push** publishes clean local text overwrites to Studio when you pass `-ConfirmPush`
+- **Push** publishes clean local text overwrites to Studio after confirmation,
+  with a backup of every remote original it replaces
 
 **Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
 text files only. It never creates files, never uploads binaries, and never
@@ -88,9 +89,10 @@ an ordinary folder of project files.
 authoritative — any ambiguity is reported as a conflict rather than guessed at.
 
 Your local edits show up as `UPLOAD` candidates. Only a clean utf8 text
-overwrite may be actionable, and only after you run `Push -ConfirmPush`.
-**A plan is never permission to write** — Push re-verifies every fingerprint
-before any `PUT`.
+overwrite may be actionable, and only after you confirm a `Push` run (or pass
+`-ForcePush` / `-ConfirmPush` to skip the prompt). **A plan is never
+permission to write** — Push re-verifies every fingerprint, backs up every
+remote original, and asks for confirmation before any `PUT`.
 
 ### 4. Pull clean remote-only changes
 
@@ -113,13 +115,23 @@ Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
 Push will check:
 
 ```powershell
-.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ConfirmPush
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push
 ```
 
+Type `yes` when Push lists the remote files it will overwrite. For unattended
+runs:
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ForcePush
+```
+
+`-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
+
 `Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`). Text
-creates, binaries, conflicts, and deletions are reported and left alone. If
-anything changed since `Plan`, Push refuses the whole run and asks you to plan
-again.
+creates, binaries, conflicts, and deletions are reported and left alone. Before
+each overwrite it copies the previous remote bytes into
+`.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
+refuses the whole run and asks you to plan again.
 
 ## Your workspace metadata
 
@@ -129,8 +141,8 @@ Sync state lives in `<LocalDir>\.rundot-sync\`:
 <LocalDir>/.rundot-sync/
   base-manifest.json   # BASE: path, size, and SHA-256 per tracked file
   last-plan.json       # the most recent Plan artifact
-  journal.jsonl        # metadata-only record of pulls
-  backups/             # pre-overwrite copies, restore by plain file copy
+  journal.jsonl        # metadata-only record of pulls and pushes
+  backups/             # pre-overwrite copies; Pull stores local originals, Push stores previous remote bytes
   temp/                # torn-read staging, cleared after each run
 ```
 
@@ -139,9 +151,9 @@ These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
 contain file contents, access tokens, or refresh tokens.
 
 **Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
-Before `Pull` overwrites a file it copies the *entire original file* into the
-backup set so you can restore it. **A backup set can therefore contain complete
-file contents.**
+Before `Pull` overwrites a local file, or before `Push` overwrites a remote
+file, the tool copies the *entire original* into the backup set so you can
+restore it. **A backup set can therefore contain complete file contents.**
 
 Both are sensitive, and for different reasons. `.rundot-sync` reveals the
 *names* of every file in your project, and a backup set may additionally hold
@@ -181,7 +193,7 @@ each keep their own independent BASE.
 | `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
 | `Status` | nothing | The same report, without saving an artifact |
 | `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
-| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan |
+| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan, with remote backups |
 
 Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
 [Pull](docs/pull.md), [Push](docs/push.md), [BASE schema](docs/base-schema.md).

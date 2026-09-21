@@ -458,6 +458,16 @@ Assert-True `
     "Push confirmation must be an explicit prompt, not -SupportsShouldProcess"
 
 Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushConfirmation')) `
+    "the CLI should define Read-RundotSyncPushConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('result.Cancelled')) `
+    "the CLI should handle a cancelled Push confirmation"
+Assert-True `
+    ($pushFunctionText -match 'exit\s+1') `
+    "a cancelled Push must exit non-zero"
+
+Assert-True `
     ($pushFunctionText -notmatch '(?i)upload-url|upload-adopt') `
     "Push must never reference a Studio upload-adopt endpoint"
 
