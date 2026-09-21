@@ -11,12 +11,15 @@ sides that can drift apart, and helps you move changes **from Studio to your
 machine** without guessing:
 
 - **Init** builds a workspace and records a verified BASE
-- **Plan** / **Status** show what a future sync would do, without writing
+- **Plan** / **Status** show what a sync would do, without writing
 - **Pull** applies clean remote-only changes, with a backup of everything it replaces
+- **Push** publishes clean local text overwrites to Studio after confirmation,
+  with a backup of every remote original it replaces
 
-**This version is read-only against Studio.** There is no `Push` and no
-`Apply`. The tool never creates, replaces, renames, or deletes anything in
-Studio.
+**Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
+text files only. It never creates files, never uploads binaries, and never
+deletes anything on Studio. There is no `Apply` shortcut that skips the plan
+fingerprint gates.
 
 If all you want is a plain raw copy of a project, the original exporter
 (`game-studio-export.ps1`) still does that into a new or empty directory —
@@ -47,6 +50,16 @@ Git is optional; it is only needed if you want to version your project files.
 
 ## Quick start
 
+The public workflow is:
+
+```text
+Init → edit → Plan → Pull (only when remote changed) → Push (only when local should publish)
+```
+
+`Plan` is the hub: it compares BASE, LOCAL, and REMOTE and tells you which
+command, if any, applies next. `Pull` and `Push` are conditional — run them
+only when the plan report shows a clean row for that direction.
+
 ### 1. Initialize a workspace
 
 Point `Init` at a **new or empty** directory. It downloads the project, proves
@@ -66,6 +79,13 @@ Already have the files? Use `-InitMode Adopt` to attach sync metadata to an
 existing tree instead. Adopt records only paths that already match Studio
 exactly, so it never claims agreement it did not verify.
 
+**Already have a diverged folder?** `Init -InitMode FromRemote` only works on a
+new or empty directory. On a tree that already has files, copy it first and run
+`Init -InitMode Adopt` on the copy. Adopt records BASE only for byte-identical
+paths; files that differ stay unresolved. A later `Push` still publishes only
+clean text overwrites against that BASE — it will not publish conflicts, text
+creates, or binaries.
+
 ### 2. Edit your files normally
 
 Work in `.\dev` however you like. Nothing about the workspace is special: it is
@@ -77,7 +97,7 @@ an ordinary folder of project files.
 # Dry run, and save the plan artifact to .rundot-sync/last-plan.json
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Plan
 
-# The same report without writing anything
+# The same report without writing anything (no artifact — cannot feed Push)
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Status
 ```
 
@@ -85,11 +105,21 @@ an ordinary folder of project files.
 (your files), and **REMOTE** (Studio now). Neither LOCAL nor REMOTE is
 authoritative — any ambiguity is reported as a conflict rather than guessed at.
 
-Your local edits show up as `UPLOAD` candidates. Because this version cannot
-push, they are reported but never actionable: **a plan is never permission to
-write.**
+Your local edits show up as `UPLOAD` candidates. Only a clean utf8 text
+overwrite may be actionable, and only after you confirm a `Push` run (or pass
+`-ForcePush` / `-ConfirmPush` to skip the prompt). **A plan is never
+permission to write** — Push re-verifies every fingerprint, backs up every
+remote original, and asks for confirmation before any `PUT`.
 
-### 4. Pull clean remote-only changes
+`Plan` writes `.rundot-sync/last-plan.json`, which `Push` consumes.
+`Status` runs the same engine but writes nothing, so it cannot feed `Push`.
+
+### 4. Pull clean remote-only changes (when remote changed)
+
+Run `Pull` **only after `Plan`** when the report shows clean remote-only
+`DOWNLOAD` rows — a file that moved on in Studio while your copy still matched
+BASE (`BASE=A LOCAL=A REMOTE=B`), or a remote-only addition. Skip this step
+when nothing on Studio changed since BASE.
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull
@@ -104,6 +134,48 @@ Before replacing anything it copies the original into
 type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
 backup.
 
+### 5. Push clean local text overwrites (when local should publish)
+
+Run `Push` **only after `Plan`** when the report shows a clean utf8 text
+overwrite (`BASE=A LOCAL=B REMOTE=A`) and that row is applicable. Skip this
+step when you have no local text change to publish.
+
+Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
+Push will check:
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push
+```
+
+Type `yes` when Push lists the remote files it will overwrite. For unattended
+runs:
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ForcePush
+```
+
+`-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
+
+`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`). Text
+creates, binaries, conflicts, and deletions are reported and left alone. Before
+each overwrite it copies the previous remote bytes into
+`.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
+refuses the whole run and asks you to plan again.
+
+**Push will:**
+
+- After you type `yes` (or pass `-ForcePush` / `-ConfirmPush`), overwrite
+  existing utf8 text files whose remote bytes still match the plan
+- Copy each remote original into `.rundot-sync/backups/<timestamp>/` before any
+  `PUT`
+- Move BASE only after every `PUT` echo-verifies
+
+**Push will not:**
+
+- Create files, upload binaries, delete or rename anything on Studio
+- Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
+  skipped; there is no automatic conflict resolution in this version
+
 ## Your workspace metadata
 
 Sync state lives in `<LocalDir>\.rundot-sync\`:
@@ -112,8 +184,8 @@ Sync state lives in `<LocalDir>\.rundot-sync\`:
 <LocalDir>/.rundot-sync/
   base-manifest.json   # BASE: path, size, and SHA-256 per tracked file
   last-plan.json       # the most recent Plan artifact
-  journal.jsonl        # metadata-only record of pulls
-  backups/             # pre-overwrite copies, restore by plain file copy
+  journal.jsonl        # metadata-only record of pulls and pushes
+  backups/             # pre-overwrite copies; Pull stores local originals, Push stores previous remote bytes
   temp/                # torn-read staging, cleared after each run
 ```
 
@@ -122,9 +194,9 @@ These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
 contain file contents, access tokens, or refresh tokens.
 
 **Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
-Before `Pull` overwrites a file it copies the *entire original file* into the
-backup set so you can restore it. **A backup set can therefore contain complete
-file contents.**
+Before `Pull` overwrites a local file, or before `Push` overwrites a remote
+file, the tool copies the *entire original* into the backup set so you can
+restore it. **A backup set can therefore contain complete file contents.**
 
 Both are sensitive, and for different reasons. `.rundot-sync` reveals the
 *names* of every file in your project, and a backup set may additionally hold
@@ -164,13 +236,15 @@ each keep their own independent BASE.
 | `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
 | `Status` | nothing | The same report, without saving an artifact |
 | `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
+| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan, with remote backups |
 
 Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
-[Pull](docs/pull.md), [BASE schema](docs/base-schema.md).
+[Pull](docs/pull.md), [Push](docs/push.md), [BASE schema](docs/base-schema.md).
 
-`Plan` and `Pull` **refuse without a BASE** and point you at `Init`: without a
-recorded shared state there is no verified direction. The refusal happens before
-authentication, so a workspace that cannot plan never asks for a token.
+`Plan`, `Pull`, and `Push` **refuse without a BASE** and point you at `Init`:
+without a recorded shared state there is no verified direction. The refusal
+happens before authentication, so a workspace that cannot plan never asks for a
+token.
 
 Every dry run ends with:
 
@@ -300,8 +374,9 @@ That is the intended behavior. See
 
 Deliberately out of scope, so nothing here does them by accident:
 
-- Pushing or applying local changes to Studio (`Push`, `Apply`)
-- Remote create, replace, rename, or delete
+- Applying local changes without a fresh `Plan` (`Apply`)
+- Automatic conflict resolution
+- Remote create, binary upload, rename, or delete
 - Binary upload or adopt
 - Deleting anything automatically, locally or remotely
 - `.rundotignore` custom patterns

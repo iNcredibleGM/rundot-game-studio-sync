@@ -20,15 +20,15 @@ Issue branches are cut from the current integration branch, not from `main`:
 
 ```text
 main
-v0.2.0
-  └── issue/14-text-write-protocol
+v0.3.0
+  └── issue/37-text-create-protocol
 ```
 
-Naming: `issue/<number>-<short-slug>` (example: `issue/14-text-write-protocol`).
+Naming: `issue/<number>-<short-slug>` (example: `issue/37-text-create-protocol`).
 
-Open each issue pull request with **base = the integration branch** (for v0.2.0 work, that is `v0.2.0`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
+Open each issue pull request with **base = the integration branch** (for v0.3.0 work, that is `v0.3.0`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
 
-Current push work (#14–#19) uses integration branch `v0.2.0`. Cut that branch from `main` after v0.1.3 ships. Do not land those issues on `main` until the v0.2.0 ship PR.
+v0.2.0 (#14–#19) ships through one PR from `v0.2.0` to `main`. Current milestone work is v0.3.0 (#37–#44) on integration branch `v0.3.0`. Cut `v0.3.0` from `main` after the v0.2.0 ship PR merges. Do not land v0.3.0 issues on `main` before that branch exists.
 
 ## Tests
 
@@ -44,4 +44,4 @@ Tests must not require Pester to be installed.
 
 - Never print, log, or commit access tokens, refresh tokens, or auth files (`%APPDATA%\.rundot\`).
 - Do not include those values in bug reports, PR bodies, or issue comments.
-- Until the v0.2.0 push work, do not add Studio mutation helpers (`PUT`, `DELETE`, `upload-url`, `upload-adopt`). Firebase `securetoken` POST for token refresh is allowed.
+- v0.2.0 on `main` adds the documented text overwrite route only: `PUT /api/projects/{projectId}/file` in `lib/RemoteWrite.ps1`. v0.3.0 may add a further Studio write route only in the issue that owns it, and only after that issue's protocol evidence exists. A missing route stays a refusal. Firebase `securetoken` POST for token refresh is allowed.

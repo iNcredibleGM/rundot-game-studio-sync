@@ -368,47 +368,99 @@ function Write-RemoteSnapshotStagingFile {
     return $full
 }
 
+function Clear-RemoteSnapshotDownloadProgress {
+    param([string]$Activity)
+
+    if ([string]::IsNullOrEmpty($Activity)) {
+        return
+    }
+
+    Write-Progress -Activity $Activity -Completed -ErrorAction SilentlyContinue
+}
+
 function Get-RemoteSnapshotFileMap {
     param(
         $Manifest,
         [string]$StagingRoot,
         [string]$StudioOrigin,
         [string]$ProjectId,
-        [hashtable]$Headers
+        [hashtable]$Headers,
+
+        [switch]$ShowProgress,
+
+        [string]$ProgressActivity = 'Downloading remote project'
     )
 
     $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
     $rows = Get-RemoteManifestFileRows -Manifest $Manifest
+    $total = 0
+    if ($null -ne $rows) {
+        if ($rows -is [System.Collections.ICollection]) {
+            $total = $rows.Count
+        }
+        else {
+            $total = 1
+        }
+    }
 
-    foreach ($row in $rows) {
-        Assert-SyncPathRepresentable `
-            -WorkspaceRoot $StagingRoot `
-            -CanonicalPath $row.CanonicalPath
+    if ($ShowProgress) {
+        Write-Host ("Downloading {0} remote file(s)..." -f $total)
+    }
 
-        $originalPath = [string](Get-RemoteEntryProperty -Entry $row.Entry -Names @('path', 'Path'))
-        $response = Get-RemoteProjectFile `
-            -StudioOrigin $StudioOrigin `
-            -ProjectId $ProjectId `
-            -Path $originalPath `
-            -Headers $Headers
+    try {
+        $index = 0
+        foreach ($row in $rows) {
+            $index++
+            if ($ShowProgress) {
+                $percent = 0
+                if ($total -gt 0) {
+                    $percent = [int][Math]::Min(
+                        100,
+                        [Math]::Floor(($index * 100.0) / $total)
+                    )
+                }
 
-        $bytes = ConvertFrom-RemoteFileContent -Response $response
-        $stagingPath = Write-RemoteSnapshotStagingFile `
-            -StagingRoot $StagingRoot `
-            -CanonicalPath $row.CanonicalPath `
-            -Bytes $bytes
-        $identity = Get-LocalFileIdentity -LiteralPath $stagingPath
-        $encoding = Get-RemoteEntryProperty -Entry $response -Names @('encoding', 'Encoding')
+                Write-Progress `
+                    -Activity $ProgressActivity `
+                    -Status ([string]$row.CanonicalPath) `
+                    -PercentComplete $percent `
+                    -CurrentOperation ("{0} of {1}" -f $index, $total)
+            }
 
-        $files[$row.CanonicalPath] = [pscustomobject]@{
-            Sha256            = $identity.Sha256
-            Size              = $identity.Size
-            LocalDetectedKind = $identity.LocalDetectedKind
-            LineEnding        = $identity.LineEnding
-            HasBom            = $identity.HasBom
-            RemoteKind        = ConvertTo-RemoteKind -Encoding $encoding
-            Encoding          = $encoding
-            StagingPath       = $stagingPath
+            Assert-SyncPathRepresentable `
+                -WorkspaceRoot $StagingRoot `
+                -CanonicalPath $row.CanonicalPath
+
+            $originalPath = [string](Get-RemoteEntryProperty -Entry $row.Entry -Names @('path', 'Path'))
+            $response = Get-RemoteProjectFile `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Path $originalPath `
+                -Headers $Headers
+
+            $bytes = ConvertFrom-RemoteFileContent -Response $response
+            $stagingPath = Write-RemoteSnapshotStagingFile `
+                -StagingRoot $StagingRoot `
+                -CanonicalPath $row.CanonicalPath `
+                -Bytes $bytes
+            $identity = Get-LocalFileIdentity -LiteralPath $stagingPath
+            $encoding = Get-RemoteEntryProperty -Entry $response -Names @('encoding', 'Encoding')
+
+            $files[$row.CanonicalPath] = [pscustomobject]@{
+                Sha256            = $identity.Sha256
+                Size              = $identity.Size
+                LocalDetectedKind = $identity.LocalDetectedKind
+                LineEnding        = $identity.LineEnding
+                HasBom            = $identity.HasBom
+                RemoteKind        = ConvertTo-RemoteKind -Encoding $encoding
+                Encoding          = $encoding
+                StagingPath       = $stagingPath
+            }
+        }
+    }
+    finally {
+        if ($ShowProgress) {
+            Clear-RemoteSnapshotDownloadProgress -Activity $ProgressActivity
         }
     }
 
@@ -427,7 +479,11 @@ function Get-StableRemoteSnapshot {
         [string]$ProjectId,
 
         [Parameter(Mandatory)]
-        [hashtable]$Headers
+        [hashtable]$Headers,
+
+        [switch]$ShowProgress,
+
+        [string]$ProgressActivity = 'Downloading remote project'
     )
 
     Initialize-RundotSyncLayout -WorkspaceRoot $WorkspaceRoot
@@ -455,7 +511,9 @@ function Get-StableRemoteSnapshot {
                 -StagingRoot $stagingRoot `
                 -StudioOrigin $StudioOrigin `
                 -ProjectId $ProjectId `
-                -Headers $Headers
+                -Headers $Headers `
+                -ShowProgress:$ShowProgress `
+                -ProgressActivity $ProgressActivity
 
             $after = Get-RemoteProjectFileList `
                 -StudioOrigin $StudioOrigin `

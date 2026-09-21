@@ -197,9 +197,9 @@ you want a disposable copy ([export.md](export.md)).
 ## Next
 
 Once BASE exists, `Plan` and `Status` are the read commands
-([plan.md](plan.md)), and `Pull` applies remote-only changes with backups
-([pull.md](pull.md)). `Plan` generates the dry-run report and persists
-`.rundot-sync/last-plan.json`; `Status` runs the same engine and writes
-nothing. Neither mutates Studio, and no command mutates Studio in this
-milestone. A workspace is bound to one project and one folder, and a second
-machine needs its own ([base-schema.md](base-schema.md)).
+([plan.md](plan.md)). `Pull` applies remote-only changes with backups
+([pull.md](pull.md)). `Push` is the command that writes REMOTE, and only for a
+confirmed utf8 text overwrite ([push.md](push.md)). `Plan` generates the
+dry-run report and persists `.rundot-sync/last-plan.json`; `Status` runs the
+same engine and writes nothing. A workspace is bound to one project and one
+folder, and a second machine needs its own ([base-schema.md](base-schema.md)).

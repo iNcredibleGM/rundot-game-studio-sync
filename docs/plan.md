@@ -32,21 +32,23 @@ runs the identical engine and persists nothing.
 
 ## No plan is permission to write
 
-This milestone has **no `Apply` and no `Push`**. Every remote-mutating
-operation is forced to `applicable: false`, even when the classifier considers
-the path actionable in principle:
+`Push` consumes this artifact and re-verifies every fingerprint before
+writing. A plan is still only a point-in-time observation: it never grants
+permission to skip those checks, bypass confirmation, or skip remote backups.
+
+The plan layer marks only one remote-mutating row as applicable:
 
 | Status | Applicable | Why |
 | --- | --- | --- |
-| `upload` (text) | no | Remote mutation is not implemented in this milestone. |
-| `upload` (binary) | no | Remote binary replacement semantics are unverified. |
-| `deleteRemoteCandidate` | no | Deletion is classification-only in this milestone. |
+| `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
+| `upload` (text create) | no | `PUT /file` is overwrite-only; a missing remote path returns `404`. |
+| `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
+| `deleteRemoteCandidate` | no | `Push` does not delete remote files. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
-A text upload stays `Status = upload` so the plan still shows the candidate,
-but it is never marked applicable, and it always carries a reason. The
-[classifier](classifier.md) still reports text uploads as applicable for a
-future `Push`; the plan layer is what blocks them here.
+Every blocked remote-mutating row carries an explicit reason. The
+[classifier](classifier.md) still marks text overwrites as applicable; the
+plan layer refuses text creates, all binaries, and every delete candidate.
 
 ## Console layout
 
@@ -118,9 +120,9 @@ contents, no tokens, no staging paths, no absolute local paths.
       "status": "upload",
       "kind": "utf8",
       "kinds": { "base": "utf8", "local": "utf8", "remote": "utf8" },
-      "applicable": false,
+      "applicable": true,
       "remoteMutating": true,
-      "reason": "Remote mutation is not implemented in this milestone.",
+      "reason": null,
       "warning": null,
       "ignored": false,
       "kindChange": false,
@@ -143,10 +145,10 @@ console header. The TTL is an engine parameter, not a command-line flag. An
 expired plan is stale: REMOTE is a point-in-time observation, and a future
 `Apply` must re-check rather than trust it.
 
-### Future Apply evidence
+### Plan artifact evidence
 
-No `Apply` exists yet. The artifact stores what a future one must re-verify
-before writing anything:
+`Push` consumes this artifact and re-verifies every fingerprint before any
+`PUT`. The artifact stores what a publish must still match:
 
 - `planId` — the plan these fingerprints belong to
 - `localRootFingerprint` — the workspace folder this plan was built for
@@ -175,11 +177,13 @@ different project or folder.
 
 ## Plan never updates BASE
 
-`Init` and `Pull` are the writers of BASE: `Init` creates it, and `Pull`
-replaces it only after a fully verified success ([base-schema.md](base-schema.md),
-[pull.md](pull.md)). `Plan` reads BASE identity from the resolver's manifest
-and writes only `last-plan.json`. `.rundot-sync/` is in the default ignore set,
-so the artifact is never a local inventory entry or an upload candidate.
+`Init`, `Pull`, and `Push` are the writers of BASE: `Init` creates it, `Pull`
+replaces it only after a fully verified success, and `Push` overlays it
+additively only after every selected `PUT` echo-verifies
+([base-schema.md](base-schema.md), [pull.md](pull.md), [push.md](push.md)).
+`Plan` reads BASE identity from the resolver's manifest and writes only
+`last-plan.json`. `.rundot-sync/` is in the default ignore set, so the artifact
+is never a local inventory entry or an upload candidate.
 
 ## Related contracts
 
@@ -188,6 +192,8 @@ so the artifact is never a local inventory entry or an upload candidate.
 - Snapshot stability and the torn-read abort: [remote-snapshot.md](remote-snapshot.md).
 - Path identity, safety, and ignores: [path-safety.md](path-safety.md).
 - Applying a remote-only change with backups: [pull.md](pull.md).
+- The delete verb and the concurrency controls a future `Apply` must respect:
+  [delete-rename-protocol.md](delete-rename-protocol.md).
 
 Unit coverage lives in `tests/SyncPlan.Tests.ps1` (engine) and
 `tests/SyncCli.Tests.ps1` (CLI wiring), and requires no network.

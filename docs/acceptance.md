@@ -1,8 +1,9 @@
-# Acceptance: v0.1.3 safe pull planner
+# Acceptance: v0.1.3 safe pull planner and v0.2.0 Push
 
-This is the acceptance record for the safe pull planner milestone. It maps each
-public gate to the evidence that proves it, so a reviewer can check the claims
-without trusting the release notes.
+This is the acceptance record for the safe pull planner milestone and the Push
+write route shipped on the v0.2.0 integration branch. It maps each public gate
+to the evidence that proves it, so a reviewer can check the claims without
+trusting the release notes.
 
 Two kinds of evidence appear below:
 
@@ -39,27 +40,30 @@ powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
 powershell -NoProfile -File .\tests\Acceptance.ps1 -ProjectId <id> -LocalDir <dir>
 ```
 
-The live gates pause and tell you which file to change in Studio, because
-automating Studio writes is a non-goal of this milestone. The harness only ever
-reads from Studio, prints no tokens or file contents, and exits non-zero if any
-gate failed.
+The live Pull gates pause and tell you which file to change in Studio, because
+automating Studio writes is a non-goal of this milestone. The live Push gates
+reuse the Gate 2 local edit after Pull and publish it with documented
+`PUT /file` (no extra Studio pause). The harness only ever reads from Studio
+for Pull, prints no tokens or file contents, and exits non-zero if any gate
+failed.
 
 **The run leaves sensitive state behind, so run it into a throwaway
 directory.** A live run creates a `.rundot-sync` workspace, which names every
 file in the project, and its `backups/` set holds the **full contents** of any
-file `Pull` overwrote ([pull.md](pull.md)). This matters on a public
-repository.
+file `Pull` or `Push` overwrote ([pull.md](pull.md), [push.md](push.md)). This
+matters on a public repository.
 
 Cleanup behavior:
 
 - If you omit `-LocalDir`, the harness uses a temporary directory and removes it
-  at the end.
-- If you pass a `-LocalDir` **inside the repository** that does not exist yet,
-  the harness removes it at the end.
-- A **pre-existing** `-LocalDir` is always left in place, and a `-LocalDir`
-  **outside** the repository is left in place. Both are reported, because they
-  now contain sensitive state.
+  at the end (inside or outside the repository).
+- If you pass a `-LocalDir` that **this run created** (missing at start), the
+  harness removes it at the end regardless of location.
+- A **pre-existing** `-LocalDir` you pointed at is always left in place and
+  reported, because it now contains sensitive state.
 - `-KeepWorkspace` leaves everything in place for inspection.
+- The scratch directory used for offline lock tests is always removed unless
+  `-KeepWorkspace` was asked for.
 
 `.gitignore` covers `.rundot-sync/` in this repository, but that is a backstop,
 not a license to leave workspace state lying around.
@@ -77,7 +81,10 @@ not a license to leave workspace state lying around.
 | 7 | Unreadable local file aborts Plan | `tests/Manifest.Tests.ps1` + harness gate 7a/7b | Automated |
 | 8 | Plan without BASE refuses | `tests/SyncPlan.Tests.ps1`, `tests/Workspace.Tests.ps1` | Automated |
 | 9 | Plan shows `expiresAt` | `tests/SyncPlan.Tests.ps1` | Automated |
-| 10 | Mutation grep still zero | `tests/NoRemoteMutation.Tests.ps1` | Automated |
+| 10 | Mutation grep allows only documented `PUT /file` | `tests/NoRemoteMutation.Tests.ps1` + harness gate 10 | Automated |
+| 11 | Push without force refuses in a non-interactive run | `tests/Push.Tests.ps1` + live check | Both |
+| 12 | Push `-ForcePush` applies with remote backup and BASE update | `tests/Push.Tests.ps1` + live check | Both |
+| 13 | Push journals success and `push-backup` without secrets | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` + live check | Both |
 
 ### 1. Test suite green
 
@@ -92,7 +99,7 @@ Editing one tracked file in place, leaving BASE and REMOTE untouched, is the
 | Evidence | Location |
 | --- | --- |
 | `A / B / A` classifies as `upload` | `tests/SyncEngine.Tests.ps1`, three-way table |
-| A text upload keeps `status: upload` but is `applicable: false` | `tests/SyncPlan.Tests.ps1`, remote-mutation guard |
+| A text overwrite keeps `status: upload` and is `applicable: true`; a text create is `applicable: false` | `tests/SyncPlan.Tests.ps1`, publish policy |
 | A path present in BASE and LOCAL is never a delete candidate | `tests/SyncEngine.Tests.ps1`, deletion cases |
 
 **Zero invented deletes** is structural, not incidental: `deleteRemoteCandidate`
@@ -169,6 +176,11 @@ deliberate:
   `Get-LocalManifest` runs before `New-RundotSyncPlanAnalysis`, and the failure
   path exits non-zero.
 
+At startup the harness prints the canonical gate map (numbers 1–13) and the
+**execution order** for the current run (offline gates first, then live gates
+2→9→3→6→4→11–13). Gate numbers are not execution order: 5–10 are Pull-era
+offline checks; 11–13 were added for Push without renumbering.
+
 7b is an order assertion rather than a live end-to-end abort because `Plan`
 authenticates **before** it reads LOCAL. Triggering the real abort through the
 CLI therefore needs a token, and asserting only on the exit code would be a
@@ -198,23 +210,66 @@ refuses `-AllowNoBase` entirely.
 `createdAt`, that an explicit TTL controls it, and that the console report
 prints it so expiry is visible rather than buried in the JSON.
 
-### 10. Mutation grep still zero
+### 10. Mutation grep allows only documented `PUT /file`
 
 `tests/NoRemoteMutation.Tests.ps1` scans `game-studio-sync.ps1`,
 `game-studio-export.ps1`, and `lib/**/*.ps1` for Studio write helpers: HTTP
-`PUT`, HTTP `DELETE`, `upload-url`, `upload-adopt`, and any `Set-*` / `Remove-*`
-function in the remote API library. This milestone ships none.
+`PUT` outside `lib/RemoteWrite.ps1`, HTTP `DELETE`, `upload-url`, `upload-adopt`,
+`/move`, reachability to the non-product `StudioProbe`, and any `Set-*` /
+`Remove-*` function in `lib/RemoteApi.ps1`. The v0.2.0 milestone ships one
+documented write route: `PUT /file` in `lib/RemoteWrite.ps1`.
 
-The plan layer enforces the same rule at runtime:
-`tests/SyncPlan.Tests.ps1` asserts that **no remote-mutating operation is
-applicable**, that every one of them carries a reason, and that a download is
-not remote-mutating.
+The plan layer enforces publish policy at runtime:
+`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite may be
+applicable among remote-mutating rows, that every blocked remote-mutating row
+carries a reason, and that a download is not remote-mutating.
+
+### 11. Push without force refuses in a non-interactive run
+
+| Property | Evidence |
+| --- | --- |
+| Applicable uploads require confirmation or `-ForcePush` | `tests/Push.Tests.ps1`, confirmation cases |
+| A declined or non-interactive run changes nothing | `tests/Push.Tests.ps1`, cancelled run |
+| No backup set, journal, or BASE move on decline | `tests/Push.Tests.ps1`, orchestrator cases |
+
+**Live check:** after Gates 2–4 and a fresh `Plan`, run `Push` in a child
+process with `-NonInteractive` and without `-ForcePush`. Expect a non-zero
+exit, unchanged BASE `capturedAt`, no new backup set, and no new `push` /
+`push-backup` journal records. The harness uses `-NonInteractive` so the child
+cannot prompt for `yes` on the parent console.
+
+### 12. Push `-ForcePush` applies with remote backup and BASE update
+
+| Property | Evidence |
+| --- | --- |
+| A clean text overwrite is applied via `PUT /file` | `tests/Push.Tests.ps1`, apply cases |
+| The remote original is copied before any PUT | `tests/Push.Tests.ps1`, backup-before-write |
+| The backup holds remote bytes, not the local publish payload | `tests/Push.Tests.ps1`, backup content |
+| BASE moves only after verified apply | `tests/Push.Tests.ps1`, BASE update cases |
+
+**Live check:** run `Push -ForcePush` on a **fresh** post-decline `Plan` (the
+harness re-plans before gate 12). Expect `applied ≥ 1`, `BASE updated: true`, a
+printed backup root and this-run set, and a backup copy that restores by plain
+file copy and does not match the local file bytes.
+
+### 13. Push journals success and `push-backup` without secrets
+
+| Property | Evidence |
+| --- | --- |
+| A successful push writes one `push` success record | `tests/Push.Tests.ps1`, journal cases |
+| Each backed-up path writes a `push-backup` record | `tests/Push.Tests.ps1`, journal cases |
+| Journal lines never carry tokens or file contents | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` |
+
+**Live check:** after Gate 12, read `.rundot-sync/journal.jsonl` (do not paste
+it). Expect at least one `push` record with `status: success` and one
+`push-backup` record per backed-up path, with no credential or `"content"`
+patterns in the raw file.
 
 ## What this milestone deliberately does not do
 
 Confirmed absent, not merely undocumented:
 
-- No remote create, replace, rename, or delete. No `Apply`, no `Push`.
+- No remote create except the documented utf8 text overwrite route (`Push`).
 - No binary upload or adopt.
 - No automatic deletion, locally or remotely. `deleteLocalCandidate` leaves the
   file in place; `deleteRemoteCandidate` is reported only.
@@ -223,14 +278,14 @@ Confirmed absent, not merely undocumented:
 - No FileSystemWatcher, device IDs, or multi-machine BASE. One initialized
   workspace belongs to one project and one folder.
 
-Direction beyond this milestone is in [ROADMAP.md](../ROADMAP.md): the next pass
-is write-protocol **investigation**, not `Apply`.
+Direction beyond this milestone is in [ROADMAP.md](../ROADMAP.md).
 
 ## Related contracts
 
 - Initializing a workspace: [init.md](init.md)
 - Dry-run planning and the artifact: [plan.md](plan.md)
 - Applying remote-only changes: [pull.md](pull.md)
+- Publishing local text overwrites: [push.md](push.md)
 - BASE ownership and atomic writes: [base-schema.md](base-schema.md)
 - Canonical paths, safety, and ignores: [path-safety.md](path-safety.md)
 - Torn-read protection: [remote-snapshot.md](remote-snapshot.md)

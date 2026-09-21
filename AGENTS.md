@@ -4,11 +4,11 @@ Before changing this repository, **read [CONTRIBUTING.md](CONTRIBUTING.md) and f
 
 ## Must follow
 
-- Branch from the current **milestone integration branch** (`v0.2.0` for issues #14–#19), never from `main` while that milestone is in progress.
+- Branch from the current **milestone integration branch** (`v0.3.0` for issues #37–#44). Cut `v0.3.0` from `main` after the v0.2.0 ship PR merges. Never branch milestone work from `main` while that milestone is in progress.
 - Name issue branches `issue/<number>-<short-slug>`. Open pull requests against the integration branch, not `main`.
 - Ship a completed milestone per [docs/releasing.md](docs/releasing.md): one PR `vX.Y.Z` → `main`, then tag, GitHub Release, close the milestone, cut the next integration branch. Do not land unfinished milestone work on `main`. Do not tag `main` before the ship PR merges.
 - Windows PowerShell 5.1 is the compatibility baseline.
 - Never print, write, or commit access tokens, refresh tokens, clipboard secrets, or `%APPDATA%\.rundot\` auth files. Do not put them in manifests, plans, journals, logs, or PR text.
-- Do not add Studio write APIs (`PUT`, `DELETE`, `upload-url`, `upload-adopt`) until the roadmap’s push milestone. Token refresh via Google `securetoken` POST is allowed.
+- After v0.2.0 ships, the product may mutate Studio only through documented routes. Today that is utf8 text overwrite (`PUT /file` in `lib/RemoteWrite.ps1`). v0.3.0 may add a further route only in the issue that owns it, after that issue's protocol evidence exists. Do not add `DELETE`, `upload-url`, `upload-adopt`, or `POST /move` without that evidence. Token refresh via Google `securetoken` POST is allowed.
 - When `tests/Run-Tests.ps1` exists, run it and keep it green.
 - Labels and milestones: [docs/github-labels.md](docs/github-labels.md). Product sequence: [ROADMAP.md](ROADMAP.md).

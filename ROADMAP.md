@@ -86,12 +86,40 @@ Milestone: [v0.2.0 - Safe push](https://github.com/iNcredibleGM/rundot-game-stud
 5. Push confirmation, backups, journal, conflict refusal — [#18](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/18)
 6. Public docs: Init → Plan → Pull → Push — [#19](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/19)
 
-Done when a stranger can push one clean local text change on a disposable project without a guessed clobber.
+Do not mark v0.2.0 complete until a stranger can push one clean text change on a disposable project without a guessed clobber.
 
-## After v0.2.0
+Shipped on `main`.
+
+## v0.3.0 - Publish the local tree
+
+v0.2.0 publishes one clean utf8 text overwrite. It does not create files, upload binaries, delete remote files, or choose a side on a conflict. Adopting a folder that already disagrees with Studio therefore plans many `upload` and `conflict` rows and an applicable count of zero.
+
+This milestone is the confirmed publish that can make Studio match that local tree, for the operations the protocol actually allows.
+
+**Guiding rule:** still no guessed clobber. Default `Push` stays the clean text overwrite. A diverged path is published only when a local-wins confirmation names it. Local-wins replaces remote bytes with local bytes. It does not merge.
+
+**Hard ban:** do not add a create, binary upload, `DELETE`, or `POST /move` until the issue that owns that route has written down the evidence. A route that does not exist stays refused.
+
+Milestone: [v0.3.0 - Publish the local tree](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/4)
+
+1. Investigate how Studio creates a text file — [#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37)
+2. Investigate placing a binary at its project path — [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+3. Delete remote files for `deleteRemoteCandidate` — [#39](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/39)
+4. Push text creates when a create route exists — [#40](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/40)
+5. Publish binaries only by a proven place-at-path sequence — [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
+6. Confirmed local-wins publish for conflicts and remote-only files — [#42](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/42)
+7. Show progress while hashing and publishing large trees — [#43](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/43)
+8. Document and accept publishing a local tree — [#44](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/44)
+
+Done when a stranger, on a disposable project, can confirm one publish that overwrites one utf8 text file, creates one text file or shows a clear refusal, deletes one remote-only file, places one binary or shows a clear refusal, and leaves every unconfirmed conflict untouched.
+
+Cut integration branch `v0.3.0` from `main` after v0.2.0 ships. Do not land these issues on `v0.2.0` or on `main` before that.
+
+## After v0.3.0
 
 - browser bootstrap / bookmarklet helper
 - official `rundot` CLI refresh-token handling beyond the current fresh-access-token path
-- selective push
-- automatic conflict resolution
+- selective push of a path subset
+- content merge of a conflict
+- publish a detected rename as `POST /move` when delete-plus-create is the wrong shape
 - distributed / multi-machine BASE

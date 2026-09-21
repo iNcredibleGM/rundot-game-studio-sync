@@ -64,7 +64,7 @@ function New-RemoteHttpException {
     )
 
     if ([string]::IsNullOrEmpty($Message)) {
-        $Message = "Remote GET failed with HTTP $StatusCode"
+        $Message = "Remote request failed with HTTP $StatusCode"
     }
 
     if ($null -ne $InnerException) {
@@ -163,7 +163,7 @@ function Convert-WebExceptionToRemoteHttpException {
     }
 
     return [System.InvalidOperationException]::new(
-        "Remote GET failed.",
+        "Remote request failed.",
         $Exception
     )
 }

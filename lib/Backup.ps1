@@ -1,9 +1,12 @@
-# Backup sets for local Pull overwrites.
+# Backup sets for Pull and Push overwrites.
 #
-# Before Pull replaces a local file it copies the original into a timestamped
-# set under .rundot-sync/backups so any overwrite is recoverable by a plain
-# file copy. Backups are metadata-free: the bytes of the original, nothing
-# else. No tokens, no journal records, no manifests live in a backup set.
+# Before Pull replaces a local file, or before Push replaces a remote file, the
+# original being overwritten is copied into a timestamped set under
+# .rundot-sync/backups so any overwrite is recoverable by a plain file copy.
+# Pull backs up LOCAL originals; Push backs up the previous REMOTE bytes it
+# fetched immediately before the write. Backups are metadata-free: the bytes of
+# the original, nothing else. No tokens, no journal records, no manifests live
+# in a backup set.
 #
 # A backup set name is a UTC timestamp plus an optional counter suffix, so sets
 # sort chronologically by ordinal name comparison and two sets created in the
