@@ -50,6 +50,16 @@ Git is optional; it is only needed if you want to version your project files.
 
 ## Quick start
 
+The public workflow is:
+
+```text
+Init → edit → Plan → Pull (only when remote changed) → Push (only when local should publish)
+```
+
+`Plan` is the hub: it compares BASE, LOCAL, and REMOTE and tells you which
+command, if any, applies next. `Pull` and `Push` are conditional — run them
+only when the plan report shows a clean row for that direction.
+
 ### 1. Initialize a workspace
 
 Point `Init` at a **new or empty** directory. It downloads the project, proves
@@ -69,6 +79,13 @@ Already have the files? Use `-InitMode Adopt` to attach sync metadata to an
 existing tree instead. Adopt records only paths that already match Studio
 exactly, so it never claims agreement it did not verify.
 
+**Already have a diverged folder?** `Init -InitMode FromRemote` only works on a
+new or empty directory. On a tree that already has files, copy it first and run
+`Init -InitMode Adopt` on the copy. Adopt records BASE only for byte-identical
+paths; files that differ stay unresolved. A later `Push` still publishes only
+clean text overwrites against that BASE — it will not publish conflicts, text
+creates, or binaries.
+
 ### 2. Edit your files normally
 
 Work in `.\dev` however you like. Nothing about the workspace is special: it is
@@ -80,7 +97,7 @@ an ordinary folder of project files.
 # Dry run, and save the plan artifact to .rundot-sync/last-plan.json
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Plan
 
-# The same report without writing anything
+# The same report without writing anything (no artifact — cannot feed Push)
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Status
 ```
 
@@ -94,7 +111,15 @@ overwrite may be actionable, and only after you confirm a `Push` run (or pass
 permission to write** — Push re-verifies every fingerprint, backs up every
 remote original, and asks for confirmation before any `PUT`.
 
-### 4. Pull clean remote-only changes
+`Plan` writes `.rundot-sync/last-plan.json`, which `Push` consumes.
+`Status` runs the same engine but writes nothing, so it cannot feed `Push`.
+
+### 4. Pull clean remote-only changes (when remote changed)
+
+Run `Pull` **only after `Plan`** when the report shows clean remote-only
+`DOWNLOAD` rows — a file that moved on in Studio while your copy still matched
+BASE (`BASE=A LOCAL=A REMOTE=B`), or a remote-only addition. Skip this step
+when nothing on Studio changed since BASE.
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Pull
@@ -109,7 +134,11 @@ Before replacing anything it copies the original into
 type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
 backup.
 
-### 5. Push clean local text overwrites
+### 5. Push clean local text overwrites (when local should publish)
+
+Run `Push` **only after `Plan`** when the report shows a clean utf8 text
+overwrite (`BASE=A LOCAL=B REMOTE=A`) and that row is applicable. Skip this
+step when you have no local text change to publish.
 
 Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
 Push will check:
@@ -132,6 +161,20 @@ creates, binaries, conflicts, and deletions are reported and left alone. Before
 each overwrite it copies the previous remote bytes into
 `.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
 refuses the whole run and asks you to plan again.
+
+**Push will:**
+
+- After you type `yes` (or pass `-ForcePush` / `-ConfirmPush`), overwrite
+  existing utf8 text files whose remote bytes still match the plan
+- Copy each remote original into `.rundot-sync/backups/<timestamp>/` before any
+  `PUT`
+- Move BASE only after every `PUT` echo-verifies
+
+**Push will not:**
+
+- Create files, upload binaries, delete or rename anything on Studio
+- Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
+  skipped; there is no automatic conflict resolution in this version
 
 ## Your workspace metadata
 
@@ -332,6 +375,7 @@ That is the intended behavior. See
 Deliberately out of scope, so nothing here does them by accident:
 
 - Applying local changes without a fresh `Plan` (`Apply`)
+- Automatic conflict resolution
 - Remote create, binary upload, rename, or delete
 - Binary upload or adopt
 - Deleting anything automatically, locally or remotely

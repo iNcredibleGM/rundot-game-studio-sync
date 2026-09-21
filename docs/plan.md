@@ -145,10 +145,10 @@ console header. The TTL is an engine parameter, not a command-line flag. An
 expired plan is stale: REMOTE is a point-in-time observation, and a future
 `Apply` must re-check rather than trust it.
 
-### Future Apply evidence
+### Plan artifact evidence
 
-No `Apply` exists yet. The artifact stores what a future one must re-verify
-before writing anything:
+`Push` consumes this artifact and re-verifies every fingerprint before any
+`PUT`. The artifact stores what a publish must still match:
 
 - `planId` — the plan these fingerprints belong to
 - `localRootFingerprint` — the workspace folder this plan was built for
@@ -177,11 +177,13 @@ different project or folder.
 
 ## Plan never updates BASE
 
-`Init` and `Pull` are the writers of BASE: `Init` creates it, and `Pull`
-replaces it only after a fully verified success ([base-schema.md](base-schema.md),
-[pull.md](pull.md)). `Plan` reads BASE identity from the resolver's manifest
-and writes only `last-plan.json`. `.rundot-sync/` is in the default ignore set,
-so the artifact is never a local inventory entry or an upload candidate.
+`Init`, `Pull`, and `Push` are the writers of BASE: `Init` creates it, `Pull`
+replaces it only after a fully verified success, and `Push` overlays it
+additively only after every selected `PUT` echo-verifies
+([base-schema.md](base-schema.md), [pull.md](pull.md), [push.md](push.md)).
+`Plan` reads BASE identity from the resolver's manifest and writes only
+`last-plan.json`. `.rundot-sync/` is in the default ignore set, so the artifact
+is never a local inventory entry or an upload candidate.
 
 ## Related contracts
 

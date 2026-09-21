@@ -86,7 +86,7 @@ Milestone: [v0.2.0 - Safe push](https://github.com/iNcredibleGM/rundot-game-stud
 5. Push confirmation, backups, journal, conflict refusal — [#18](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/18)
 6. Public docs: Init → Plan → Pull → Push — [#19](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/19)
 
-Done when a stranger can push one clean local text change on a disposable project without a guessed clobber.
+Do not mark v0.2.0 complete until a stranger can push one clean text change on a disposable project without a guessed clobber.
 
 ## After v0.2.0
 

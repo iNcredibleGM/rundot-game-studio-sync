@@ -78,8 +78,9 @@ constants so `Plan` renders one source of truth.
 | `deleteRemoteCandidate` | LOCAL gone, REMOTE still matches BASE | no |
 | `deleteLocalCandidate` | REMOTE gone, LOCAL still matches BASE | no |
 
-`Applicable` is about **this milestone**, not about correctness: v0.1.3 has no
-mutation, so delete candidates are classified but never actionable.
+`Applicable` is about **this milestone**, not about correctness: this version
+can publish a utf8 text overwrite via `Push` and still never deletes, so delete
+candidates are classified but never actionable.
 
 ## Decision table
 
