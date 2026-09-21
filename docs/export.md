@@ -7,8 +7,8 @@ optionally archive Studio conversation threads.
 It is a **dump**, not a sync command. This document covers where it is allowed
 to write, and why it refuses everywhere else.
 
-Export is GET-only, like every command in this milestone. It never creates,
-replaces, renames, or deletes anything on Studio.
+Export is GET-only. It never creates, replaces, renames, or deletes anything on
+Studio.
 
 ```powershell
 .\game-studio-export.ps1 -ProjectId <id> -OutDir <dir> [-IncludeThreads] [-ForgetAuth]
