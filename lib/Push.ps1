@@ -11,7 +11,7 @@
 #   3. apply/BASE   - remote backup, per-file GET+PUT with echo verify, additive BASE
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
-# Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1,
+# Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1, Journal.ps1,
 # RemoteApi.ps1, RemoteWrite.ps1, and Push.ps1 first.
 
 
@@ -663,33 +663,44 @@ function Invoke-RundotSyncPushApply {
             -LocalFullPath $localFullPath
     }
 
-    foreach ($action in $actionRows) {
-        Save-RundotSyncPushRemoteBackup `
-            -WorkspaceRoot $WorkspaceRoot `
-            -BackupSetPath $BackupSetPath `
-            -Action $action `
-            -StudioOrigin $StudioOrigin `
-            -ProjectId $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -CopyBackupFile $CopyBackupFile | Out-Null
-    }
-
     $appliedActions = New-Object 'System.Collections.Generic.List[object]'
     $appliedLocals = New-Object 'System.Collections.Generic.List[object]'
 
-    foreach ($action in $actionRows) {
-        $appliedLocal = Invoke-RundotSyncPushWriteAction `
-            -WorkspaceRoot $WorkspaceRoot `
-            -Action $action `
-            -StudioOrigin $StudioOrigin `
-            -ProjectId $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -PutRemoteFile $PutRemoteFile
+    try {
+        foreach ($action in $actionRows) {
+            Save-RundotSyncPushRemoteBackup `
+                -WorkspaceRoot $WorkspaceRoot `
+                -BackupSetPath $BackupSetPath `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -CopyBackupFile $CopyBackupFile | Out-Null
+        }
 
-        [void]$appliedActions.Add($action)
-        [void]$appliedLocals.Add($appliedLocal)
+        foreach ($action in $actionRows) {
+            $appliedLocal = Invoke-RundotSyncPushWriteAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile
+
+            [void]$appliedActions.Add($action)
+            [void]$appliedLocals.Add($appliedLocal)
+        }
+    }
+    catch {
+        $originalError = $_.Exception
+        $wrapper = [System.InvalidOperationException]::new(
+            ("Push aborted: {0}" -f [string]$originalError.Message),
+            $originalError
+        )
+        $wrapper.Data['PushAppliedCount'] = $appliedActions.Count
+        throw $wrapper
     }
 
     return [pscustomobject]@{
@@ -805,6 +816,9 @@ function Update-RundotSyncBaseAfterPush {
 
 # ----------------------------------------------------------------------------
 # Report and orchestration
+#
+# Invoke-RundotSyncPush is the single entrypoint the CLI calls. It is the only
+# layer that decides whether BASE moves, and the only layer that journals.
 # ----------------------------------------------------------------------------
 
 function Format-SyncPushReport {
@@ -993,27 +1007,110 @@ function Invoke-RundotSyncPush {
 
     $backupSet = New-RundotSyncBackupSet -WorkspaceRoot $WorkspaceRoot
 
-    $applyResult = Invoke-RundotSyncPushApply `
-        -WorkspaceRoot $WorkspaceRoot `
-        -Actions $actions `
-        -StudioOrigin $StudioOrigin `
-        -ProjectId $ProjectId `
-        -Headers $Headers `
-        -BackupSetPath ([string]$backupSet.Path) `
-        -GetRemoteFile $GetRemoteFile `
-        -PutRemoteFile $PutRemoteFile
+    try {
+        $applyResult = Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $WorkspaceRoot `
+            -Actions $actions `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -BackupSetPath ([string]$backupSet.Path) `
+            -GetRemoteFile $GetRemoteFile `
+            -PutRemoteFile $PutRemoteFile
+    }
+    catch {
+        $applyError = $_.Exception
+        $appliedBeforeFailure = 0
+        if ($applyError.Data.Contains('PushAppliedCount')) {
+            $appliedBeforeFailure = [int]$applyError.Data['PushAppliedCount']
+        }
+
+        try {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push' `
+                -Record @{
+                    status      = 'failed'
+                    projectId   = $ProjectId
+                    planId      = $planId
+                    backupSet   = [string]$backupSet.Name
+                    applied     = $appliedBeforeFailure
+                    overwritten = $appliedBeforeFailure
+                    skipped     = @($selection.Excluded).Count
+                    baseUpdated = $false
+                    reason      = 'Push failed while writing REMOTE. BASE was not updated. The backup set holds the previous remote bytes.'
+                } | Out-Null
+        }
+        catch {
+            # Best effort.
+        }
+
+        throw
+    }
 
     $baseFiles = $null
     if ($Resolution.Base.PSObject.Properties['files']) {
         $baseFiles = $Resolution.Base.files
     }
 
-    Update-RundotSyncBaseAfterPush `
-        -WorkspaceRoot $WorkspaceRoot `
-        -ProjectId $ProjectId `
-        -AppliedActions $applyResult.AppliedActions `
-        -AppliedLocals $applyResult.AppliedLocals `
-        -BaseFiles $baseFiles | Out-Null
+    try {
+        Update-RundotSyncBaseAfterPush `
+            -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $ProjectId `
+            -AppliedActions $applyResult.AppliedActions `
+            -AppliedLocals $applyResult.AppliedLocals `
+            -BaseFiles $baseFiles | Out-Null
+
+        Add-RundotSyncJournalRecord `
+            -WorkspaceRoot $WorkspaceRoot `
+            -Event 'push' `
+            -Record @{
+                status      = 'success'
+                projectId   = $ProjectId
+                planId      = $planId
+                backupSet   = [string]$backupSet.Name
+                applied     = $applyResult.Applied
+                overwritten = $applyResult.Applied
+                skipped     = @($selection.Excluded).Count
+                baseUpdated = $true
+            } | Out-Null
+
+        foreach ($action in @($applyResult.AppliedActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-backup' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+    }
+    catch {
+        try {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push' `
+                -Record @{
+                    status      = 'failed'
+                    projectId   = $ProjectId
+                    planId      = $planId
+                    backupSet   = [string]$backupSet.Name
+                    applied     = $applyResult.Applied
+                    overwritten = $applyResult.Applied
+                    skipped     = @($selection.Excluded).Count
+                    baseUpdated = $false
+                    reason      = 'Push applied remote writes, but the verified BASE update did not complete. The previous BASE remains authoritative.'
+                } | Out-Null
+        }
+        catch {
+            # Journaling a failure must never mask the failure itself.
+        }
+
+        throw
+    }
 
     try {
         [void](Remove-RundotSyncExpiredBackupSets `

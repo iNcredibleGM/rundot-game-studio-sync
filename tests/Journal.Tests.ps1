@@ -92,8 +92,8 @@ try {
         @(Read-RundotSyncJournal -WorkspaceRoot $journalWorkspace).Count `
         "reading a journal that does not exist must return no records"
 
-    # Layout initialization must never plant a journal: only a real Pull run
-    # creates it.
+    # Layout initialization must never plant a journal: only a mutating Pull
+    # or Push run creates it.
     $layoutWorkspace = New-JournalTestWorkspace -Root $journalTestRoot
     Initialize-RundotSyncLayout -WorkspaceRoot $layoutWorkspace
     Assert-True `

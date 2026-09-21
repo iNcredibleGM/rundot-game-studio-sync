@@ -17,6 +17,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
 . (Join-Path $repoRoot "lib\Backup.ps1")
+. (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\RemoteWrite.ps1")
 . (Join-Path $repoRoot "lib\Push.ps1")
@@ -570,6 +571,10 @@ try {
         0 `
         @(Get-RundotSyncBackupSets -WorkspaceRoot $confirmScenario.Workspace).Count `
         'a declined confirmation must not create a backup set'
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $confirmScenario.Workspace).Count `
+        'a declined confirmation must not write a journal record'
 
     $script:PushTestPutCalls = 0
     $script:PushTestGetCalls = 0
@@ -710,6 +715,36 @@ try {
     Assert-True `
         (([string]$pushResult.Report) -match [regex]::Escape($pushResult.BackupRoot)) `
         'the report must print the backup root after a mutating push'
+
+    $pushJournal = @(Read-RundotSyncJournal -WorkspaceRoot $scenario.Workspace)
+    Assert-True ($pushJournal.Count -ge 2) 'a push must journal the run and its backups'
+    Assert-True `
+        (@($pushJournal | Where-Object { [string]$_.event -eq 'push' }).Count -eq 1) `
+        'a push must write exactly one run record'
+    Assert-True `
+        (@($pushJournal | Where-Object { [string]$_.event -eq 'push-backup' }).Count -eq 1) `
+        'a push must write one backup record per backed-up file'
+
+    $pushRunRecord = @($pushJournal | Where-Object { [string]$_.event -eq 'push' })[0]
+    Assert-Equal 'success' ([string]$pushRunRecord.status) 'a successful push must journal a success status'
+    Assert-Equal $true $pushRunRecord.baseUpdated 'a successful push must journal baseUpdated true'
+    Assert-Equal 1 $pushRunRecord.applied 'the push run record must report the applied count'
+    Assert-Equal 1 $pushRunRecord.overwritten 'the push run record must report the overwrite count'
+    Assert-Equal $pushTestProjectId ([string]$pushRunRecord.projectId) 'the push run record must carry the projectId'
+    Assert-Equal $scenario.Artifact.planId ([string]$pushRunRecord.planId) 'the push run record must carry the plan artifact planId'
+
+    $pushBackupRecord = @($pushJournal | Where-Object { [string]$_.event -eq 'push-backup' })[0]
+    Assert-Equal $scenario.Path ([string]$pushBackupRecord.path) 'a push-backup record must name the backed-up path'
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$pushBackupRecord.backupSet)) `
+        'a push-backup record must name the backup set'
+
+    $pushJournalRaw = [System.IO.File]::ReadAllText(
+        (Get-RundotSyncJournalPath -WorkspaceRoot $scenario.Workspace)
+    )
+    Assert-True `
+        ($pushJournalRaw -notmatch '(?i)bearer|authoriz|accesstoken|refreshtoken|"content"') `
+        'the push journal must never record tokens or contents'
 
 
     # --------------------------------------------------------------------------
@@ -884,6 +919,20 @@ try {
             -PutRemoteFile $partialPut | Out-Null
     } 'Injected PUT failure' 'a failed second PUT must abort the run'
 
+    $partialJournal = @(Read-RundotSyncJournal -WorkspaceRoot $partialWorkspace)
+    Assert-Equal 1 $partialJournal.Count 'a failed push must journal exactly one run record'
+    if ($partialJournal.Count -eq 1) {
+        Assert-Equal 'failed' ([string]$partialJournal[0].status) 'a failed push must journal a failed status'
+        Assert-Equal $false $partialJournal[0].baseUpdated 'a failed push must journal baseUpdated false'
+        Assert-Equal 1 $partialJournal[0].applied 'a failed push must journal how many PUTs succeeded'
+        Assert-True `
+            (-not [string]::IsNullOrEmpty([string]$partialJournal[0].backupSet)) `
+            'a failed push must journal the backup set name'
+        Assert-True `
+            (-not [string]::IsNullOrEmpty([string]$partialJournal[0].reason)) `
+            'a failed push must journal why it failed'
+    }
+
     Assert-Equal 2 $script:PushTestPartialPutCount 'the first PUT must have been attempted before the second failure'
 
     $partialBaseAfter = Read-BaseManifest -WorkspaceRoot $partialWorkspace
@@ -939,6 +988,10 @@ try {
 
     Assert-Equal 0 $noopResult.Applied 'a plan with no publishable rows must no-op'
     Assert-Equal $false $noopResult.BaseUpdated 'a no-op push must not update BASE'
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $gateWorkspace).Count `
+        'a no-op push must not write a journal record'
 }
 finally {
     if (Test-Path -LiteralPath $pushTestRoot) {
