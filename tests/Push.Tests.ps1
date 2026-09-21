@@ -401,17 +401,23 @@ try {
     # --------------------------------------------------------------------------
 
     $selectBase = @{
-        'src/text.ts'  = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
-        'public/x.png' = (New-PushTestBaseEntry -Sha256 $pushTestShaA -Kind 'binary')
+        'src/text.ts'     = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+        'public/x.png'    = (New-PushTestBaseEntry -Sha256 $pushTestShaA -Kind 'binary')
+        'src/conflict.ts' = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+        'src/kind.ts'     = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
     }
     $selectLocal = @{
-        'src/text.ts'  = (New-PushTestLocalEntry -Sha256 $pushTestShaB)
-        'public/x.png' = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary')
-        'src/new.ts'   = (New-PushTestLocalEntry -Sha256 $pushTestShaC)
+        'src/text.ts'     = (New-PushTestLocalEntry -Sha256 $pushTestShaB)
+        'public/x.png'    = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary')
+        'src/new.ts'      = (New-PushTestLocalEntry -Sha256 $pushTestShaC)
+        'src/conflict.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaB)
+        'src/kind.ts'     = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary')
     }
     $selectRemote = @{
-        'src/text.ts'  = (New-PushTestRemoteEntry -Sha256 $pushTestShaA)
-        'public/x.png' = (New-PushTestRemoteEntry -Sha256 $pushTestShaA -Kind 'binary' -Encoding 'base64')
+        'src/text.ts'     = (New-PushTestRemoteEntry -Sha256 $pushTestShaA)
+        'public/x.png'    = (New-PushTestRemoteEntry -Sha256 $pushTestShaA -Kind 'binary' -Encoding 'base64')
+        'src/conflict.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaC)
+        'src/kind.ts'     = (New-PushTestRemoteEntry -Sha256 $pushTestShaA)
     }
     $selectArtifact = New-PushTestArtifact `
         -WorkspaceRoot $gateWorkspace `
@@ -419,7 +425,9 @@ try {
         -Operations @(
             (New-PushTestPlanOperation -Path 'src/text.ts' -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA),
             (New-PushTestPlanOperation -Path 'public/x.png' -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA -Kind 'binary' -Applicable $false -Reason 'binary blocked'),
-            (New-PushTestPlanOperation -Path 'src/new.ts' -LocalSha256 $pushTestShaC -RemoteSha256 $null -ExpectedRemoteHash $null -Applicable $false -Reason $script:SyncPlanTextCreateReason)
+            (New-PushTestPlanOperation -Path 'src/new.ts' -LocalSha256 $pushTestShaC -RemoteSha256 $null -ExpectedRemoteHash $null -Applicable $false -Reason $script:SyncPlanTextCreateReason),
+            (New-PushTestPlanOperation -Path 'src/conflict.ts' -Status 'conflict' -Applicable $false -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaC -ExpectedRemoteHash $pushTestShaA),
+            (New-PushTestPlanOperation -Path 'src/kind.ts' -Status 'conflict' -Applicable $false -KindChange $true -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA -Kind 'binary')
         )
 
     $selection = Get-SyncPushSelection `
@@ -430,7 +438,17 @@ try {
 
     Assert-Equal 1 $selection.Actions.Count 'only one text overwrite may be selected'
     Assert-Equal 'src/text.ts' $selection.Actions[0].Path 'the text overwrite path must be selected'
-    Assert-Equal 2 $selection.Excluded.Count 'blocked uploads must be excluded with reasons'
+    Assert-Equal 4 $selection.Excluded.Count 'every non-applicable plan row must be excluded with a reason'
+
+    $conflictExcluded = @($selection.Excluded | Where-Object { [string]$_.Path -eq 'src/conflict.ts' })
+    Assert-Equal 1 $conflictExcluded.Count 'a conflict row must appear in SKIPPED'
+    Assert-Equal 'conflict' ([string]$conflictExcluded[0].Status) 'a conflict row must keep its status'
+    Assert-Equal $script:SyncConflictReason ([string]$conflictExcluded[0].Reason) 'a conflict row must explain why Push skips it'
+
+    $kindExcluded = @($selection.Excluded | Where-Object { [string]$_.Path -eq 'src/kind.ts' })
+    Assert-Equal 1 $kindExcluded.Count 'a kind-change row must appear in SKIPPED'
+    Assert-Equal $true $kindExcluded[0].KindChange 'a kind-change row must be flagged'
+    Assert-Equal $script:SyncKindChangeReason ([string]$kindExcluded[0].Reason) 'a kind-change row must name the kind change'
 
     Assert-PushTestThrowsLike {
         $conflictLocal = @{
@@ -451,6 +469,26 @@ try {
             -Local $conflictLocal `
             -Remote $conflictRemote | Out-Null
     } 'no longer an upload candidate' 'a live conflict on an applicable row must refuse the whole run'
+
+    Assert-PushTestThrowsLike {
+        $kindLocal = @{
+            'src/text.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary')
+        }
+        $kindRemote = @{
+            'src/text.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaA)
+        }
+        $kindArtifact = New-PushTestArtifact `
+            -WorkspaceRoot $gateWorkspace `
+            -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $kindLocal) `
+            -Operations @(
+                (New-PushTestPlanOperation -Path 'src/text.ts' -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA)
+            )
+        Get-SyncPushSelection `
+            -Artifact $kindArtifact `
+            -Base $selectBase `
+            -Local $kindLocal `
+            -Remote $kindRemote | Out-Null
+    } 'no longer an upload candidate' 'a live kind change on an applicable row must refuse the whole run'
 
 
     # --------------------------------------------------------------------------

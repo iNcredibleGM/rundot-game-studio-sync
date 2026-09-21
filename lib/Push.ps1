@@ -167,6 +167,10 @@ function Get-SyncPushExclusionReason {
             return 'REMOTE differs from BASE while LOCAL still matches BASE. Push never downloads remote content.'
         }
         $script:SyncStatusConflict {
+            if ([bool]$PlanOperation.kindChange) {
+                return $script:SyncKindChangeReason
+            }
+
             return $script:SyncConflictReason
         }
         $script:SyncStatusDeleteLocalCandidate {
@@ -217,15 +221,13 @@ function Get-SyncPushSelection {
         $applicable = [bool]$operation.applicable
 
         if ($status -ne $script:SyncStatusUpload -or -not $applicable) {
-            if ($status -eq $script:SyncStatusUpload) {
-                $excluded.Add([pscustomobject]@{
-                    Path       = $path
-                    Status     = $status
-                    Reason     = Get-SyncPushExclusionReason -PlanOperation $operation
-                    Ignored    = [bool]$operation.ignored
-                    KindChange = [bool]$operation.kindChange
-                })
-            }
+            $excluded.Add([pscustomobject]@{
+                Path       = $path
+                Status     = $status
+                Reason     = Get-SyncPushExclusionReason -PlanOperation $operation
+                Ignored    = [bool]$operation.ignored
+                KindChange = [bool]$operation.kindChange
+            })
 
             continue
         }
