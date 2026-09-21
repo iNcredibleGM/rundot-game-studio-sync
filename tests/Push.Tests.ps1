@@ -492,15 +492,153 @@ try {
 
 
     # --------------------------------------------------------------------------
-    # Apply guards and one clean overwrite
+    # Confirmation orchestration
     # --------------------------------------------------------------------------
 
-    $scenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
     $headers = @{
         Authorization = 'Bearer test-token-not-for-output'
         Accept        = '*/*'
     }
 
+    $confirmScenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
+
+    $getRemote = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        $script:PushTestGetCalls++
+        return [pscustomobject]@{
+            encoding = 'utf8'
+            content  = $confirmScenario.RemoteText
+        }
+    }
+
+    $putRemote = {
+        param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+        $script:PushTestPutCalls++
+        return [pscustomobject]@{
+            encoding = 'utf8'
+            content  = $BodyText
+        }
+    }
+
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPush `
+            -WorkspaceRoot $confirmScenario.Workspace `
+            -ProjectId $pushTestProjectId `
+            -Resolution $confirmScenario.Resolution `
+            -Artifact $confirmScenario.Artifact `
+            -Local $confirmScenario.LocalMap `
+            -Remote $confirmScenario.RemoteMap `
+            -Snapshot $confirmScenario.Snapshot `
+            -StudioOrigin $pushTestOrigin `
+            -Headers $headers `
+            -GetRemoteFile $getRemote `
+            -PutRemoteFile $putRemote | Out-Null
+    } 'Confirm the overwrite' 'Push must fail closed without -Force or a confirm callback'
+
+    $script:PushTestPutCalls = 0
+    $script:PushTestConfirmCalls = 0
+    $declineResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $confirmScenario.Workspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution $confirmScenario.Resolution `
+        -Artifact $confirmScenario.Artifact `
+        -Local $confirmScenario.LocalMap `
+        -Remote $confirmScenario.RemoteMap `
+        -Snapshot $confirmScenario.Snapshot `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            $script:PushTestConfirmCalls++
+            return $false
+        } `
+        -GetRemoteFile $getRemote `
+        -PutRemoteFile $putRemote
+
+    Assert-Equal 1 $script:PushTestConfirmCalls 'the overwrite confirmation must be invoked once'
+    Assert-Equal $true $declineResult.Cancelled 'a declined confirmation must report as cancelled'
+    Assert-Equal 0 $declineResult.Applied 'a declined confirmation must apply nothing'
+    Assert-Equal 0 $script:PushTestPutCalls 'a declined confirmation must not PUT'
+
+    $script:PushTestPutCalls = 0
+    $script:PushTestGetCalls = 0
+    $confirmResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $confirmScenario.Workspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution $confirmScenario.Resolution `
+        -Artifact $confirmScenario.Artifact `
+        -Local $confirmScenario.LocalMap `
+        -Remote $confirmScenario.RemoteMap `
+        -Snapshot $confirmScenario.Snapshot `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            return $true
+        } `
+        -GetRemoteFile $getRemote `
+        -PutRemoteFile $putRemote
+
+    Assert-Equal 1 $confirmResult.Applied 'a confirmed push must apply'
+
+    $script:PushTestForceConfirmCalls = 0
+    $forceResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $confirmScenario.Workspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution $confirmScenario.Resolution `
+        -Artifact $confirmScenario.Artifact `
+        -Local $confirmScenario.LocalMap `
+        -Remote $confirmScenario.RemoteMap `
+        -Snapshot $confirmScenario.Snapshot `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -Force `
+        -ConfirmOverwrite {
+            param($Count, $Paths)
+            $script:PushTestForceConfirmCalls++
+            return $false
+        } `
+        -GetRemoteFile $getRemote `
+        -PutRemoteFile $putRemote
+
+    Assert-Equal 0 $script:PushTestForceConfirmCalls '-Force must not prompt for confirmation'
+    Assert-Equal $false $forceResult.Cancelled '-Force must not report as cancelled'
+    Assert-Equal 1 $forceResult.Applied '-Force must apply the action'
+
+    Assert-PushTestThrowsLike {
+        $forceConflictLocal = @{
+            'src/text.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaB)
+        }
+        $forceConflictRemote = @{
+            'src/text.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaC)
+        }
+        $forceConflictArtifact = New-PushTestArtifact `
+            -WorkspaceRoot $gateWorkspace `
+            -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $forceConflictLocal) `
+            -Operations @(
+                (New-PushTestPlanOperation -Path 'src/text.ts' -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA)
+            )
+        Invoke-RundotSyncPush `
+            -WorkspaceRoot $gateWorkspace `
+            -ProjectId $pushTestProjectId `
+            -Resolution (New-PushTestResolution -Files $selectBase) `
+            -Artifact $forceConflictArtifact `
+            -Local $forceConflictLocal `
+            -Remote $forceConflictRemote `
+            -Snapshot (New-PushTestSnapshot) `
+            -StudioOrigin $pushTestOrigin `
+            -Headers $headers `
+            -Force `
+            -GetRemoteFile $getRemote `
+            -PutRemoteFile $putRemote | Out-Null
+    } 'no longer an upload candidate' '-Force must not bypass conflict refusal'
+
+
+    # --------------------------------------------------------------------------
+    # Apply guards and one clean overwrite
+    # --------------------------------------------------------------------------
+
+    $scenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
     $script:PushTestGetCalls = 0
     $script:PushTestPutCalls = 0
 
@@ -522,21 +660,6 @@ try {
         }
     }
 
-    Assert-PushTestThrowsLike {
-        Invoke-RundotSyncPush `
-            -WorkspaceRoot $scenario.Workspace `
-            -ProjectId $pushTestProjectId `
-            -Resolution $scenario.Resolution `
-            -Artifact $scenario.Artifact `
-            -Local $scenario.LocalMap `
-            -Remote $scenario.RemoteMap `
-            -Snapshot $scenario.Snapshot `
-            -StudioOrigin $pushTestOrigin `
-            -Headers $headers `
-            -GetRemoteFile $getRemote `
-            -PutRemoteFile $putRemote | Out-Null
-    } 'Pass -ConfirmPush' 'Push must fail closed without -ConfirmPush'
-
     $pushResult = Invoke-RundotSyncPush `
         -WorkspaceRoot $scenario.Workspace `
         -ProjectId $pushTestProjectId `
@@ -547,7 +670,7 @@ try {
         -Snapshot $scenario.Snapshot `
         -StudioOrigin $pushTestOrigin `
         -Headers $headers `
-        -ConfirmPush `
+        -Force `
         -GetRemoteFile $getRemote `
         -PutRemoteFile $putRemote
 
@@ -688,7 +811,7 @@ try {
             -Snapshot (New-PushTestSnapshot) `
             -StudioOrigin $pushTestOrigin `
             -Headers $headers `
-            -ConfirmPush `
+            -Force `
             -GetRemoteFile $partialGetRemote `
             -PutRemoteFile $partialPut | Out-Null
     } 'Injected PUT failure' 'a failed second PUT must abort the run'
@@ -730,7 +853,6 @@ try {
         -Snapshot $gateSnapshot `
         -StudioOrigin $pushTestOrigin `
         -Headers $headers `
-        -ConfirmPush `
         -GetRemoteFile $getRemote `
         -PutRemoteFile $putRemote
 

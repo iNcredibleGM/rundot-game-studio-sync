@@ -731,7 +731,9 @@ function Invoke-RundotSyncPush {
         [Parameter(Mandatory)]
         [hashtable]$Headers,
 
-        [switch]$ConfirmPush,
+        [scriptblock]$ConfirmOverwrite = $null,
+
+        [switch]$Force,
 
         [scriptblock]$GetRemoteFile = $null,
 
@@ -756,10 +758,33 @@ function Invoke-RundotSyncPush {
     $actions = @($selection.Actions)
     $planId = [string]$Artifact.planId
 
-    if ($actions.Count -gt 0 -and -not $ConfirmPush) {
-        throw [System.InvalidOperationException]::new(
-            ("Refusing to push: {0} remote text file(s) would be overwritten. Pass -ConfirmPush to proceed." -f $actions.Count)
-        )
+    # Confirmation before any write. A declined overwrite changes nothing, so
+    # it is not journaled as a run.
+    if ($actions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmOverwrite) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote text file(s) would be overwritten. " -f $actions.Count) +
+                'Confirm the overwrite, or pass -ForcePush to proceed. ' +
+                'A backup of each remote original is always created first.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmOverwrite $actions.Count @($actions | ForEach-Object { [string]$_.Path }))
+        if (-not $confirmed) {
+            return [pscustomobject]@{
+                Applied        = 0
+                Cancelled      = $true
+                BaseUpdated    = $false
+                PlanId         = $planId
+                Selection      = $selection
+                AppliedActions = @()
+                Report         = (Format-SyncPushReport `
+                    -Selection $selection `
+                    -AppliedActions @() `
+                    -Cancelled $true `
+                    -PlanId $planId)
+            }
+        }
     }
 
     if ($actions.Count -eq 0) {

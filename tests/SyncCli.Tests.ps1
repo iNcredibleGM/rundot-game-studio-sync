@@ -389,6 +389,9 @@ Assert-True `
 Assert-True `
     ($syncCliSource -match '\$ConfirmPush') `
     "the CLI should accept -ConfirmPush"
+Assert-True `
+    ($syncCliSource -match '\$ForcePush') `
+    "the CLI should accept -ForcePush"
 
 foreach ($requiredPushFunction in @(
     'Invoke-RundotSyncPush',
@@ -436,8 +439,23 @@ foreach ($pushFunction in @(
 }
 
 Assert-True `
-    ($pushFunctionText -match [regex]::Escape('-ConfirmPush')) `
-    "the CLI should forward -ConfirmPush into the engine"
+    ($pushFunctionText -match [regex]::Escape('-ConfirmOverwrite')) `
+    "the CLI should hand the overwrite prompt to the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-Force')) `
+    "the CLI should forward -Force into the engine"
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('-ForcePush applies to Push only')) `
+    "the CLI should refuse -ForcePush outside Push"
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('[bool]$ForcePush -or [bool]$ConfirmPush')) `
+    "the CLI should treat -ConfirmPush as a skip-prompt alias for Push"
+
+# Push must not expose -SupportsShouldProcess/-Confirm/-WhatIf in this
+# milestone: confirmation is an explicit prompt plus -ForcePush/-ConfirmPush.
+Assert-True `
+    ($syncCliParamBlock -notmatch '(?i)SupportsShouldProcess|\[switch\]\s*\$(Confirm|WhatIf)\b') `
+    "Push confirmation must be an explicit prompt, not -SupportsShouldProcess"
 
 Assert-True `
     ($pushFunctionText -notmatch '(?i)upload-url|upload-adopt') `
