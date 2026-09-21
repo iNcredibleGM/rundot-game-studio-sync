@@ -88,6 +88,8 @@ Milestone: [v0.2.0 - Safe push](https://github.com/iNcredibleGM/rundot-game-stud
 
 Do not mark v0.2.0 complete until a stranger can push one clean text change on a disposable project without a guessed clobber.
 
+Shipped on `main`.
+
 ## v0.3.0 - Publish the local tree
 
 v0.2.0 publishes one clean utf8 text overwrite. It does not create files, upload binaries, delete remote files, or choose a side on a conflict. Adopting a folder that already disagrees with Studio therefore plans many `upload` and `conflict` rows and an applicable count of zero.
