@@ -16,6 +16,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
+. (Join-Path $repoRoot "lib\Backup.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\RemoteWrite.ps1")
 . (Join-Path $repoRoot "lib\Push.ps1")
@@ -221,6 +222,12 @@ function New-PushTestArtifact {
         localManifestHash        = $LocalManifestHash
         operations               = @($Operations)
     }
+}
+
+function Get-PushTestBytes {
+    param([string]$LiteralPath)
+
+    return [System.IO.File]::ReadAllBytes($LiteralPath)
 }
 
 function Assert-PushTestThrowsLike {
@@ -559,6 +566,10 @@ try {
     Assert-Equal $true $declineResult.Cancelled 'a declined confirmation must report as cancelled'
     Assert-Equal 0 $declineResult.Applied 'a declined confirmation must apply nothing'
     Assert-Equal 0 $script:PushTestPutCalls 'a declined confirmation must not PUT'
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $confirmScenario.Workspace).Count `
+        'a declined confirmation must not create a backup set'
 
     $script:PushTestPutCalls = 0
     $script:PushTestGetCalls = 0
@@ -676,8 +687,16 @@ try {
 
     Assert-Equal 1 $pushResult.Applied 'one clean overwrite must apply'
     Assert-Equal $true $pushResult.BaseUpdated 'BASE must move after a successful push'
-    Assert-Equal 1 $script:PushTestGetCalls 'each overwrite must GET remote immediately before PUT'
+    Assert-Equal 2 $script:PushTestGetCalls 'each overwrite must GET remote for backup and again immediately before PUT'
     Assert-Equal 1 $script:PushTestPutCalls 'each overwrite must PUT once'
+    Assert-True ($null -ne $pushResult.BackupSet) 'a mutating push must create a backup set'
+
+    $backupPath = Join-Path $pushResult.BackupSet.Path ($scenario.Path.Replace('/', '\'))
+    Assert-True (Test-Path -LiteralPath $backupPath -PathType Leaf) 'the remote original must be backed up before PUT'
+    Assert-Equal `
+        (Get-PushTestBytes -LiteralPath $backupPath) `
+        ($pushTestUtf8.GetBytes($scenario.RemoteText)) `
+        'the backup must hold the previous remote bytes, not the local publish payload'
 
     $afterBase = Read-BaseManifest -WorkspaceRoot $scenario.Workspace
     Assert-Equal `
@@ -688,6 +707,55 @@ try {
     Assert-True `
         ($pushResult.Report -notmatch '(?i)bearer|authoriz|access[_-]?token|refresh[_-]?token|"content"') `
         'the push report must not contain tokens or file contents'
+    Assert-True `
+        (([string]$pushResult.Report) -match [regex]::Escape($pushResult.BackupRoot)) `
+        'the report must print the backup root after a mutating push'
+
+
+    # --------------------------------------------------------------------------
+    # Backup failure aborts before any PUT
+    # --------------------------------------------------------------------------
+
+    $backupFailScenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
+    $backupFailSetPath = Join-Path (Get-RundotSyncBackupRoot -WorkspaceRoot $backupFailScenario.Workspace) 'injected-push-backup-set'
+    $script:PushTestBackupFailPutCalls = 0
+    $backupFailGetRemote = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        return [pscustomobject]@{
+            encoding = 'utf8'
+            content  = $backupFailScenario.RemoteText
+        }
+    }
+
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $backupFailScenario.Workspace `
+            -Actions @(
+                [pscustomobject]@{
+                    Path               = $backupFailScenario.Path
+                    LocalSha256        = $backupFailScenario.LocalEntry.Sha256
+                    ExpectedRemoteHash = $backupFailScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -BackupSetPath $backupFailSetPath `
+            -GetRemoteFile $backupFailGetRemote `
+            -PutRemoteFile {
+                param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+                $script:PushTestBackupFailPutCalls++
+                return [pscustomobject]@{ encoding = 'utf8'; content = $BodyText }
+            } `
+            -CopyBackupFile {
+                throw [System.InvalidOperationException]::new('Injected backup failure.')
+            } | Out-Null
+    } 'Injected backup failure' 'a backup failure must abort the push before any PUT'
+
+    Assert-Equal 0 $script:PushTestBackupFailPutCalls 'a backup failure must not PUT'
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $backupFailSetPath ($backupFailScenario.Path.Replace('/', '\'))) -PathType Leaf)) `
+        'a backup failure must not leave a verified backup file behind'
 
 
     # --------------------------------------------------------------------------
@@ -823,6 +891,19 @@ try {
         $partialBaseOneBefore `
         (Get-PushTestBaseEntrySha -Base $partialBaseAfter -Path 'src/one.ts') `
         'BASE must not update when apply aborts mid-run'
+
+    $partialBackupSets = @(Get-RundotSyncBackupSets -WorkspaceRoot $partialWorkspace)
+    Assert-Equal 1 $partialBackupSets.Count 'a partial push must still keep the backup set it made before PUT'
+    $partialBackupOne = Join-Path $partialBackupSets[0].Path 'src\one.ts'
+    $partialBackupTwo = Join-Path $partialBackupSets[0].Path 'src\two.ts'
+    Assert-Equal `
+        ($pushTestUtf8.GetBytes($partial.RemoteText)) `
+        (Get-PushTestBytes -LiteralPath $partialBackupOne) `
+        'the backup set must hold the first remote original before PUT'
+    Assert-Equal `
+        ($pushTestUtf8.GetBytes($partialTwo.RemoteText)) `
+        (Get-PushTestBytes -LiteralPath $partialBackupTwo) `
+        'the backup set must hold the second remote original before PUT'
 
 
     # --------------------------------------------------------------------------
