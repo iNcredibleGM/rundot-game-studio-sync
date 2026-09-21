@@ -92,8 +92,8 @@ try {
         @(Read-RundotSyncJournal -WorkspaceRoot $journalWorkspace).Count `
         "reading a journal that does not exist must return no records"
 
-    # Layout initialization must never plant a journal: only a real Pull run
-    # creates it.
+    # Layout initialization must never plant a journal: only a mutating Pull
+    # or Push run creates it.
     $layoutWorkspace = New-JournalTestWorkspace -Root $journalTestRoot
     Initialize-RundotSyncLayout -WorkspaceRoot $layoutWorkspace
     Assert-True `
@@ -342,6 +342,44 @@ try {
         3 `
         @(Read-RundotSyncJournal -WorkspaceRoot $tornWorkspace).Count `
         "a later append must add one readable record despite a torn line"
+
+    # ----------------------------------------------------------------------
+    # Push event records use the same allowlist and safety checks
+    # ----------------------------------------------------------------------
+
+    $pushJournalWorkspace = New-JournalTestWorkspace -Root $journalTestRoot
+    $pushPlanId = [string][Guid]::NewGuid()
+    $pushBackupSet = '20260921T120000000Z'
+
+    [void](Add-RundotSyncJournalRecord `
+        -WorkspaceRoot $pushJournalWorkspace `
+        -Event 'push' `
+        -Record @{
+            status      = 'success'
+            projectId   = 'proj-journal-push'
+            planId      = $pushPlanId
+            backupSet   = $pushBackupSet
+            applied     = 1
+            overwritten = 1
+            skipped     = 2
+            baseUpdated = $true
+        })
+    [void](Add-RundotSyncJournalRecord `
+        -WorkspaceRoot $pushJournalWorkspace `
+        -Event 'push-backup' `
+        -Record @{
+            status    = 'success'
+            projectId = 'proj-journal-push'
+            planId    = $pushPlanId
+            backupSet = $pushBackupSet
+            path      = 'src/a.ts'
+        })
+
+    $pushJournal = @(Read-RundotSyncJournal -WorkspaceRoot $pushJournalWorkspace)
+    Assert-Equal 2 $pushJournal.Count "push and push-backup records must both append"
+    Assert-Equal 'push' ([string]$pushJournal[0].event) "the run record must use event push"
+    Assert-Equal 'push-backup' ([string]$pushJournal[1].event) "each backup must use event push-backup"
+    Assert-Equal 'src/a.ts' ([string]$pushJournal[1].path) "a push-backup record must name the backed-up path"
 
     # ----------------------------------------------------------------------
     # The journal is never sync content

@@ -21,7 +21,10 @@ param(
     # Pull only: skip the overwrite confirmation prompt. Never skips backups.
     [switch]$ForcePull,
 
-    # Push only: confirm publishing clean text overwrites to Studio.
+    # Push only: skip the overwrite confirmation prompt. Never skips backups.
+    [switch]$ForcePush,
+
+    # Push only: skip-prompt alias for -ForcePush.
     [switch]$ConfirmPush
 )
 
@@ -58,7 +61,9 @@ $ErrorActionPreference = "Stop"
 #
 # Push is the only command that writes REMOTE. It consumes the last Plan
 # artifact, re-verifies every fingerprint, and publishes only clean utf8 text
-# overwrites via documented PUT /file. Pass -ConfirmPush to proceed. Push never
+# overwrites via documented PUT /file. Push asks for confirmation before
+# overwriting; -ForcePush or -ConfirmPush skips the prompt but never a backup,
+# and never bypasses conflict refusal or the concurrent-edit guard. Push never
 # creates files, never uploads binaries, and never deletes anything.
 # ============================================================================
 
@@ -131,6 +136,8 @@ function Stop-WithUsageError {
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Status"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull -ForcePull"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ForcePush"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ConfirmPush"
     Write-Host ""
 
@@ -494,14 +501,51 @@ function Invoke-SyncPullCommand {
 #
 # Push is the only command that writes REMOTE. It consumes last-plan.json,
 # re-verifies every fingerprint against the live tree, and publishes only clean
-# utf8 text overwrites. -ConfirmPush is required before any PUT runs.
+# utf8 text overwrites. -ForcePush or -ConfirmPush skips the prompt; a console
+# run otherwise requires typing yes before any PUT runs.
 # ============================================================================
+
+function Read-RundotSyncPushConfirmation {
+    # Deliberate confirmation: the user must type the whole word. Anything
+    # else, including an empty line or a closed console, declines.
+    param(
+        [int]$OverwriteCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will overwrite $OverwriteCount remote text file(s) on Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each remote original is copied into .rundot-sync/backups before it is replaced."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "Overwrite $OverwriteCount remote file(s)?"
+    }
+    catch {
+        # No console to prompt on. Fail closed.
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
 
 function Invoke-SyncPushCommand {
     param(
         [string]$WorkspaceRoot,
         [string]$StudioProjectId,
-        [bool]$Confirm,
+        [bool]$Force,
         [string]$Origin,
         [string]$SyncAuthDir,
         [string]$SyncAuthPath,
@@ -556,6 +600,13 @@ function Invoke-SyncPushCommand {
 
     $script:Headers = $Headers
 
+    # The engine owns the write; the CLI owns only the prompt. Keeping the
+    # callback here means the engine stays testable without a console.
+    $ConfirmOverwrite = {
+        param($OverwriteCount, $Paths)
+        return (Read-RundotSyncPushConfirmation -OverwriteCount $OverwriteCount -Paths $Paths)
+    }
+
     try {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
@@ -582,7 +633,8 @@ function Invoke-SyncPushCommand {
             -Snapshot $snapshot `
             -StudioOrigin $Origin `
             -Headers $Headers `
-            -ConfirmPush:$Confirm
+            -ConfirmOverwrite $ConfirmOverwrite `
+            -Force:$Force
 
         Write-Host ""
         Write-Host $result.Report
@@ -596,6 +648,10 @@ function Invoke-SyncPushCommand {
         }
 
         Clear-SensitiveVariables
+
+        if ($result.Cancelled) {
+            exit 1
+        }
     }
     catch {
         Write-Host ""
@@ -734,6 +790,10 @@ if ($Command -eq 'Init') {
         Stop-WithUsageError "-ForcePull applies to Pull only."
     }
 
+    if ($ForcePush) {
+        Stop-WithUsageError "-ForcePush applies to Push only."
+    }
+
     if ($ConfirmPush) {
         Stop-WithUsageError "-ConfirmPush applies to Push only."
     }
@@ -786,7 +846,7 @@ if ($Command -eq 'Push') {
     Invoke-SyncPushCommand `
         -WorkspaceRoot $LocalDir `
         -StudioProjectId $ProjectId `
-        -Confirm ([bool]$ConfirmPush) `
+        -Force ([bool]$ForcePush -or [bool]$ConfirmPush) `
         -Origin $StudioOrigin `
         -SyncAuthDir $AuthDir `
         -SyncAuthPath $AuthPath `
@@ -795,6 +855,10 @@ if ($Command -eq 'Push') {
 
 if ($ForcePull) {
     Stop-WithUsageError "-ForcePull applies to Pull only."
+}
+
+if ($ForcePush) {
+    Stop-WithUsageError "-ForcePush applies to Push only."
 }
 
 if ($ConfirmPush) {

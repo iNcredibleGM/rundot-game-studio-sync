@@ -34,7 +34,7 @@ runs the identical engine and persists nothing.
 
 `Push` consumes this artifact and re-verifies every fingerprint before
 writing. A plan is still only a point-in-time observation: it never grants
-permission to skip those checks or to bypass `-ConfirmPush`.
+permission to skip those checks, bypass confirmation, or skip remote backups.
 
 The plan layer marks only one remote-mutating row as applicable:
 

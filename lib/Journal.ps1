@@ -1,9 +1,9 @@
 # Append-only journal for sync runs.
 #
-# The journal is the durable audit trail of a mutating command. It records
-# METADATA ONLY: what ran, which plan and backup set it belonged to, what it
-# changed, and whether BASE was updated. It never records file contents, access
-# tokens, refresh tokens, or Authorization headers.
+# The journal is the durable audit trail of a mutating command. Pull and Push
+# append metadata-only records here. It records what ran, which plan and backup
+# set it belonged to, what it changed, and whether BASE was updated. It never
+# records file contents, access tokens, refresh tokens, or Authorization headers.
 #
 # Fields are written from a fixed allowlist, so a caller cannot widen the
 # record by passing an unexpected key. A serialized line is additionally
