@@ -1,4 +1,4 @@
-# Acceptance harness for the v0.1.3 safe pull planner final gates.
+# Acceptance harness for v0.1.3 Pull and v0.2.0 Push live gates.
 #
 # Companion to docs/acceptance.md: this script executes the gates that can be
 # run from a terminal, and prints a PASS/FAIL table.
@@ -6,9 +6,9 @@
 #   powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
 #   powershell -NoProfile -File .\tests\Acceptance.ps1 -ProjectId <id> -LocalDir <dir>
 #
-# Offline gates need no network and no account. Live gates talk to Studio and
-# REQUIRE YOUR HELP: the script pauses and tells you what to change in Studio,
-# because automating Studio writes is a non-goal of this milestone.
+# Offline gates need no network and no account. Live Pull gates pause for a
+# Studio-side edit. Live Push gates reuse the Gate 2 local edit after Pull and
+# publish it with documented PUT /file (no extra Studio pause).
 #
 # This script never prints or persists tokens, auth files, or file contents.
 # It is named Acceptance.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
@@ -40,6 +40,8 @@ $testRunner = Join-Path $PSScriptRoot "Run-Tests.ps1"
 . (Join-Path $repoRoot "lib\Hashing.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
+. (Join-Path $repoRoot "lib\Backup.ps1")
+. (Join-Path $repoRoot "lib\Journal.ps1")
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -186,6 +188,47 @@ function Get-PlanAppliedRows {
     }
 
     return $rows.ToArray()
+}
+
+function Get-PlanFirstUploadPath {
+    # Returns the first path in the UPLOAD section, or $null when absent.
+    param([string]$Output)
+
+    $lines = $Output -split "`n"
+    $inSection = $false
+
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd("`r")
+
+        if ($trimmed -eq 'UPLOAD') {
+            $inSection = $true
+            continue
+        }
+
+        if (-not $inSection) { continue }
+
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+
+        if ($trimmed -match '^\s+(.+?)\s+base=') {
+            return $matches[1].Trim()
+        }
+
+        if ($trimmed -notmatch '^\s') { break }
+    }
+
+    return $null
+}
+
+function Test-AcceptanceJournalSafe {
+    param([Parameter(Mandatory)][string]$WorkspaceRoot)
+
+    $journalPath = Get-RundotSyncJournalPath -WorkspaceRoot $WorkspaceRoot
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+        return $true
+    }
+
+    $raw = [System.IO.File]::ReadAllText($journalPath)
+    return ($raw -notmatch '(?i)bearer|authoriz|access[_-]?token|refresh[_-]?token|"content"|stagingpath')
 }
 
 function Get-ShortHash {
@@ -339,7 +382,7 @@ else {
             $planNoBaseResult.ExitCode, $refusalMentionsBase, $refusalPointsAtInit, (Test-Path -LiteralPath $planArtifactPath))
 }
 
-# Gate 10: mutation grep
+# Gate 10: mutation grep (documented PUT /file only in lib/RemoteWrite.ps1)
 $productFiles = @()
 foreach ($candidate in @($syncCli, (Join-Path $repoRoot "game-studio-export.ps1"))) {
     if (Test-Path -LiteralPath $candidate) { $productFiles += Get-Item $candidate }
@@ -349,33 +392,61 @@ if (Test-Path -LiteralPath $libRoot) {
     $productFiles += @(Get-ChildItem -Path $libRoot -Recurse -Filter "*.ps1")
 }
 
+$uploadPattern = '(?i)upload-url|upload-adopt'
+$httpPutPattern = '(?i)(?:-Method\s+[''"]?PUT\b|(?:\.Method|\bMethod)\s*=\s*[''"]PUT[''"])'
+$httpDeletePattern = '(?i)(?:-Method\s+[''"]?DELETE\b|(?:\.Method|\bMethod)\s*=\s*[''"]DELETE[''"])'
+$httpMovePattern = '(?i)/move\b|projects/\{[^}]+\}/move'
+$setFunctionPattern = '(?im)^\s*function\s+Set-'
+$removeFunctionPattern = '(?im)^\s*function\s+Remove-'
+$probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
+$allowedPutRelative = 'lib/RemoteWrite.ps1'
+
 $mutationHits = New-Object 'System.Collections.Generic.List[string]'
 foreach ($file in $productFiles) {
     $text = Get-Content -Path $file.FullName -Raw
     $relative = $file.FullName.Substring($repoRoot.Length).TrimStart("\", "/")
+    $normalizedRelative = $relative -replace '\\', '/'
 
-    foreach ($pattern in @(
-        '(?i)upload-url|upload-adopt',
-        '(?i)(?:-Method\s+[''"]?PUT\b|(?:\.Method|\bMethod)\s*=\s*[''"]PUT[''"])',
-        '(?i)(?:-Method\s+[''"]?DELETE\b|(?:\.Method|\bMethod)\s*=\s*[''"]DELETE[''"])'
-    )) {
-        if ([regex]::IsMatch($text, $pattern)) {
-            $mutationHits.Add("${relative}: $pattern")
+    foreach ($match in [regex]::Matches($text, $uploadPattern)) {
+        [void]$mutationHits.Add("${relative}: Studio upload endpoint '$($match.Value)'")
+    }
+
+    if ($normalizedRelative -ne $allowedPutRelative) {
+        foreach ($match in [regex]::Matches($text, $httpPutPattern)) {
+            [void]$mutationHits.Add("${relative}: HTTP PUT '$($match.Value)'")
         }
     }
 
-    if (($relative -replace "\\", "/") -eq 'lib/RemoteApi.ps1') {
-        if ([regex]::IsMatch($text, '(?im)^\s*function\s+Set-')) { $mutationHits.Add("${relative}: Set-* function") }
-        if ([regex]::IsMatch($text, '(?im)^\s*function\s+Remove-')) { $mutationHits.Add("${relative}: Remove-* function") }
+    foreach ($match in [regex]::Matches($text, $httpDeletePattern)) {
+        [void]$mutationHits.Add("${relative}: HTTP DELETE '$($match.Value)'")
+    }
+
+    foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
+        [void]$mutationHits.Add("${relative}: Studio move endpoint '$($match.Value)'")
+    }
+
+    foreach ($match in [regex]::Matches($text, $probeReachabilityPattern)) {
+        [void]$mutationHits.Add("${relative}: reaches the non-product Studio probe '$($match.Value)'")
+    }
+
+    if ($normalizedRelative -eq 'lib/RemoteApi.ps1') {
+        foreach ($match in [regex]::Matches($text, $setFunctionPattern)) {
+            [void]$mutationHits.Add("${relative}: remote Set-* function '$($match.Value.Trim())'")
+        }
+
+        foreach ($match in [regex]::Matches($text, $removeFunctionPattern)) {
+            [void]$mutationHits.Add("${relative}: remote Remove-* function '$($match.Value.Trim())'")
+        }
     }
 }
 
 if ($mutationHits.Count -eq 0) {
-    Add-GateResult -Gate "10. Mutation grep still zero" -Status "PASS" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "PASS" `
         -Detail ("scanned {0} product file(s)" -f $productFiles.Count)
 }
 else {
-    Add-GateResult -Gate "10. Mutation grep still zero" -Status "FAIL" -Detail ($mutationHits -join "; ")
+    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "FAIL" `
+        -Detail ($mutationHits -join "; ")
 }
 
 # ---------------------------------------------------------------------------
@@ -388,9 +459,12 @@ if ($SkipLive) {
     Add-GateResult -Gate "4. Pull applies clean remote-only change with a restorable backup" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "6. Unstable snapshot retries/aborts" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "9. Plan shows expiresAt" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" -Detail "-SkipLive"
 }
 elseif ([string]::IsNullOrEmpty($ProjectId)) {
-    Add-GateResult -Gate "2-4, 6, 9 live gates" -Status "SKIP" -Detail "no -ProjectId supplied; rerun with -ProjectId <id>"
+    Add-GateResult -Gate "2-4, 6, 9, 11-13 live gates" -Status "SKIP" -Detail "no -ProjectId supplied; rerun with -ProjectId <id>"
 }
 else {
     if ([string]::IsNullOrEmpty($LocalDir)) {
@@ -434,6 +508,9 @@ else {
             Add-GateResult -Gate "4. Pull applies clean remote-only change with a restorable backup" -Status "SKIP" -Detail "Init failed"
             Add-GateResult -Gate "6. Unstable snapshot retries/aborts" -Status "SKIP" -Detail "Init failed"
             Add-GateResult -Gate "9. Plan shows expiresAt" -Status "SKIP" -Detail "Init failed"
+            Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" -Detail "Init failed"
+            Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" -Detail "Init failed"
+            Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" -Detail "Init failed"
         }
     }
 
@@ -681,6 +758,201 @@ else {
                 Write-Host "Restore any overwritten file by copying it back from there."
             }
         }
+
+        # Gates 11-13: Push confirmation, remote backup, and journal (reuse Gate 2 upload).
+        if (-not $oneUpload) {
+            Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" `
+                -Detail "gate 2 did not produce exactly one upload"
+            Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" `
+                -Detail "gate 2 did not produce exactly one upload"
+            Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" `
+                -Detail "gate 2 did not produce exactly one upload"
+        }
+        else {
+            Write-Host ""
+            Write-Host "--------------------------------------------------"
+            Write-Host "GATES 11-13: Push confirmation, backup, journal"
+            Write-Host "--------------------------------------------------"
+            Write-Host "Re-planning after Pull so Push fingerprints match the live tree."
+            Write-Host ""
+
+            $planPush = Invoke-SyncCli -CliArgs @(
+                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+            )
+
+            if ($planPush.ExitCode -ne 0) {
+                Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" `
+                    -Detail ("post-pull Plan failed with exit {0}" -f $planPush.ExitCode)
+                Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" `
+                    -Detail ("post-pull Plan failed with exit {0}" -f $planPush.ExitCode)
+                Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" `
+                    -Detail ("post-pull Plan failed with exit {0}" -f $planPush.ExitCode)
+            }
+            else {
+                $uploadCountPush = Get-PlanSummaryCount -Output $planPush.Output -StatusName 'upload'
+                $uploadRowsPush = Get-PlanSectionRowCount -Output $planPush.Output -Header 'UPLOAD'
+                $pushUploadPath = Get-PlanFirstUploadPath -Output $planPush.Output
+
+                if ($uploadCountPush -ne 1 -or $uploadRowsPush -ne 1) {
+                    Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" `
+                        -Detail ("post-pull Plan upload rows={0} (summary {1}); expected exactly one" -f $uploadRowsPush, $uploadCountPush)
+                    Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" `
+                        -Detail ("post-pull Plan upload rows={0} (summary {1}); expected exactly one" -f $uploadRowsPush, $uploadCountPush)
+                    Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" `
+                        -Detail ("post-pull Plan upload rows={0} (summary {1}); expected exactly one" -f $uploadRowsPush, $uploadCountPush)
+                }
+                else {
+                    $baseBeforeDecline = Read-BaseManifest -WorkspaceRoot $LocalDir
+                    $baseCapturedBeforeDecline = $null
+                    if ($null -ne $baseBeforeDecline) { $baseCapturedBeforeDecline = [string]$baseBeforeDecline.capturedAt }
+
+                    $journalBeforeDecline = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                    $pushJournalBeforeDecline = @($journalBeforeDecline | Where-Object { [string]$_.event -eq 'push' -or [string]$_.event -eq 'push-backup' })
+                    $backupSetCountBeforeDecline = @(Get-RundotSyncBackupSets -WorkspaceRoot $LocalDir).Count
+
+                    $declinePush = Invoke-SyncCli -CliArgs @(
+                        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push'
+                    )
+
+                    $declineRefused = ($declinePush.ExitCode -ne 0) -and (
+                        ($declinePush.Output -match 'Push cancelled') -or
+                        ($declinePush.Output -match 'Confirm the overwrite')
+                    )
+
+                    $baseAfterDecline = Read-BaseManifest -WorkspaceRoot $LocalDir
+                    $baseUnchangedAfterDecline = ($null -ne $baseAfterDecline) -and (
+                        [string]$baseAfterDecline.capturedAt -eq $baseCapturedBeforeDecline
+                    )
+
+                    $journalAfterDecline = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                    $pushJournalAfterDecline = @($journalAfterDecline | Where-Object { [string]$_.event -eq 'push' -or [string]$_.event -eq 'push-backup' })
+                    $journalUnchangedAfterDecline = ($pushJournalAfterDecline.Count -eq $pushJournalBeforeDecline.Count)
+
+                    $backupSetCountAfterDecline = @(Get-RundotSyncBackupSets -WorkspaceRoot $LocalDir).Count
+                    $backupUnchangedAfterDecline = ($backupSetCountAfterDecline -eq $backupSetCountBeforeDecline)
+
+                    if ($declineRefused -and $baseUnchangedAfterDecline -and $journalUnchangedAfterDecline -and $backupUnchangedAfterDecline) {
+                        Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "PASS" `
+                            -Detail ("exit={0}; BASE, journal, and backup sets unchanged" -f $declinePush.ExitCode)
+                    }
+                    else {
+                        Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "FAIL" `
+                            -Detail ("exit={0}, refused={1}, BASE unchanged={2}, push journal unchanged={3}, backup sets unchanged={4}" -f `
+                                $declinePush.ExitCode, $declineRefused, $baseUnchangedAfterDecline, $journalUnchangedAfterDecline, $backupUnchangedAfterDecline)
+                    }
+
+                    $pushResult = Invoke-SyncCli -CliArgs @(
+                        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-ForcePush'
+                    )
+
+                    $appliedCount = Get-PlanSummaryCount -Output $pushResult.Output -StatusName 'applied'
+                    $baseUpdatedLine = [regex]::Match($pushResult.Output, '(?m)^\s*BASE updated:\s+(\w+)')
+                    $baseUpdated = ($baseUpdatedLine.Success -and $baseUpdatedLine.Groups[1].Value -eq 'true')
+
+                    $backupRootLine = [regex]::Match($pushResult.Output, '(?m)^\s*backup root:\s+(.+?)\s*$')
+                    $backupRootPush = $null
+                    if ($backupRootLine.Success) { $backupRootPush = $backupRootLine.Groups[1].Value.Trim().TrimEnd('\') }
+
+                    $thisRunLine = [regex]::Match($pushResult.Output, '(?m)^\s*this run:\s+(.+?)\s*$')
+                    $thisRunSetPush = $null
+                    if ($thisRunLine.Success) { $thisRunSetPush = $thisRunLine.Groups[1].Value.Trim().TrimEnd('\') }
+
+                    $appliedRowsPush = @(Get-PlanAppliedRows -Output $pushResult.Output)
+                    $pushBackupChecks = New-Object 'System.Collections.Generic.List[string]'
+                    $pushBackupVerified = $true
+
+                    foreach ($row in $appliedRowsPush) {
+                        $canonical = [string]$row.Path
+                        $localFull = ConvertTo-LocalFullPath -WorkspaceRoot $LocalDir -CanonicalPath $canonical
+
+                        if ([string]::IsNullOrEmpty($thisRunSetPush) -or -not (Test-Path -LiteralPath $thisRunSetPush)) {
+                            $pushBackupVerified = $false
+                            $pushBackupChecks.Add("$canonical : no backup set to verify")
+                            continue
+                        }
+
+                        $backupFile = Join-Path $thisRunSetPush $canonical.Replace('/', '\')
+                        if (-not (Test-Path -LiteralPath $backupFile)) {
+                            $pushBackupVerified = $false
+                            $pushBackupChecks.Add("$canonical : no backup file in this run set")
+                            continue
+                        }
+
+                        $backupIdentity = Get-LocalFileIdentity -LiteralPath $backupFile
+                        $localIdentity = Get-LocalFileIdentity -LiteralPath $localFull
+
+                        if ([string]::Equals(
+                            [string]$backupIdentity.Sha256,
+                            [string]$localIdentity.Sha256,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )) {
+                            $pushBackupVerified = $false
+                            $pushBackupChecks.Add("$canonical : backup matches local (expected remote original bytes)")
+                            continue
+                        }
+
+                        $restoreCopy = Join-Path $scratchRoot ("push-restore-" + [Guid]::NewGuid().ToString("N") + ".bin")
+                        Copy-Item -LiteralPath $backupFile -Destination $restoreCopy -Force
+                        $restoredIdentity = Get-LocalFileIdentity -LiteralPath $restoreCopy
+                        Remove-Item -LiteralPath $restoreCopy -Force -ErrorAction SilentlyContinue
+
+                        if ([string]::Equals(
+                            [string]$backupIdentity.Sha256,
+                            [string]$restoredIdentity.Sha256,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )) {
+                            $pushBackupChecks.Add("$canonical : backup restores by plain copy")
+                        }
+                        else {
+                            $pushBackupVerified = $false
+                            $pushBackupChecks.Add("$canonical : restored copy does not match backup")
+                        }
+                    }
+
+                    $baseCapturedBeforeForce = $baseCapturedBeforeDecline
+                    $baseAfterForce = Read-BaseManifest -WorkspaceRoot $LocalDir
+                    $baseMovedAfterForce = ($baseUpdated -and $null -ne $baseAfterForce -and (
+                        [string]$baseAfterForce.capturedAt -ne $baseCapturedBeforeForce
+                    ))
+
+                    $pushOk = ($pushResult.ExitCode -eq 0 -and $null -ne $appliedCount -and $appliedCount -ge 1)
+
+                    if ($pushOk -and $baseUpdated -and $baseMovedAfterForce -and $pushBackupVerified `
+                        -and (-not [string]::IsNullOrEmpty($backupRootPush)) -and (-not [string]::IsNullOrEmpty($thisRunSetPush))) {
+                        Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "PASS" `
+                            -Detail ("applied={0}, path={1}; {2}" -f $appliedCount, $pushUploadPath, (($pushBackupChecks -join ' | ')))
+                    }
+                    else {
+                        Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "FAIL" `
+                            -Detail ("exit={0}, applied={1}, BASE updated={2}, BASE capturedAt moved={3}, backup root={4}, this run={5}; {6}" -f `
+                                $pushResult.ExitCode, $appliedCount, $baseUpdated, $baseMovedAfterForce, `
+                                (-not [string]::IsNullOrEmpty($backupRootPush)), (-not [string]::IsNullOrEmpty($thisRunSetPush)), `
+                                (($pushBackupChecks -join ' | ')))
+                    }
+
+                    $journalAfterPush = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                    $pushRunRecords = @($journalAfterPush | Where-Object { [string]$_.event -eq 'push' })
+                    $pushBackupRecords = @($journalAfterPush | Where-Object { [string]$_.event -eq 'push-backup' })
+                    $successPushRecords = @($pushRunRecords | Where-Object { [string]$_.status -eq 'success' })
+                    $journalSafe = Test-AcceptanceJournalSafe -WorkspaceRoot $LocalDir
+
+                    $journalOk = ($successPushRecords.Count -ge 1) `
+                        -and ($pushBackupRecords.Count -ge $appliedRowsPush.Count) `
+                        -and $journalSafe
+
+                    if ($journalOk) {
+                        Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "PASS" `
+                            -Detail ("push success={0}, push-backup={1}, journal safe={2}" -f `
+                                $successPushRecords.Count, $pushBackupRecords.Count, $journalSafe)
+                    }
+                    else {
+                        Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "FAIL" `
+                            -Detail ("push success={0}, push-backup={1}, journal safe={2}" -f `
+                                $successPushRecords.Count, $pushBackupRecords.Count, $journalSafe)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -733,43 +1005,21 @@ if ($KeepWorkspace) {
     Write-Host ""
 }
 else {
-    if (Test-Path -LiteralPath $scratchRoot) {
-        Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrEmpty($LocalDir) -and $script:liveWorkspaceCreated -and (Test-Path -LiteralPath $LocalDir)) {
+        Write-Host "Removing the live workspace this run created:"
+        Write-Host "  $LocalDir"
+        Write-Host ""
+        Remove-Item -LiteralPath $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-
-    $workspaceExists = (-not [string]::IsNullOrEmpty($LocalDir)) -and (Test-Path -LiteralPath $LocalDir)
-
-    if (-not $workspaceExists) {
-        # Nothing to do: no live workspace was used, or it is already gone.
-    }
-    elseif (-not $script:liveWorkspaceCreated) {
+    elseif (-not [string]::IsNullOrEmpty($LocalDir) -and (Test-Path -LiteralPath $LocalDir) -and -not $script:liveWorkspaceCreated) {
         Write-Host "Left a pre-existing workspace in place:"
         Write-Host "  $LocalDir"
         Write-Host "Its .rundot-sync/ now holds state from this run."
         Write-Host ""
     }
-    else {
-        # Remove it only inside the repository. A directory the user pointed at
-        # deliberately may hold work this script did not create.
-        $normalizedLocal = [System.IO.Path]::GetFullPath($LocalDir).TrimEnd('\')
-        $normalizedRepo = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd('\')
-        $insideRepo = $normalizedLocal.StartsWith(
-            $normalizedRepo + '\',
-            [System.StringComparison]::OrdinalIgnoreCase
-        )
 
-        if ($insideRepo) {
-            Write-Host "Removing the workspace this run created:"
-            Write-Host "  $LocalDir"
-            Write-Host ""
-            Remove-Item -LiteralPath $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        else {
-            Write-Host "Workspace is outside the repository, so it was left in place:"
-            Write-Host "  $LocalDir"
-            Write-Host "Delete it yourself when you are done; it contains .rundot-sync/ state."
-            Write-Host ""
-        }
+    if (Test-Path -LiteralPath $scratchRoot) {
+        Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
