@@ -460,7 +460,7 @@ try {
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"
     Assert-Equal $false $binaryUpload.applicable "a binary upload must not be applicable"
     Assert-Equal `
-        'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
+        'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
         ([string]$binaryUpload.reason) `
         "a binary upload must keep the fixed replacement-impossible reason"
 

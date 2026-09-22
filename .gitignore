@@ -2,3 +2,4 @@
 # copies of files Pull overwrote. Bound to one project and one folder, so it
 # must not be shared or committed. See "Your workspace metadata" in README.md.
 .rundot-sync/
+dev

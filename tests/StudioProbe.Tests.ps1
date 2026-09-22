@@ -327,7 +327,7 @@ Assert-Equal 0 $undispatched.Count (
 
 # The runner functions are the documented entry points; they must exist and be
 # reachable from the dispatch switch.
-foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all', 'run-text-create-all')) {
+foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all', 'run-text-create-all', 'run-binary-place-all')) {
     Assert-True (
         $dispatchMatch.Success -and
         $dispatchMatch.Groups[1].Value -match [regex]::Escape("'$runnerName'")
