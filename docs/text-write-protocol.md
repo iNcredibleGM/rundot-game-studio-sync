@@ -50,7 +50,8 @@ rejected, and no other verb on this route creates one:
 | `POST` on the same route | `405` |
 
 Creating a text file therefore needs a different mechanism that is **not
-established by this investigation**. `Plan` classifies a brand-new local file as
+established by this investigation** (see [text-create-protocol.md](text-create-protocol.md)
+for the #37 create characterization). `Plan` classifies a brand-new local file as
 `upload` with a dash in REMOTE (`— / A / —`), so the create case is exactly the
 case this route cannot serve.
 
@@ -252,7 +253,7 @@ defense-in-depth.
 
 | Question | Answer from evidence |
 | --- | --- |
-| Can it create a new text file? | No. `PUT` 404s; `POST` is 405. Create mechanism unknown. |
+| Can it create a new text file? | No single API route found ([#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37): guessed creates fail; see [text-create-protocol.md](text-create-protocol.md)). `PUT` 404s; `POST` on `/file` is 405. Upload+move can compose a path but is not one create call. |
 | Does overwrite replace in place? | Yes. No collision rename. |
 | Are bytes preserved? | Yes, exactly: CRLF, BOM, emoji, empty, no trailing newline. |
 | Is it idempotent? | Yes. Identical writes converge, no duplicates. |
