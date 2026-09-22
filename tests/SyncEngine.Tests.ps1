@@ -470,7 +470,7 @@ Assert-True `
     "a binary upload candidate must never be relabelled 'skip'"
 Assert-Equal $false $binaryUploadRow.Applicable "a binary upload candidate is not applicable until #15"
 Assert-Equal `
-    'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
+    'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
     ([string]$binaryUploadRow.Reason) `
     "a binary upload candidate must carry the fixed replacement-impossible reason"
 
@@ -479,7 +479,7 @@ $newBinaryRow = Get-SyncPlanChange -Path 'public/new.png' -Base $null -Local $bi
 Assert-Equal 'upload' ([string]$newBinaryRow.Status) "a new binary file must still display as upload"
 Assert-Equal $false $newBinaryRow.Applicable "a new binary file is not applicable until #15"
 Assert-Equal `
-    'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
+    'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
     ([string]$newBinaryRow.Reason) `
     "a new binary file must carry the fixed replacement-impossible reason"
 

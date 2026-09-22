@@ -167,19 +167,28 @@ never relabelled as a skip — but is marked `Applicable = $false`:
 ```text
 Status   : upload
 Applicable: False
-Reason   : Remote binary replacement is not possible: the upload flow ignores
-           the requested path and a repeated name creates a sibling instead of
-           replacing.
+Reason   : Binary placement needs upload-then-move: the upload flow ignores the
+           requested path and a repeated name creates a sibling instead of
+           replacing, and a replacement is delete-then-place rather than an
+           in-place overwrite.
 ```
 
-Binary replacement was verified **impossible** in
-[#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15): the
-upload flow ignores the requested path (a file always lands at
-`/uploads/{basename}`) and a repeated name creates a numeric-suffixed sibling
-rather than replacing the existing file ([binary-upload-protocol.md](binary-upload-protocol.md)).
+Binary placement was investigated twice. [#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15)
+verified that the upload flow itself cannot choose a path (a file always lands
+at `/uploads/{basename}`) and cannot replace a file — a repeated name creates a
+numeric-suffixed sibling
+([binary-upload-protocol.md](binary-upload-protocol.md)). [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+then proved that the capability still exists through a composed sequence:
+upload-then-`POST /move` lands one binary at a chosen path, and a replacement is
+`DELETE`-then-place rather than an in-place overwrite
+([binary-place-protocol.md](binary-place-protocol.md)). The row stays
+`Applicable = $false` because the product emits none of those routes;
+[#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41) owns
+wiring them.
 Every binary upload candidate is therefore conservative, including a brand-new
-`— / A / —` file, because publishing it would create a different path than the
-plan promised. Text uploads, by contrast, are `Applicable = $true`.
+`— / A / —` file, because publishing it through the upload flow alone would
+create a different path than the plan promised. Text uploads, by contrast, are
+`Applicable = $true`.
 
 ## Determinism and purity
 

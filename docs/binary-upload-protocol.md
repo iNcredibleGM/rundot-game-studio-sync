@@ -85,6 +85,14 @@ Raw bytes, no `Authorization` header. Returns `200` with an empty body.
 The content type is not enforced, and the URL is reusable within its lifetime.
 No `ETag` or other identity header was returned.
 
+> **Refinement from [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38).**
+> A later run observed the presigned `PUT` **returning** an `ETag` header
+> (object storage's, identical across uploads of identical bytes). It is the
+> storage object's identity, not a Studio revision: `GET /files` still exposes
+> no hash, and the landing path is decided by `POST /move` afterwards. A client
+> that needs to verify remote content must still fetch and hash it itself. See
+> [binary-place-protocol.md](binary-place-protocol.md).
+
 ### Step 3 - `upload-adopt`
 
 Requires `uploadId`, and then `name`. The server validates in that order:
@@ -339,7 +347,7 @@ explicitly rather than attempted.
 | --- | --- |
 | Can it create a binary? | Yes. `upload-url` → presigned PUT → `upload-adopt`, all `200`. |
 | Can it choose the project path? | **No.** `path` is ignored; the file always lands in `/uploads/<basename>`. |
-| Does a repeated name replace the file? | **No.** It creates a sibling with a numeric suffix. Replacement was not achievable by any attempt. |
+| Does a repeated name replace the file? | **No.** It creates a sibling with a numeric suffix. Replacement is achievable only by delete-then-place ([#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)), never in place. |
 | Is it idempotent? | **No.** Identical bytes and name create a second file. Only the presigned PUT is idempotent. |
 | Can it create a **text** file? | **Yes**, where `PUT /file` cannot. A UTF-8 `.txt` payload reads back as `encoding: utf8`, and `PUT /file` can then overwrite it. |
 | Are bytes preserved? | Yes, exactly; read-back SHA-256 matches. |
@@ -349,27 +357,42 @@ explicitly rather than attempted.
 | Does a failed step damage anything? | No. Each step is independent and a rejected request wrote nothing. |
 
 The two hard constraints are that **the upload cannot target a path** and that
-**replacement is impossible**. Both are structural, not policy, so `Push`
-cannot work around them.
+**the upload cannot replace a file**. Both are structural, not policy, so `Push`
+cannot work around them. [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+later showed a composed sequence can still land a binary at a chosen path and
+replace one by delete-then-place ([binary-place-protocol.md](binary-place-protocol.md));
+what remains impossible is doing either through the upload flow alone.
 
 ## Consequences for `Push` and the classifier
 
-1. **Binary upload cannot serve a binary `upload` row.** A plan row for a
-   local binary at `src/assets/sprite.png` cannot be published to that path:
-   the server would record `/uploads/sprite.png`. Publishing it would create a
-   *different* path than the plan promised, which is exactly the kind of
-   silent divergence the plan fingerprints exist to prevent.
+1. **The upload step alone cannot serve a binary `upload` row.** A plan row for
+   a local binary at `src/assets/sprite.png` cannot be published to that path
+   by upload: the server would record `/uploads/sprite.png`. Publishing it that
+   way would create a *different* path than the plan promised, which is exactly
+   the kind of silent divergence the plan fingerprints exist to prevent. The
+   path can be reached by a following `POST /move` — that composition is proven
+   in [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+   ([binary-place-protocol.md](binary-place-protocol.md)) — but it is still
+   refused in the product, because [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
+   owns wiring it.
 
-2. **`expectedRemoteHash` cannot be honoured for a binary.** With no hash field
-   and no in-place replacement, `Push` cannot verify that the bytes it replaced
-   are the bytes the plan observed. It would be creating a new file, not
-   replacing a known one.
+2. **`expectedRemoteHash` cannot be honoured in place for a binary.** There is
+   no hash field on the Studio routes, and a replacement is delete-then-place
+   rather than an overwrite, so `Push` cannot send a precondition or make the
+   server verify that the bytes it removed were the bytes the plan observed. It
+   has to fetch and hash the file itself, immediately before the delete.
 
-3. **The existing classifier reason is now accurate.** Binary uploads remain
-   `applicable: false`. The reason previously said replacement semantics were
-   "unverified"; the verification is done and the answer is that replacement
-   is not possible, so the reason was sharpened to say so explicitly in the
-   same change that recorded this evidence.
+3. **The classifier reason is now superseded.** Binary uploads remain
+   `applicable: false`, but the reason text — "Remote binary replacement is not
+   possible" — is no longer accurate as a statement of protocol capability.
+   [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+   proved a binary can be placed at a chosen path and replaced by
+   delete-then-place ([binary-place-protocol.md](binary-place-protocol.md)), so
+   the text was rewritten to say what is actually true: placement needs
+   upload-then-move, a repeated upload collides rather than replaces, and
+   replacement is delete-then-place. The flag stays `false` because the product
+   does not emit those routes; [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
+   owns that.
 
 4. **A future binary `Push` would need a different shape entirely**: treat
    binaries as additive-only (create, never replace), require the remote path
@@ -384,6 +407,10 @@ cannot work around them.
    steps — upload, then move — with the move refusing to overwrite an existing
    destination. That is a viable path for a binary `upload` row, and it is
    recorded in [delete-rename-protocol.md](delete-rename-protocol.md).
+   [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+   then proved the composition end to end: one binary at the chosen path, the
+   staging copy gone, bytes preserved, and no `name-1` sibling left behind
+   ([binary-place-protocol.md](binary-place-protocol.md)).
 
 5. **The create gap from #14 is partly closed, but only for `/uploads`.**
    `PUT /file` cannot create anything, and the upload flow can create a file
@@ -436,13 +463,13 @@ this investigation, against a disposable Studio project only. The probe
 refuses to send anything without `-ConfirmRemoteWrite`, and its text cases
 restore what they touch and verify the restore by SHA-256.
 
-Binary cases cannot be restored: delete was unavailable when this
-investigation began, and replacement is impossible, so a created binary is
-permanent. The probe therefore records every path it creates. Once the delete
-route was found (above), cleanup became automated: a full run deletes what it
-created as its final step and verifies none remain. The 177 files left by the
-earlier exploratory runs were removed the same way, and the project was
-confirmed to hold only its original files afterwards.
+Binary cases cannot be restored in place: delete was unavailable when this
+investigation began, and the upload flow cannot replace a file, so a created
+binary could not be put back. The probe therefore records every path it
+creates. Once the delete route was found (above), cleanup became automated: a
+full run deletes what it created as its final step and verifies none remain.
+The 177 files left by the earlier exploratory runs were removed the same way,
+and the project was confirmed to hold only its original files afterwards.
 
 Evidence files contain status codes, sizes, hashes, and response bodies only.
 No tokens, credentials, or project file contents are recorded. The presigned

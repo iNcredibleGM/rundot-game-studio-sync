@@ -42,7 +42,7 @@ The plan layer marks only one remote-mutating row as applicable:
 | --- | --- | --- |
 | `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
 | `upload` (text create) | no | `PUT /file` is overwrite-only; a missing remote path returns `404`. |
-| `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
+| `upload` (binary) | no | Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite. |
 | `deleteRemoteCandidate` | no | `Push` does not delete remote files. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 

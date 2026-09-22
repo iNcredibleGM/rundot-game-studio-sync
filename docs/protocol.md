@@ -99,3 +99,19 @@ so the file is always recorded at `/uploads/{basename}`; a repeated filename
 (`name-1.png`); and the flow **can create a text file** at that path, which
 `PUT /file` cannot. Replacement was not achievable by any attempt. Nothing in
 the product calls these routes.
+
+## Place a binary at a chosen project path
+
+Status: investigated in [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+([binary-place-protocol.md](binary-place-protocol.md)). The upload flow cannot
+choose a path, but a composed sequence can: upload a unique name, `POST /move`
+to the chosen path, and the staging copy is gone — one binary at the requested
+path, with bytes preserved. A repeated upload name still collides, and the
+adopt response names the suffixed path it actually recorded, so the sibling is
+visible and can be deleted. Replacement is **delete-then-place**, not an
+in-place overwrite: a move onto an occupied destination is refused with `409`
+and changes nothing. A move honors a leading-dot destination (which the upload
+flow strips) and any nested path, but the server does not uniformly guard
+reserved paths (`/.rundot-sync/…` and `/.rundot/…` returned `200` while
+`/.git/…` returned `404`), so the client-side rule stays load-bearing. Nothing
+in the product calls these routes.

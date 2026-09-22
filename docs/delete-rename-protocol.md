@@ -177,6 +177,28 @@ A file can be relocated **out of `/uploads` entirely**, into any directory. This
 is the only observed way to place a file at an arbitrary path, since `PUT /file`
 cannot create and the upload flow cannot choose a path.
 
+[#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+refined this for the destinations that matter to a binary landing:
+
+| Destination | Status | Listed after | Note |
+| --- | --- | --- | --- |
+| A nested path (`/sync-probe/src/assets/x.png`) | `200` | yes | honored verbatim |
+| A **leading-dot** name (`/sync-probe/.x.png`) | `200` | yes | the dot is **preserved** |
+| `/.git/x.png` | `404` `not found` | no | |
+| `/.rundot-sync/x.png` | **`200`** | **yes** | server accepted |
+| `/.rundot/x.png` | **`200`** | **yes** | server accepted |
+| `/../x.png` | `400` | no | `to must be a normalized absolute project path` |
+
+Two of these are worth calling out. A **leading dot survives a move** even
+though the upload flow strips it from a filename — so a dotfile can reach its
+real path, but the dot has to come from the move destination. And the server
+does **not** uniformly guard reserved paths: `/.rundot-sync/…` and `/.rundot/…`
+were created with `200`, while `/.git/…` returned `404`. The `404` is the same
+one an absent path returns, so it must not be read as protection, and the
+client-side reserved-path rule ([path-safety.md](path-safety.md)) stays
+load-bearing on this route. See
+[binary-place-protocol.md](binary-place-protocol.md).
+
 ### Bytes are preserved exactly
 
 | Kind | SHA-256 before | SHA-256 after | Preserved |
@@ -443,6 +465,7 @@ redacts credential-shaped text before writing evidence.
   [text-write-protocol.md](text-write-protocol.md).
 - The binary upload flow, which cannot choose a path or replace a file:
   [binary-upload-protocol.md](binary-upload-protocol.md).
+- The composed landing this route enables: [binary-place-protocol.md](binary-place-protocol.md).
 - The deletion statuses that stay classification-only: [classifier.md](classifier.md).
 - Plan fingerprints a future `Apply` must re-verify: [plan.md](plan.md).
 - Local path safety and reserved paths: [path-safety.md](path-safety.md).
