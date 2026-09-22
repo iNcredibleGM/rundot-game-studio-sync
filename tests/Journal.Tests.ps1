@@ -374,12 +374,42 @@ try {
             backupSet = $pushBackupSet
             path      = 'src/a.ts'
         })
+    [void](Add-RundotSyncJournalRecord `
+        -WorkspaceRoot $pushJournalWorkspace `
+        -Event 'push-delete' `
+        -Record @{
+            status    = 'success'
+            projectId = 'proj-journal-push'
+            planId    = $pushPlanId
+            backupSet = $pushBackupSet
+            path      = 'src/gone.ts'
+        })
 
     $pushJournal = @(Read-RundotSyncJournal -WorkspaceRoot $pushJournalWorkspace)
-    Assert-Equal 2 $pushJournal.Count "push and push-backup records must both append"
+    Assert-Equal 3 $pushJournal.Count "push, push-backup, and push-delete records must all append"
     Assert-Equal 'push' ([string]$pushJournal[0].event) "the run record must use event push"
     Assert-Equal 'push-backup' ([string]$pushJournal[1].event) "each backup must use event push-backup"
     Assert-Equal 'src/a.ts' ([string]$pushJournal[1].path) "a push-backup record must name the backed-up path"
+    Assert-Equal 'push-delete' ([string]$pushJournal[2].event) "each delete must use event push-delete"
+    Assert-Equal 'src/gone.ts' ([string]$pushJournal[2].path) "a push-delete record must name the deleted path"
+
+    # The deleted count is an allowlisted metadata field, like the other
+    # counts. It must round-trip and must never carry contents.
+    $deleteCountWorkspace = New-JournalTestWorkspace -Root $journalTestRoot
+    $deleteCountRecord = Add-RundotSyncJournalRecord `
+        -WorkspaceRoot $deleteCountWorkspace `
+        -Event 'push' `
+        -Record @{
+            status      = 'success'
+            applied     = 1
+            overwritten = 1
+            deleted     = 1
+            skipped     = 0
+            baseUpdated = $true
+        }
+
+    Assert-Equal 1 (Get-JournalTestPropertyValue -Record $deleteCountRecord -Name 'deleted') "the deleted count must round-trip"
+    Assert-Equal 1 ([string]$deleteCountRecord.deleted) "the deleted count must be recorded as a number"
 
     # ----------------------------------------------------------------------
     # The journal is never sync content

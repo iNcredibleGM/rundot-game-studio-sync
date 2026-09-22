@@ -81,7 +81,7 @@ not a license to leave workspace state lying around.
 | 7 | Unreadable local file aborts Plan | `tests/Manifest.Tests.ps1` + harness gate 7a/7b | Automated |
 | 8 | Plan without BASE refuses | `tests/SyncPlan.Tests.ps1`, `tests/Workspace.Tests.ps1` | Automated |
 | 9 | Plan shows `expiresAt` | `tests/SyncPlan.Tests.ps1` | Automated |
-| 10 | Mutation grep allows only documented `PUT /file` | `tests/NoRemoteMutation.Tests.ps1` + harness gate 10 | Automated |
+| 10 | Mutation grep allows only the documented write routes | `tests/NoRemoteMutation.Tests.ps1` + harness gate 10 | Automated |
 | 11 | Push without force refuses in a non-interactive run | `tests/Push.Tests.ps1` + live check | Both |
 | 12 | Push `-ForcePush` applies with remote backup and BASE update | `tests/Push.Tests.ps1` + live check | Both |
 | 13 | Push journals success and `push-backup` without secrets | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` + live check | Both |
@@ -105,8 +105,9 @@ Editing one tracked file in place, leaving BASE and REMOTE untouched, is the
 **Zero invented deletes** is structural, not incidental: `deleteRemoteCandidate`
 requires LOCAL to be genuinely absent (`A / - / A`). An edit in place cannot
 reach that row, so an unchanged-but-edited project cannot produce a delete
-candidate. Deletion candidates are also classification-only here — no command
-deletes anything (see gate 10 and the non-goals).
+candidate. A delete candidate is applied only by a confirmed `Push` with its own
+confirmation, a client-side hash guard, and a backup first ([delete.md](delete.md));
+`Pull` never deletes anything (see gate 10 and the non-goals).
 
 **Live check:** initialize a disposable project with `Init -InitMode FromRemote`,
 edit one file, run `Plan`. Expect exactly one `UPLOAD` row for that path, no
@@ -210,19 +211,22 @@ refuses `-AllowNoBase` entirely.
 `createdAt`, that an explicit TTL controls it, and that the console report
 prints it so expiry is visible rather than buried in the JSON.
 
-### 10. Mutation grep allows only documented `PUT /file`
+### 10. Mutation grep allows only the documented write routes
 
 `tests/NoRemoteMutation.Tests.ps1` scans `game-studio-sync.ps1`,
 `game-studio-export.ps1`, and `lib/**/*.ps1` for Studio write helpers: HTTP
-`PUT` outside `lib/RemoteWrite.ps1`, HTTP `DELETE`, `upload-url`, `upload-adopt`,
-`/move`, reachability to the non-product `StudioProbe`, and any `Set-*` /
-`Remove-*` function in `lib/RemoteApi.ps1`. The v0.2.0 milestone ships one
-documented write route: `PUT /file` in `lib/RemoteWrite.ps1`.
+`PUT` outside `lib/RemoteWrite.ps1`, HTTP `DELETE` outside
+`lib/RemoteDelete.ps1`, `upload-url`, `upload-adopt`, `/move`, reachability to
+the non-product `StudioProbe`, and any `Set-*` / `Remove-*` function in
+`lib/RemoteApi.ps1`. Two documented write routes exist: `PUT /file` in
+`lib/RemoteWrite.ps1` and `DELETE /file` in `lib/RemoteDelete.ps1`
+([push.md](push.md), [delete.md](delete.md)).
 
 The plan layer enforces publish policy at runtime:
-`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite may be
-applicable among remote-mutating rows, that every blocked remote-mutating row
-carries a reason, and that a download is not remote-mutating.
+`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite and a
+route-allowed remote delete may be applicable among remote-mutating rows, that
+every blocked remote-mutating row carries a reason, and that a download is not
+remote-mutating.
 
 ### 11. Push without force refuses in a non-interactive run
 
@@ -271,8 +275,9 @@ Confirmed absent, not merely undocumented:
 
 - No remote create except the documented utf8 text overwrite route (`Push`).
 - No binary upload or adopt.
-- No automatic deletion, locally or remotely. `deleteLocalCandidate` leaves the
-  file in place; `deleteRemoteCandidate` is reported only.
+- No automatic local deletion. `deleteLocalCandidate` leaves the file in place.
+  A remote delete happens only through a confirmed `Push` delete
+  ([delete.md](delete.md)).
 - No `.rundotignore`. The default ignore set is fixed and documented.
 - No newline or encoding normalization; text is preserved byte-for-byte.
 - No FileSystemWatcher, device IDs, or multi-machine BASE. One initialized

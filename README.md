@@ -14,12 +14,13 @@ machine** without guessing:
 - **Plan** / **Status** show what a sync would do, without writing
 - **Pull** applies clean remote-only changes, with a backup of everything it replaces
 - **Push** publishes clean local text overwrites to Studio after confirmation,
-  with a backup of every remote original it replaces
+  and applies confirmed remote deletes, with a backup of every remote original
+  it replaces or removes
 
 **Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
-text files only. It never creates files, never uploads binaries, and never
-deletes anything on Studio. There is no `Apply` shortcut that skips the plan
-fingerprint gates.
+text files and delete a remote file whose local copy is gone. It never creates
+files and never uploads binaries. There is no `Apply` shortcut that skips the
+plan fingerprint gates.
 
 If all you want is a plain raw copy of a project, the original exporter
 (`game-studio-export.ps1`) still does that into a new or empty directory —
@@ -156,9 +157,10 @@ runs:
 
 `-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
 
-`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`). Text
-creates, binaries, conflicts, and deletions are reported and left alone. Before
-each overwrite it copies the previous remote bytes into
+`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`) and
+applies confirmed remote deletes (`BASE=A LOCAL=— REMOTE=A`). Text creates,
+binaries, conflicts, and local deletions are reported and left alone. Before
+each overwrite or delete it copies the previous remote bytes into
 `.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
 refuses the whole run and asks you to plan again.
 
@@ -166,13 +168,18 @@ refuses the whole run and asks you to plan again.
 
 - After you type `yes` (or pass `-ForcePush` / `-ConfirmPush`), overwrite
   existing utf8 text files whose remote bytes still match the plan
+- Ask for a second, separate `yes` before removing any remote file, and list
+  every path it would remove
 - Copy each remote original into `.rundot-sync/backups/<timestamp>/` before any
-  `PUT`
-- Move BASE only after every `PUT` echo-verifies
+  `PUT` or `DELETE`
+- Move BASE only after every `PUT` echo-verifies and every delete is proven
+  absent from `GET /files`
 
 **Push will not:**
 
-- Create files, upload binaries, delete or rename anything on Studio
+- Create files, upload binaries, or rename anything on Studio
+- Delete a path under `.git`, `.gitignore`, `.rundot-sync`, or `.rundot`, or a
+  directory-shaped path
 - Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
   skipped; there is no automatic conflict resolution in this version
 
@@ -185,7 +192,7 @@ Sync state lives in `<LocalDir>\.rundot-sync\`:
   base-manifest.json   # BASE: path, size, and SHA-256 per tracked file
   last-plan.json       # the most recent Plan artifact
   journal.jsonl        # metadata-only record of pulls and pushes
-  backups/             # pre-overwrite copies; Pull stores local originals, Push stores previous remote bytes
+  backups/             # pre-overwrite and pre-delete copies; Pull stores local originals, Push stores previous remote bytes
   temp/                # torn-read staging, cleared after each run
 ```
 
@@ -194,9 +201,9 @@ These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
 contain file contents, access tokens, or refresh tokens.
 
 **Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
-Before `Pull` overwrites a local file, or before `Push` overwrites a remote
-file, the tool copies the *entire original* into the backup set so you can
-restore it. **A backup set can therefore contain complete file contents.**
+Before `Pull` overwrites a local file, or before `Push` overwrites or deletes a
+remote file, the tool copies the *entire original* into the backup set so you
+can restore it. **A backup set can therefore contain complete file contents.**
 
 Both are sensitive, and for different reasons. `.rundot-sync` reveals the
 *names* of every file in your project, and a backup set may additionally hold

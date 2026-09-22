@@ -19,6 +19,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
+. (Join-Path $repoRoot "lib\RemoteDelete.ps1")
 
 $syncPlanTestShaA = 'a' * 64
 $syncPlanTestShaB = 'b' * 64
@@ -442,6 +443,36 @@ try {
 
     $guardOps = @($guardArtifact.operations)
 
+    # A second fixture for the two delete refusals the route rules own:
+    # a reserved root and a directory-shaped path. Both stay delete candidates
+    # at the classifier layer and both must be refused by the publish policy.
+    $reservedBase = @{
+        '.rundot/config' = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+        'src/dir'        = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+    }
+    $reservedLocal = @{}
+    $reservedRemote = @{
+        '.rundot/config' = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA)
+        'src/dir'        = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA)
+        'src/dir/a.ts'   = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaB)
+    }
+
+    $reservedArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution (New-SyncPlanTestResolution `
+            -Base ([pscustomobject]@{
+                capturedAt = '2026-09-14T12:00:00.0000000Z'
+                files      = $reservedBase
+            }) `
+            -BasePresent $true `
+            -Untrusted $false) `
+        -Local $reservedLocal `
+        -Remote $reservedRemote `
+        -Snapshot $snapshot
+
+    $reservedOps = @($reservedArtifact.operations)
+
     $textUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/text.ts'
     Assert-Equal 'upload' $textUpload.status "the text upload row must keep its upload status"
     Assert-Equal $true $textUpload.remoteMutating "a text upload is remote-mutating"
@@ -472,11 +503,25 @@ try {
     $remoteDelete = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/gone.ts'
     Assert-Equal 'deleteRemoteCandidate' $remoteDelete.status "a remote deletion keeps its status"
     Assert-Equal $true $remoteDelete.remoteMutating "a remote delete candidate is remote-mutating"
-    Assert-Equal $false $remoteDelete.applicable "a remote delete candidate must not be applicable"
-    Assert-Equal `
-        'Push does not delete remote files.' `
-        ([string]$remoteDelete.reason) `
-        "a remote delete candidate must carry the Push refusal reason"
+    Assert-Equal $true $remoteDelete.applicable "a route-allowed remote delete must be applicable for Push"
+    Assert-Null $remoteDelete.reason "an applicable remote delete must not carry a block reason"
+
+    # A reserved path and a directory-shaped path are both refused by the
+    # route rules even though the classifier still calls them delete
+    # candidates. The reason names why, and neither is applicable.
+    $reservedDelete = Get-SyncPlanTestRowForPath -Rows $reservedOps -Path '.rundot/config'
+    Assert-Equal 'deleteRemoteCandidate' $reservedDelete.status "a reserved path is still a delete candidate"
+    Assert-Equal $false $reservedDelete.applicable "a reserved path must never be applicable for delete"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$reservedDelete.reason)) `
+        "a refused reserved delete must carry a reason"
+
+    $directoryDelete = Get-SyncPlanTestRowForPath -Rows $reservedOps -Path 'src/dir'
+    Assert-Equal 'deleteRemoteCandidate' $directoryDelete.status "a directory-shaped path is still a delete candidate"
+    Assert-Equal $false $directoryDelete.applicable "a directory-shaped path must never be applicable for delete"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$directoryDelete.reason)) `
+        "a refused directory-shaped delete must carry a reason"
 
     $localDelete = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/localdel.ts'
     Assert-Equal 'deleteLocalCandidate' $localDelete.status "a local deletion keeps its status"

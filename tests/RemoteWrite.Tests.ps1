@@ -211,3 +211,79 @@ Assert-Equal $putText (Get-RemoteWriteTestDecodedContent -BodyBytes $script:Remo
 Assert-Equal 'Bearer test-token' $script:RemoteWriteCapturedHeaders.Authorization `
     "Invoke-RemoteTextPut must pass Authorization through"
 Assert-Equal 'utf8' $putResponse.encoding "the stubbed PUT should return a utf8 echo payload"
+
+
+# --------------------------------------------------------------------------
+# One decode+hash implementation for every remote route
+#
+# The overwrite and delete paths must not each carry their own decoder: a
+# 0-byte remote file aborted a real delete because one copy returned $null and
+# the other returned a bare Byte. Both routes now share one implementation,
+# and the shared one must be the only place that hashes decoded remote bytes.
+# --------------------------------------------------------------------------
+
+$snapshotSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\Snapshot.ps1"))
+$pushSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\Push.ps1"))
+$remoteWriteSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\RemoteWrite.ps1"))
+
+$decodeHashPattern = 'ComputeHash\s*\(\s*\$bytes\s*\)'
+
+Assert-True `
+    ($snapshotSource -match [regex]::Escape('function Get-RemoteFileContentSha256')) `
+    "the shared decoded-payload hash must live in Snapshot.ps1 next to the decoder"
+Assert-Equal `
+    1 `
+    ([regex]::Matches($snapshotSource, $decodeHashPattern)).Count `
+    "the shared hash must be the one place that hashes decoded remote bytes"
+
+Assert-True `
+    ($pushSource -notmatch [regex]::Escape('function Get-RemoteFileContentSha256')) `
+    "Push must not define its own decoded-payload hash"
+Assert-True `
+    ($pushSource -notmatch $decodeHashPattern) `
+    "Push must delegate the decoded-payload hash rather than re-implement it"
+
+Assert-True `
+    ($remoteWriteSource -notmatch $decodeHashPattern) `
+    "the PUT response hash must delegate the decoded-payload hash rather than re-implement it"
+
+# The empty and single-byte payloads are the cases that broke. Both routes must
+# agree on them, and agree with the canonical empty-string SHA-256.
+foreach ($encoding in @('utf8', 'base64')) {
+    $emptyPayload = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+        encoding = $encoding
+        content  = ''
+    })
+    Assert-True ($emptyPayload -is [byte[]]) "an empty $encoding payload must decode to byte[]"
+
+    $emptyHash = Get-RemoteFileContentSha256 -Response ([pscustomobject]@{
+        encoding = $encoding
+        content  = ''
+    })
+    Assert-Equal `
+        'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' `
+        $emptyHash `
+        "an empty $encoding payload must hash to the empty-string SHA-256"
+}
+
+# A one-byte payload is the other unrolling case: it must stay a byte[].
+$oneByteHash = Get-RemoteFileContentSha256 -Response ([pscustomobject]@{
+    encoding = 'utf8'
+    content  = 'A'
+})
+Assert-Equal `
+    '559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd' `
+    $oneByteHash `
+    "a one-byte payload must hash as bytes, not as a bare Byte"
+
+# The PUT echo check and the delete pre-check must agree for the same bytes.
+$agreeText = 'shared decoder agreement'
+$putSha = Get-RemoteTextPutResponseSha256 -Response ([pscustomobject]@{
+    encoding = 'utf8'
+    content  = $agreeText
+})
+$sharedSha = Get-RemoteFileContentSha256 -Response ([pscustomobject]@{
+    encoding = 'utf8'
+    content  = $agreeText
+})
+Assert-Equal $sharedSha $putSha "the PUT echo hash and the shared hash must agree"

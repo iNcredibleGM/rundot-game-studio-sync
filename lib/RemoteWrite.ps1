@@ -132,17 +132,7 @@ function Invoke-RemoteTextPut {
     $request.ContentType = 'application/json'
     $request.ContentLength = $bodyBytes.Length
 
-    foreach ($key in $Headers.Keys) {
-        switch -Regex ($key) {
-            '^Accept$' {
-                $request.Accept = [string]$Headers[$key]
-                continue
-            }
-            default {
-                $request.Headers[$key] = [string]$Headers[$key]
-            }
-        }
-    }
+    Add-RemoteRequestHeaders -Request $request -Headers $Headers
 
     $requestStream = $request.GetRequestStream()
     try {
@@ -170,21 +160,14 @@ function Invoke-RemoteTextPut {
 
 
 function Get-RemoteTextPutResponseSha256 {
+    # The shared decoder+hash in Snapshot.ps1 owns the byte[] guard; this is
+    # only the PUT response's name for it.
     param(
         [Parameter(Mandatory)]
         $Response
     )
 
-    $bytes = ConvertFrom-RemoteFileContent -Response $Response
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($bytes)
-    }
-    finally {
-        $sha.Dispose()
-    }
-
-    return [System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    return Get-RemoteFileContentSha256 -Response $Response
 }
 
 

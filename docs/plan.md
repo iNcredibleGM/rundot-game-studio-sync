@@ -36,19 +36,20 @@ runs the identical engine and persists nothing.
 writing. A plan is still only a point-in-time observation: it never grants
 permission to skip those checks, bypass confirmation, or skip remote backups.
 
-The plan layer marks only one remote-mutating row as applicable:
+The plan layer marks two remote-mutating rows as applicable:
 
 | Status | Applicable | Why |
 | --- | --- | --- |
 | `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
 | `upload` (text create) | no | `PUT /file` is overwrite-only; a missing remote path returns `404`. |
 | `upload` (binary) | no | Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite. |
-| `deleteRemoteCandidate` | no | `Push` does not delete remote files. |
+| `deleteRemoteCandidate` | yes, unless refused | `BASE=A LOCAL=— REMOTE=A` with a present `expectedRemoteHash`, when the path is neither a reserved root nor directory-shaped. `Push` may apply it via `DELETE /file` ([delete.md](delete.md)). |
+| `deleteRemoteCandidate` (reserved or directory-shaped) | no | The route rules refuse the path, so it can never reach a `DELETE`. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
 Every blocked remote-mutating row carries an explicit reason. The
 [classifier](classifier.md) still marks text overwrites as applicable; the
-plan layer refuses text creates, all binaries, and every delete candidate.
+plan layer refuses text creates, all binaries, and every refused delete path.
 
 ## Console layout
 
@@ -57,8 +58,9 @@ Sections appear only when they have rows:
 - `UPLOAD` — local changes a future push would publish
 - `DOWNLOAD` — remote-only changes
 - `CONFLICT` — no single safe direction
-- `STAGED DELETES` — `deleteRemoteCandidate` / `deleteLocalCandidate`,
-  classification only
+- `STAGED DELETES` — `deleteRemoteCandidate` / `deleteLocalCandidate`; a
+  `deleteRemoteCandidate` may be applied by a confirmed `Push`, a
+  `deleteLocalCandidate` is reported only
 - `IGNORED` — out of sync scope by the default ignore set
 - `UNSUPPORTED` — text ↔ binary kind changes
 - `DIAGNOSTIC` — see below

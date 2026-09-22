@@ -55,7 +55,7 @@ confirmation because there is no existing file to preserve.
 | A | B | C | `conflict` | skipped: no safe direction |
 | A | B | B | `synchronized-change` | skipped: both sides already agree |
 | — | A | A | `synchronized-addition` | skipped: both sides already agree |
-| A | — | A | `deleteRemoteCandidate` | reported only |
+| A | — | A | `deleteRemoteCandidate` | applied by a confirmed `Push` ([delete.md](delete.md)) |
 | A | A | — | `deleteLocalCandidate` | **reported, local file left in place** |
 | A | — | — | `settledAbsent` | reported only |
 | — | A | — | `upload` | skipped: future push work |
@@ -65,9 +65,10 @@ confirmation because there is no existing file to preserve.
 Every skipped path is printed with its status and a reason. A skipped path is
 never a silent no-op.
 
-Pull never deletes anything. `deleteLocalCandidate` and
-`deleteRemoteCandidate` are classification-only in this milestone
-([classifier.md](classifier.md)).
+Pull never deletes anything, locally or remotely. `deleteLocalCandidate` is
+reported and the local file is left in place; `deleteRemoteCandidate` is applied
+only by a confirmed `Push`, never by Pull
+([classifier.md](classifier.md), [delete.md](delete.md)).
 
 ## Confirmation and `-ForcePull`
 

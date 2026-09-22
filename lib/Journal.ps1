@@ -29,6 +29,7 @@ $script:RundotSyncJournalAllowedFields = @(
     'applied',
     'overwritten',
     'created',
+    'deleted',
     'skipped',
     'baseUpdated',
     'reason'

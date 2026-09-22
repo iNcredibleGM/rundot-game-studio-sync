@@ -12,10 +12,10 @@ $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
 # Push consumes plan fingerprints but a plan is never permission to write.
-# Only a clean text overwrite may be marked applicable; creates, binaries, and
-# deletes stay blocked with explicit reasons.
+# Only a clean text overwrite and a route-allowed remote delete may be marked
+# applicable; creates, binaries, and refused deletes stay blocked with reasons.
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
-$script:SyncPlanDeleteRemoteBlockedReason = 'Push does not delete remote files.'
+$script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
 
 $script:SyncPlanDryRunClosingLines = @(
     'Dry run only. No remote files were modified.'
@@ -81,21 +81,7 @@ function Get-SyncPlanBaseMapFromResolution {
     }
 
     $files = $filesProperty.Value
-    $map = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-
-    if ($files -is [System.Collections.IDictionary]) {
-        foreach ($key in @($files.Keys)) {
-            $map[[string]$key] = $files[$key]
-        }
-
-        return $map
-    }
-
-    foreach ($property in $files.PSObject.Properties) {
-        $map[[string]$property.Name] = $property.Value
-    }
-
-    return $map
+    return (Copy-SyncMapToHashtable -Map $files)
 }
 
 function Get-SyncLocalManifestFingerprint {
@@ -104,15 +90,7 @@ function Get-SyncLocalManifestFingerprint {
     # without storing any file contents.
     param($Local)
 
-    $paths = @()
-    if ($null -ne $Local) {
-        if ($Local -is [System.Collections.IDictionary]) {
-            $paths = @($Local.Keys | ForEach-Object { [string]$_ })
-        }
-        else {
-            $paths = @($Local.PSObject.Properties | ForEach-Object { [string]$_.Name })
-        }
-    }
+    $paths = Get-SyncMapKeys -Map $Local
 
     if ($paths.Count -gt 0) {
         $sorted = New-Object string[] $paths.Count
@@ -136,6 +114,14 @@ function Get-SyncLocalManifestFingerprint {
     }
 
     return Convert-Utf8Sha256Hex -Text ([string]::Join("`n", $lines.ToArray()))
+}
+
+function Get-SyncPlanRemotePaths {
+    # The canonical paths the live REMOTE map lists. Used by the delete
+    # applicability check to tell a leaf from a directory-shaped path.
+    param($Remote)
+
+    return (Get-SyncMapKeys -Map $Remote)
 }
 
 function Get-SyncPlanOperationRows {
@@ -181,8 +167,27 @@ function Get-SyncPlanOperationRows {
                 }
             }
             elseif ($status -eq $script:SyncStatusDeleteRemoteCandidate) {
-                $applicable = $false
-                $reason = $script:SyncPlanDeleteRemoteBlockedReason
+                # A delete is applicable only when the route may touch the
+                # path: not reserved, not directory-shaped, and carrying the
+                # expectedRemoteHash the engine re-verifies before DELETE.
+                # Plan and Push share one predicate so they cannot drift.
+                $refusal = Get-SyncDeletePathRefusalReason `
+                    -CanonicalPath $path `
+                    -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+
+                if ([string]::IsNullOrEmpty($refusal) -and -not [string]::IsNullOrEmpty($remoteSha)) {
+                    $applicable = $true
+                    $reason = $null
+                }
+                else {
+                    $applicable = $false
+                    if (-not [string]::IsNullOrEmpty($refusal)) {
+                        $reason = $refusal
+                    }
+                    else {
+                        $reason = $script:SyncPlanDeleteRemoteRefusalReason
+                    }
+                }
             }
             else {
                 $applicable = $false

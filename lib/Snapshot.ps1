@@ -274,12 +274,15 @@ function ConvertFrom-RemoteFileContent {
 
     if ($encoding -eq 'utf8') {
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        return $utf8NoBom.GetBytes([string]$content)
+        # The comma keeps an empty or single-byte payload as byte[]: PowerShell
+        # unrolls a one-element array on return, which would hand a bare Byte
+        # to SHA256.ComputeHash and raise an ambiguous-overload error.
+        return ,$utf8NoBom.GetBytes([string]$content)
     }
 
     if ($encoding -eq 'base64') {
         try {
-            return [Convert]::FromBase64String([string]$content)
+            return ,[Convert]::FromBase64String([string]$content)
         }
         catch {
             throw [System.InvalidOperationException]::new(
@@ -292,6 +295,32 @@ function ConvertFrom-RemoteFileContent {
     throw [System.InvalidOperationException]::new(
         "Unknown encoding '$encoding'."
     )
+}
+
+
+function Get-RemoteFileContentSha256 {
+    # The one hash of a decoded remote payload. Every route that verifies
+    # remote bytes goes through here, so the decode guard and the hex
+    # conversion cannot drift between the overwrite and delete paths.
+    #
+    # ConvertFrom-RemoteFileContent always returns byte[] (including empty and
+    # single-byte payloads), which matters because SHA256.ComputeHash raises an
+    # ambiguous-overload error on a bare Byte and returns $null for $null.
+    param(
+        [Parameter(Mandatory)]
+        $Response
+    )
+
+    $bytes = ConvertFrom-RemoteFileContent -Response $Response
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    return Convert-HashBytesToHex -Hash $hash
 }
 
 

@@ -98,13 +98,13 @@ This milestone is the confirmed publish that can make Studio match that local tr
 
 **Guiding rule:** still no guessed clobber. Default `Push` stays the clean text overwrite. A diverged path is published only when a local-wins confirmation names it. Local-wins replaces remote bytes with local bytes. It does not merge.
 
-**Hard ban:** do not add a create, binary upload, `DELETE`, or `POST /move` until the issue that owns that route has written down the evidence. A route that does not exist stays refused.
+**Hard ban:** do not add a create, binary upload, or `POST /move` until the issue that owns that route has written down the evidence. A route that does not exist stays refused. The delete route is implemented in `lib/RemoteDelete.ps1` under [#39](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/39), on the evidence in [docs/delete-rename-protocol.md](docs/delete-rename-protocol.md).
 
 Milestone: [v0.3.0 - Publish the local tree](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/4)
 
 1. Investigate how Studio creates a text file — [#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37)
 2. Investigate placing a binary at its project path — [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
-3. Delete remote files for `deleteRemoteCandidate` — [#39](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/39)
+3. Delete remote files for `deleteRemoteCandidate` — [#39](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/39) — shipped in `lib/RemoteDelete.ps1`
 4. Push text creates when a create route exists — [#40](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/40)
 5. Publish binaries only by a proven place-at-path sequence — [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
 6. Confirmed local-wins publish for conflicts and remote-only files — [#42](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/42)
