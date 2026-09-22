@@ -951,3 +951,66 @@ finally {
         Remove-Item -LiteralPath $tornRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# --------------------------------------------------------------------------
+# Payload decode keeps byte[] for empty and single-byte content
+#
+# PowerShell unrolls a one-element array on return, so a zero-byte or one-byte
+# payload would otherwise arrive as $null or a bare Byte. Hashing that raises
+# "Multiple ambiguous overloads found for ComputeHash", which aborted a real
+# delete of a 0-byte remote file. The decoded value must always be a byte[].
+# --------------------------------------------------------------------------
+
+foreach ($payloadCase in @(
+    @{ Name = 'empty';   Content = '' },
+    @{ Name = 'oneByte'; Content = 'A' },
+    @{ Name = 'many';    Content = 'hello world' }
+)) {
+    $decoded = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+        encoding = 'utf8'
+        content  = $payloadCase.Content
+    })
+
+    Assert-True `
+        ($decoded -is [byte[]]) `
+        "a decoded $($payloadCase.Name) utf8 payload must stay a byte array"
+    Assert-Equal `
+        $payloadCase.Content.Length `
+        $decoded.Length `
+        "a decoded $($payloadCase.Name) payload must have the expected length"
+
+    # The real failure mode: hashing the decoded bytes must not be ambiguous.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($decoded)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    Assert-Equal 32 $hash.Length "a $($payloadCase.Name) payload must hash to 32 bytes"
+}
+
+$emptyDecoded = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+    encoding = 'utf8'
+    content  = ''
+})
+$emptySha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $emptyHash = $emptySha.ComputeHash($emptyDecoded)
+}
+finally {
+    $emptySha.Dispose()
+}
+Assert-Equal `
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' `
+    ([System.BitConverter]::ToString($emptyHash).Replace('-', '').ToLowerInvariant()) `
+    "empty remote content must hash to the empty-string SHA-256"
+
+$emptyBase64 = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+    encoding = 'base64'
+    content  = ''
+})
+Assert-True ($emptyBase64 -is [byte[]]) "a decoded empty base64 payload must stay a byte array"
+Assert-Equal 0 $emptyBase64.Length "a decoded empty base64 payload must be zero bytes"
+

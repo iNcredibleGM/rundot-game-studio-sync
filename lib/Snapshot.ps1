@@ -274,12 +274,15 @@ function ConvertFrom-RemoteFileContent {
 
     if ($encoding -eq 'utf8') {
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        return $utf8NoBom.GetBytes([string]$content)
+        # The comma keeps an empty or single-byte payload as byte[]: PowerShell
+        # unrolls a one-element array on return, which would hand a bare Byte
+        # to SHA256.ComputeHash and raise an ambiguous-overload error.
+        return ,$utf8NoBom.GetBytes([string]$content)
     }
 
     if ($encoding -eq 'base64') {
         try {
-            return [Convert]::FromBase64String([string]$content)
+            return ,[Convert]::FromBase64String([string]$content)
         }
         catch {
             throw [System.InvalidOperationException]::new(
