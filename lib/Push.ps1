@@ -448,6 +448,19 @@ function Assert-SyncPushLocalUnchanged {
     }
 }
 
+function Get-SyncPushDefaultRemoteFileReader {
+    # The real GET used when a caller injects no reader. Shared so the read
+    # route cannot drift between the overwrite and delete paths.
+    return {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        Get-RemoteProjectFile `
+            -StudioOrigin $Origin `
+            -ProjectId $Id `
+            -Path $ApiPath `
+            -Headers $Hdr
+    }
+}
+
 function Get-SyncPushVerifiedRemoteResponse {
     param(
         [Parameter(Mandatory)]
@@ -471,14 +484,7 @@ function Get-SyncPushVerifiedRemoteResponse {
     $absolutePath = ConvertTo-StudioAbsoluteApiPath -CanonicalPath $Path
 
     if ($null -eq $GetRemoteFile) {
-        $GetRemoteFile = {
-            param($Origin, $Id, $ApiPath, $Hdr)
-            Get-RemoteProjectFile `
-                -StudioOrigin $Origin `
-                -ProjectId $Id `
-                -Path $ApiPath `
-                -Headers $Hdr
-        }
+        $GetRemoteFile = Get-SyncPushDefaultRemoteFileReader
     }
 
     try {
@@ -628,14 +634,7 @@ function Invoke-RundotSyncPushWriteAction {
     $text = Get-LocalUtf8TextForPush -LiteralPath $localFullPath
 
     if ($null -eq $GetRemoteFile) {
-        $GetRemoteFile = {
-            param($Origin, $Id, $ApiPath, $Hdr)
-            Get-RemoteProjectFile `
-                -StudioOrigin $Origin `
-                -ProjectId $Id `
-                -Path $ApiPath `
-                -Headers $Hdr
-        }
+        $GetRemoteFile = Get-SyncPushDefaultRemoteFileReader
     }
 
     if ($null -eq $PutRemoteFile) {
@@ -964,18 +963,7 @@ function New-RundotSyncPushBaseFiles {
         [string[]]$DeletedPaths
     )
 
-    $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-
-    if ($BaseFiles -is [System.Collections.IDictionary]) {
-        foreach ($key in @($BaseFiles.Keys)) {
-            $files[[string]$key] = $BaseFiles[$key]
-        }
-    }
-    elseif ($null -ne $BaseFiles) {
-        foreach ($property in $BaseFiles.PSObject.Properties) {
-            $files[[string]$property.Name] = $property.Value
-        }
-    }
+    $files = Copy-SyncMapToHashtable -Map $BaseFiles
 
     foreach ($applied in @($AppliedLocals)) {
         if ($null -eq $applied) {

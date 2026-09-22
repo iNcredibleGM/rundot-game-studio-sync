@@ -443,6 +443,60 @@ function Get-SyncPlanChange {
     }
 }
 
+function Get-SyncMapKeys {
+    # The keys of a file map, whichever shape it arrived in: a Hashtable from
+    # BASE or a PSCustomObject from a parsed manifest. Emitted as one array so
+    # an empty map still returns an empty array rather than $null.
+    param($Map)
+
+    if ($null -eq $Map) {
+        return ,([string[]]@())
+    }
+
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($key in $Map.Keys) {
+            [void]$keys.Add([string]$key)
+        }
+
+        return ,$keys.ToArray()
+    }
+
+    foreach ($property in $Map.PSObject.Properties) {
+        [void]$keys.Add([string]$property.Name)
+    }
+
+    return ,$keys.ToArray()
+}
+
+function Copy-SyncMapToHashtable {
+    # A fresh ordinal Hashtable copy of a file map, whichever shape it arrived
+    # in. Values are copied by reference; a caller that needs to replace an
+    # entry does so on the returned map. A missing map copies to an empty map.
+    param($Map)
+
+    $copy = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+
+    if ($null -eq $Map) {
+        return $copy
+    }
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($key in $Map.Keys) {
+            $copy[[string]$key] = $Map[$key]
+        }
+
+        return $copy
+    }
+
+    foreach ($property in $Map.PSObject.Properties) {
+        $copy[[string]$property.Name] = $property.Value
+    }
+
+    return $copy
+}
+
 function Get-SyncMapEntry {
     param(
         $Map,

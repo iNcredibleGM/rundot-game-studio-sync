@@ -189,17 +189,7 @@ function Invoke-RemoteDeleteFile {
     $request = [System.Net.HttpWebRequest]::Create($uri)
     $request.Method = 'DELETE'
 
-    foreach ($key in $Headers.Keys) {
-        switch -Regex ($key) {
-            '^Accept$' {
-                $request.Accept = [string]$Headers[$key]
-                continue
-            }
-            default {
-                $request.Headers[$key] = [string]$Headers[$key]
-            }
-        }
-    }
+    Add-RemoteRequestHeaders -Request $request -Headers $Headers
 
     try {
         $httpResponse = $request.GetResponse()

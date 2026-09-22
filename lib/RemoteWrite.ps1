@@ -132,17 +132,7 @@ function Invoke-RemoteTextPut {
     $request.ContentType = 'application/json'
     $request.ContentLength = $bodyBytes.Length
 
-    foreach ($key in $Headers.Keys) {
-        switch -Regex ($key) {
-            '^Accept$' {
-                $request.Accept = [string]$Headers[$key]
-                continue
-            }
-            default {
-                $request.Headers[$key] = [string]$Headers[$key]
-            }
-        }
-    }
+    Add-RemoteRequestHeaders -Request $request -Headers $Headers
 
     $requestStream = $request.GetRequestStream()
     try {

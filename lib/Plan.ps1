@@ -81,21 +81,7 @@ function Get-SyncPlanBaseMapFromResolution {
     }
 
     $files = $filesProperty.Value
-    $map = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-
-    if ($files -is [System.Collections.IDictionary]) {
-        foreach ($key in @($files.Keys)) {
-            $map[[string]$key] = $files[$key]
-        }
-
-        return $map
-    }
-
-    foreach ($property in $files.PSObject.Properties) {
-        $map[[string]$property.Name] = $property.Value
-    }
-
-    return $map
+    return (Copy-SyncMapToHashtable -Map $files)
 }
 
 function Get-SyncLocalManifestFingerprint {
@@ -104,15 +90,7 @@ function Get-SyncLocalManifestFingerprint {
     # without storing any file contents.
     param($Local)
 
-    $paths = @()
-    if ($null -ne $Local) {
-        if ($Local -is [System.Collections.IDictionary]) {
-            $paths = @($Local.Keys | ForEach-Object { [string]$_ })
-        }
-        else {
-            $paths = @($Local.PSObject.Properties | ForEach-Object { [string]$_.Name })
-        }
-    }
+    $paths = Get-SyncMapKeys -Map $Local
 
     if ($paths.Count -gt 0) {
         $sorted = New-Object string[] $paths.Count
@@ -143,25 +121,7 @@ function Get-SyncPlanRemotePaths {
     # applicability check to tell a leaf from a directory-shaped path.
     param($Remote)
 
-    $paths = New-Object 'System.Collections.Generic.List[string]'
-
-    if ($null -eq $Remote) {
-        return @()
-    }
-
-    if ($Remote -is [System.Collections.IDictionary]) {
-        foreach ($key in @($Remote.Keys)) {
-            [void]$paths.Add([string]$key)
-        }
-
-        return $paths.ToArray()
-    }
-
-    foreach ($property in $Remote.PSObject.Properties) {
-        [void]$paths.Add([string]$property.Name)
-    }
-
-    return $paths.ToArray()
+    return (Get-SyncMapKeys -Map $Remote)
 }
 
 function Get-SyncPlanOperationRows {
