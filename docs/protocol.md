@@ -32,6 +32,16 @@ tool. It is **overwrite-only**: a path that is not already in the project
 returns 404, and there is no ETag, version field, or honoured `If-Match`. Nothing
 in the product calls this route.
 
+## Create text file
+
+Status: investigated in [#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37)
+([text-create-protocol.md](text-create-protocol.md)). **No single-request create
+route** was found among guessed API shapes; `PUT /file` remains overwrite-only
+(#14). Studio’s UI does not expose a new text-file create (and does not offer
+text upload; binary upload is separate). New source text at a chosen path was
+observed only through the **API**: unique **upload adopt**, **`POST /move`**, then
+**`PUT /file`** for exact bytes. Nothing in the product creates remote text files.
+
 ## Delete file
 
 DELETE /api/projects/{projectId}/file?path={encodedPath}
