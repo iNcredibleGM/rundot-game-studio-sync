@@ -138,6 +138,7 @@ param(
         'text-create-route-survey',
         'text-create-devtools-prepare',
         'text-create-devtools-apply',
+        'text-place-exact',
         'run-text-create-all'
     )]
     [string]$Scenario,
@@ -344,13 +345,18 @@ function Save-ProbeEvidence {
 # ---------------------------------------------------------------------------
 
 function Get-Sha256Hex {
-    param([byte[]]$Bytes)
+    param($Bytes)
 
-    if ($null -eq $Bytes) { return $null }
+    # An empty [byte[]] binds as $null on a typed parameter, so this stays
+    # untyped and hashes a zero-length buffer as the empty-file digest.
+    $buffer = New-Object byte[] 0
+    if ($null -ne $Bytes) {
+        $buffer = [byte[]]$Bytes
+    }
 
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return [System.BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant()
+        return [System.BitConverter]::ToString($sha.ComputeHash($buffer)).Replace('-', '').ToLowerInvariant()
     }
     finally { $sha.Dispose() }
 }
@@ -1457,6 +1463,7 @@ function Get-ProbeScenarioPlan {
         'text-create-route-survey' = @()
         'text-create-devtools-prepare' = @('create a probe-owned target and print UI capture instructions')
         'text-create-devtools-apply'   = @('record the UI capture route shape without replaying it')
+        'text-place-exact'         = @('upload a unique name, POST /move to a source path, then PUT /file the exact text')
         'run-text-create-all'      = @('The full #37 text create investigation: discover, compose, idempotency, bytes, race, conditional, reserved, survey')
     }
 
@@ -4119,6 +4126,11 @@ function Remove-ProbeListedPathIfOwned {
 
     try {
         $result = Invoke-ProbeDeleteFile -Path $Path -Case $Case
+        if ($result.Deleted) {
+            while ($script:CreatedPaths.Contains($Path)) {
+                [void]$script:CreatedPaths.Remove($Path)
+            }
+        }
         return $result.Deleted
     }
     catch {
@@ -5171,6 +5183,190 @@ function Invoke-ProbeStep {
     }
 }
 
+function Get-ProbeReadIdentity {
+    param($Read)
+
+    if ($null -eq $Read) {
+        return @{
+            byteCount          = $null
+            sha256             = $null
+            encoding           = $null
+            contentStartsWithBom = $false
+        }
+    }
+
+    $startsWithBom = $false
+    if (-not [string]::IsNullOrEmpty($Read.Content)) {
+        $startsWithBom = ([int][char]$Read.Content[0] -eq 0xFEFF)
+    }
+
+    return @{
+        byteCount            = $Read.ByteCount
+        sha256               = $Read.Sha256
+        encoding             = $Read.Encoding
+        contentStartsWithBom = $startsWithBom
+    }
+}
+
+function Invoke-ProbePlaceTextExactCase {
+    # Upload under a unique /uploads name, move to the chosen path, then PUT
+    # the exact text. Upload is only how the path comes into existence. PUT
+    # is the byte-exact step, because #14 showed PUT preserves CRLF and BOM
+    # on a file that already exists.
+    param(
+        [string]$Case,
+        [string]$DestPath,
+        [string]$Text,
+        [string]$Extension,
+        [string]$ContentType = 'text/plain',
+        [switch]$UploadPlaceholder
+    )
+
+    $sentText = $Text
+    $uploadText = $Text
+    if ($UploadPlaceholder) {
+        $uploadText = 'x'
+    }
+
+    $sentBytes = Get-Utf8NoBomBytes -Text $sentText
+    $uploadBytes = Get-Utf8NoBomBytes -Text $uploadText
+    $sentSha = Get-Sha256Hex -Bytes $sentBytes
+    $fileName = Get-BinaryProbeName -Suffix $Case -Extension $Extension
+
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        Remove-ProbeListedPathIfOwned -Path $DestPath -Case "$Case-preclean" | Out-Null
+    }
+
+    $upload = Invoke-ProbeBinaryUpload `
+        -Case "$Case-upload" `
+        -FileName $fileName `
+        -Bytes $uploadBytes `
+        -ContentType $ContentType `
+        -Note 'unique upload so the destination can be created by move'
+
+    $afterUpload = $null
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        $afterUpload = Get-ProbeReadOrNull -Path $upload.recordedPath
+    }
+
+    $moveStatus = $null
+    $moveBody = $null
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        $move = Invoke-ProbeMoveRequest -Case "$Case-move" -From $upload.recordedPath -To $DestPath
+        $moveStatus = $move.Status
+        $moveBody = $move.BodyText
+    }
+
+    $afterMove = Get-ProbeReadOrNull -Path $DestPath
+    $putStatus = $null
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        $put = Invoke-ProbeTextPut -Path $DestPath -ContentBytes (New-JsonContentBody -Text $sentText)
+        $putStatus = $put.Status
+    }
+
+    Start-Sleep -Milliseconds 300
+    $afterPut = Get-ProbeReadOrNull -Path $DestPath
+    $uploadIdentity = Get-ProbeReadIdentity -Read $afterUpload
+    $moveIdentity = Get-ProbeReadIdentity -Read $afterMove
+    $putIdentity = Get-ProbeReadIdentity -Read $afterPut
+
+    $exactAfterPut = (
+        $null -ne $afterPut -and
+        [string]::Equals($afterPut.Sha256, $sentSha, [System.StringComparison]::OrdinalIgnoreCase) -and
+        ($afterPut.ByteCount -eq $sentBytes.Length)
+    )
+
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note                 = 'upload creates the path; PUT /file is the exact-bytes step'
+        destPath             = $DestPath
+        extension            = $Extension
+        contentType          = $ContentType
+        uploadPlaceholder    = [bool]$UploadPlaceholder
+        uploadStatus         = $upload.uploadUrl.status
+        adoptStatus          = if ($null -ne $upload.adopt) { $upload.adopt['status'] } else { $null }
+        uploadPath           = $upload.recordedPath
+        uploadEncoding       = $uploadIdentity.encoding
+        uploadByteCount      = $uploadIdentity.byteCount
+        uploadSha256         = $uploadIdentity.sha256
+        uploadStartsWithBom  = $uploadIdentity.contentStartsWithBom
+        moveStatus           = $moveStatus
+        moveBody             = $moveBody
+        moveEncoding         = $moveIdentity.encoding
+        moveByteCount        = $moveIdentity.byteCount
+        moveSha256           = $moveIdentity.sha256
+        moveStartsWithBom    = $moveIdentity.contentStartsWithBom
+        putStatus            = $putStatus
+        putEncoding          = $putIdentity.encoding
+        putByteCount         = $putIdentity.byteCount
+        putSha256            = $putIdentity.sha256
+        putStartsWithBom     = $putIdentity.contentStartsWithBom
+        sentSize             = $sentBytes.Length
+        sentSha256           = $sentSha
+        exactAfterPut        = $exactAfterPut
+    }
+    Write-ProbeLog ("[PROBED] {0} move={1} put={2} exactAfterPut={3}" -f $Case, $moveStatus, $putStatus, $exactAfterPut)
+
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        Remove-ProbeListedPathIfOwned -Path $DestPath -Case "$Case-cleanup" | Out-Null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        if ($null -ne (Get-ProbeRowOrNull -Path $upload.recordedPath)) {
+            Remove-ProbeListedPathIfOwned -Path $upload.recordedPath -Case "$Case-cleanup-upload" | Out-Null
+        }
+        else {
+            while ($script:CreatedPaths.Contains($upload.recordedPath)) {
+                [void]$script:CreatedPaths.Remove($upload.recordedPath)
+            }
+        }
+    }
+
+    return $exactAfterPut
+}
+
+function Invoke-ScenarioTextPlaceExact {
+    $results = @()
+
+    $ts = "export const n = 1;`r`nconst q = `"quote`";`r`n"
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-ts' `
+        -DestPath "$($script:ProbeDir)/src/$($script:ProbeNamePrefix)-main.ts" `
+        -Text $ts `
+        -Extension '.ts'
+
+    $bom = "$([char]0xFEFF)export const bom = true;`n"
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-bom' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-bom.ts" `
+        -Text $bom `
+        -Extension '.ts'
+
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-empty' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-empty.ts" `
+        -Text '' `
+        -Extension '.ts' `
+        -UploadPlaceholder
+
+    $json = '{ "ok": true }'
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-json' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-pack.json" `
+        -Text $json `
+        -Extension '.json'
+
+    $allExact = $true
+    foreach ($flag in $results) {
+        if (-not $flag) { $allExact = $false }
+    }
+
+    Add-ProbeEvidence -Case 'text-place-exact-summary' -Status 'OBSERVED' -Data @{
+        note     = 'trustworthy create is unique upload, move onto an absent path, then PUT /file'
+        allExact = $allExact
+        count    = $results.Count
+    }
+    Write-ProbeLog ("[OBSERVED] text-place-exact allExact={0}" -f $allExact)
+}
+
 function Invoke-ScenarioRunTextCreateAll {
     Invoke-ProbeStep 'text-create-discover' { Invoke-ScenarioTextCreateDiscover }
     Invoke-ProbeStep 'text-create-compose' { Invoke-ScenarioTextCreateCompose }
@@ -5331,6 +5527,7 @@ switch ($Scenario) {
     'text-create-route-survey'   { Invoke-ScenarioSurvey }
     'text-create-devtools-prepare' { Invoke-ScenarioTextCreateDevToolsPrepare }
     'text-create-devtools-apply' { Invoke-ScenarioTextCreateDevToolsApply -CapturePath $CapturePath }
+    'text-place-exact'           { Invoke-ScenarioTextPlaceExact }
     'run-text-create-all'        { Invoke-ScenarioRunTextCreateAll }
     default {
         throw "Scenario '$Scenario' is not implemented."

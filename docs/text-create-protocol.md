@@ -125,34 +125,69 @@ refusing `.git/`, `.rundot-sync/`, and `..` locally
 ([path-safety.md](path-safety.md)). A `404` on `/.git/…` must not be read as
 “safe”; the client rule stays load-bearing.
 
+## A trustworthy place for source text
+
+There is still no single create route. Source files can be placed exactly by
+using the upload flow only to **bring a path into existence**, then `PUT /file`
+to store the real bytes. `PUT` is overwrite-only (#14), so it cannot be the
+first call. Once the path exists, it preserves the bytes the upload step does
+not.
+
+`text-place-exact` did this for four probe-owned files, `Content-Type:
+text/plain`, each upload name unique for the run:
+
+1. `POST /upload-url` → presigned `PUT` → `POST /upload-adopt`
+2. `POST /move` from `/uploads/<unique>` to the chosen path (`/sync-probe/src/…` for the `.ts` case)
+3. `PUT /file` with `{ "content": "<exact text>" }`
+4. `GET /file` and compare size and SHA-256
+
+| Case | After upload | After move | After `PUT /file` |
+| --- | --- | --- | --- |
+| `.ts`, CRLF, quotes, nested `src/` | 41 bytes, `0ea58a48…`, `utf8` | same hash, move `200` | same hash, `PUT` `200`, exact |
+| `.ts` with a leading U+FEFF | **25 bytes, no BOM**, `b21c4879…` | same stripped hash | **28 bytes, BOM present**, `fcf75c2e…`, exact |
+| empty `.ts` | upload of 0 bytes is rejected, so a 1-byte placeholder was uploaded (`2d711642…`) | move `200`, still 1 byte | **0 bytes**, `e3b0c442…` (empty digest), exact |
+| `.json` | 14 bytes, `4300d4e4…`, `utf8` | same hash | same hash, exact |
+
+Upload itself is already exact for ordinary UTF-8 source without a BOM. It is
+not exact for a BOM, and it cannot create an empty file (`declaredSize: 0` is
+`400`). The `PUT` after the path exists repairs both. A nested destination was
+honored by `POST /move`.
+
+That sequence is still not safe to call blindly:
+
+- `POST /move` onto a path that already exists is `409` and changes nothing. A create must stop there, or switch to the existing overwrite rules, rather than assuming the move placed these bytes.
+- `If-Match` is ignored, so the client still re-reads immediately before the `PUT`.
+- `.git/`, `.rundot-sync/`, and `..` stay client refusals even though a move onto `/.rundot-sync/` returned `200`.
+- Nothing in the product calls upload, move, or a create `PUT`. [#40](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/40) owns wiring this, if it is adopted.
+
 ## Summary for publish design
 
 | Question | Answer from this evidence |
 | --- | --- |
 | Is there a single-request text create route? | **Not among guessed routes.** UI capture still outstanding. |
-| Can a chosen path get new text bytes at all? | **Yes**, via upload + `POST /move` (two steps). |
+| Can a chosen path get new text bytes at all? | **Yes.** Unique upload, `POST /move` onto an absent path, then `PUT /file`. |
+| Is upload alone byte-exact for source? | For ordinary UTF-8 without a BOM, yes. A BOM is stripped (28 sent, 25 stored). `PUT /file` restored 28 bytes, sha `fcf75c2e…`. |
+| CRLF preserved through compose? | **Yes** (6 = 6, matching hashes). A `.ts` with CRLF was also exact after upload (41 bytes, `0ea58a48…`). |
+| BOM preserved through compose? | **No** on upload or move. **Yes** after the follow-up `PUT /file`. |
+| Empty file through compose? | Upload rejects `declaredSize: 0`. A 1-byte placeholder, move, then `PUT` of `""` read back as size 0, sha `e3b0c442…`. |
 | Is compose idempotent on the same path? | **No.** Second move onto an existing destination → **`409`**, bytes unchanged. |
-| CRLF preserved through compose? | **Yes** (6 = 6, matching hashes). |
-| BOM preserved through compose? | **No** in this run (6 sent, 3 read, hashes differ). |
-| Empty file through compose? | **Not observed**; `declaredSize: 0` rejected at upload-url. |
 | Destination occupied before create? | **`409`**, occupied bytes preserved. |
 | `If-Match` / `If-None-Match` on move? | **Ignored** (all `200`, no `412`). |
 | Server guards `.rundot-sync/`? | **No** (`200` move). Client must still refuse. |
 
 ## Consequence for [#40](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/40)
 
-This issue does **not** implement `Push` text creates. If the UI capture later
-shows a single create route, #40 may adopt it. Until then, or if the UI uses the
-same composition, product text creates stay **`applicable: false`** with the
-existing PUT-only reason.
+This issue does **not** implement `Push` text creates. A trustworthy create,
+if #40 adopts it, is: unique upload, `POST /move` onto an absent path, then
+`PUT /file` so BOM and empty files match the local bytes. Product text creates
+stay **`applicable: false`** until that issue lands.
 
 ## How this was observed
 
-Scenario `run-text-create-all` in [tools/StudioProbe.ps1](../tools/StudioProbe.ps1)
+Scenario `run-text-create-all`, then `text-place-exact`, in [tools/StudioProbe.ps1](../tools/StudioProbe.ps1)
 against a disposable Studio project. Evidence records status codes, sizes, and
-SHA-256 only (see `%TEMP%\rundot-probe-evidence\probe-run-text-create-all.json`).
-No tokens, credentials, or file contents appear in this document. Cleanup
-deleted probe-owned paths at end of run.
+SHA-256 only. No tokens, credentials, or file contents appear in this document.
+A follow-up list showed no probe paths left behind.
 
 ## Related contracts
 
