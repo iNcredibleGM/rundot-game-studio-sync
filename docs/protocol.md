@@ -37,9 +37,10 @@ in the product calls this route.
 Status: investigated in [#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37)
 ([text-create-protocol.md](text-create-protocol.md)). **No single-request create
 route** was found among guessed API shapes; `PUT /file` remains overwrite-only
-(#14). New text at an arbitrary path was observed only as **upload adopt +
-`POST /move`** (composition of #15 and #16). The Studio UI create request was
-not captured in that run. Nothing in the product creates remote text files.
+(#14). Studio’s UI does not expose a new text-file create (and does not offer
+text upload; binary upload is separate). New source text at a chosen path was
+observed only through the **API**: unique **upload adopt**, **`POST /move`**, then
+**`PUT /file`** for exact bytes. Nothing in the product creates remote text files.
 
 ## Delete file
 

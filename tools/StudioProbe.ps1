@@ -4766,16 +4766,17 @@ function Invoke-ScenarioTextCreateDevToolsPrepare {
     }
 
     Write-ProbeLog ''
-    Write-ProbeLog 'NEXT (human step):'
+    Write-ProbeLog 'NEXT (human step, only if Studio exposes a new-file action):'
     Write-ProbeLog "  1. In Studio, create a new text file at: $suggestedPath"
-    Write-ProbeLog '     (File tree: new file, or the UI equivalent.)'
-    Write-ProbeLog '     Keep the probe-<stamp> prefix in the name.'
+    Write-ProbeLog '     If the product has no such control, skip to apply with no'
+    Write-ProbeLog '     capture file and record uiCreateUnavailable in evidence.'
+    Write-ProbeLog '     Keep the probe-<stamp> prefix when the UI allows naming.'
     Write-ProbeLog '  2. DevTools > Network open while you create it.'
     Write-ProbeLog '     Copy as fetch, or Save all as HAR.'
     Write-ProbeLog '  3. Save to e.g. %TEMP%\rundot-text-create-capture.txt'
     Write-ProbeLog '  4. Run -Scenario text-create-devtools-apply -CapturePath <that file>'
     Write-ProbeLog ''
-    Write-ProbeLog "  A baseline file already exists at $($target.Path) for reference; the UI step is a separate create."
+    Write-ProbeLog "  Baseline (API upload only) is at $($target.Path). UI text upload is not required."
     Write-ProbeLog ''
 }
 
@@ -4839,7 +4840,10 @@ function Invoke-ScenarioTextCreateDevToolsApply {
     $suggestedPath = if ($null -ne $state) { [string]$state.suggestedPath } else { $null }
 
     $captureText = $null
-    if (-not [string]::IsNullOrWhiteSpace($CapturePath) -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
+    $capturePathGiven = -not [string]::IsNullOrWhiteSpace($CapturePath)
+    $captureFileExists = $false
+    if ($capturePathGiven -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
+        $captureFileExists = $true
         $captureText = (Get-Content -LiteralPath $CapturePath -Raw)
     }
 
@@ -4878,12 +4882,20 @@ function Invoke-ScenarioTextCreateDevToolsApply {
         }
     }
 
+    $uiCreateListed = $false
+    if (-not [string]::IsNullOrWhiteSpace($suggestedPath)) {
+        $uiCreateListed = ($null -ne (Get-ProbeRowOrNull -Path $suggestedPath))
+    }
+
     Add-ProbeEvidence -Case 'text-create-devtools-apply' -Status 'OBSERVED' -Data @{
         note               = 'UI create route shape; request was not replayed'
         prepareStamp       = $prepareStamp
         suggestedPath      = $suggestedPath
         createdPathListed  = $createdPath
+        uiCreateListed     = $uiCreateListed
         ownedPathsNow      = $ownedNow
+        capturePathGiven   = $capturePathGiven
+        captureFileExists  = $captureFileExists
         captureProvided    = (-not [string]::IsNullOrWhiteSpace($captureText))
         captureHadResponse = $captureHadResponse
         captureRoutes      = $captureRoutes
@@ -4920,7 +4932,20 @@ function Invoke-ScenarioTextCreateDevToolsApply {
     }
 
     if ($null -eq $captureText) {
-        Write-ProbeLog '[WARNING] text-create-devtools-apply: no -CapturePath; route shape was not recorded.'
+        if (-not $capturePathGiven) {
+            Write-ProbeLog '[WARNING] text-create-devtools-apply: -CapturePath was not passed; route shape was not recorded.'
+        }
+        elseif (-not $captureFileExists) {
+            Write-ProbeLog ("[WARNING] text-create-devtools-apply: capture file not found at '$CapturePath'.")
+        }
+        else {
+            Write-ProbeLog '[WARNING] text-create-devtools-apply: capture file was empty; route shape was not recorded.'
+        }
+    }
+
+    if (-not $uiCreateListed) {
+        Write-ProbeLog '[NOTE] text-create-devtools-apply: the suggested UI create path is not listed.'
+        Write-ProbeLog '       If Studio has no new-file action, that is expected; API create remains upload+move+PUT.'
     }
 }
 
@@ -5386,9 +5411,8 @@ function Invoke-ScenarioRunTextCreateAll {
     }
 
     Write-ProbeLog ''
-    Write-ProbeLog 'MANUAL STEP for UI text create (not run by this runner):'
-    Write-ProbeLog '  -Scenario text-create-devtools-prepare  (prints create instructions)'
-    Write-ProbeLog '  ...create the file in Studio, then -Scenario text-create-devtools-apply -CapturePath <file>.'
+    Write-ProbeLog 'Optional: text-create-devtools-prepare / -apply if Studio exposes a new-file UI.'
+    Write-ProbeLog '  If not, run apply without -CapturePath after prepare to record uiCreateListed=false.'
     Write-ProbeLog ''
 }
 

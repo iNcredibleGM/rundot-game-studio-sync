@@ -38,11 +38,26 @@ The probe tried a small set of one-shot creates against absent paths under
 | `POST /api/projects/{id}/file?path=` (reconfirm #14) | `405` | no |
 
 **Conclusion:** there is no observed HTTP create route matching these shapes.
-The Studio UI may still use a different URL; that requires a DevTools capture
-(`text-create-devtools-prepare` / `text-create-devtools-apply` in
-[tools/StudioProbe.ps1](../tools/StudioProbe.ps1)). This investigation run
-executed the automated scenarios only; **no UI capture was recorded**, so the
-UI request shape is still unknown.
+
+## Studio product UI (no text create to capture)
+
+A DevTools hand-off (`text-create-devtools-prepare` / `text-create-devtools-apply`
+in [tools/StudioProbe.ps1](../tools/StudioProbe.ps1)) was run to see whether the
+browser uses a different URL than the guessed API routes.
+
+| Observation | Result |
+| --- | --- |
+| “New text file” (or equivalent) in the file tree | **Not available** in Studio as exercised; the suggested `/sync-probe/…-created.txt` path never appeared in `GET /files` after the human step |
+| Upload **text** through the Studio UI | **Not available** (same limitation called out for sync: text create is not a UI upload) |
+| Upload **binary** through the Studio UI | Available; that flow is characterized in [binary-upload-protocol.md](binary-upload-protocol.md) and lands under `/uploads/{basename}` only |
+| API upload of UTF-8 with `Content-Type: text/plain` (probe prepare step) | **Works**; file appears under `/uploads/` and reads back as `encoding: utf8` |
+
+Apply recorded `captureProvided: false` when no capture file exists (expected if
+there was no UI network request to save). **`createdPathListed` was null**; only
+the prepare baseline under `/uploads/` was listed. There is **no separate UI
+create request** to document. Publish paths for new **source text** remain the
+API sequence in [A trustworthy place for source text](#a-trustworthy-place-for-source-text)
+below, not something inferred from Studio chrome.
 
 ## Composition: upload then move (not a single create)
 
@@ -164,7 +179,7 @@ That sequence is still not safe to call blindly:
 
 | Question | Answer from this evidence |
 | --- | --- |
-| Is there a single-request text create route? | **Not among guessed routes.** UI capture still outstanding. |
+| Is there a single-request text create route? | **Not among guessed routes.** Studio UI exposes no text-file create to capture. |
 | Can a chosen path get new text bytes at all? | **Yes.** Unique upload, `POST /move` onto an absent path, then `PUT /file`. |
 | Is upload alone byte-exact for source? | For ordinary UTF-8 without a BOM, yes. A BOM is stripped (28 sent, 25 stored). `PUT /file` restored 28 bytes, sha `fcf75c2e…`. |
 | CRLF preserved through compose? | **Yes** (6 = 6, matching hashes). A `.ts` with CRLF was also exact after upload (41 bytes, `0ea58a48…`). |
@@ -184,10 +199,11 @@ stay **`applicable: false`** until that issue lands.
 
 ## How this was observed
 
-Scenario `run-text-create-all`, then `text-place-exact`, in [tools/StudioProbe.ps1](../tools/StudioProbe.ps1)
-against a disposable Studio project. Evidence records status codes, sizes, and
-SHA-256 only. No tokens, credentials, or file contents appear in this document.
-A follow-up list showed no probe paths left behind.
+Scenarios `run-text-create-all`, `text-place-exact`, and
+`text-create-devtools-prepare` / `text-create-devtools-apply` in
+[tools/StudioProbe.ps1](../tools/StudioProbe.ps1) against disposable Studio
+projects. Evidence records status codes, sizes, and SHA-256 only. No tokens,
+credentials, or file contents appear in this document.
 
 ## Related contracts
 
