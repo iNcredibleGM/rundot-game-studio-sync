@@ -404,24 +404,6 @@ function Get-LocalUtf8TextForPush {
     return $utf8.GetString($bytes)
 }
 
-function Get-RemoteFileContentSha256 {
-    param(
-        [Parameter(Mandatory)]
-        $Response
-    )
-
-    $bytes = ConvertFrom-RemoteFileContent -Response $Response
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($bytes)
-    }
-    finally {
-        $sha.Dispose()
-    }
-
-    return [System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
-}
-
 function Assert-SyncPushLocalUnchanged {
     param(
         [Parameter(Mandatory)]

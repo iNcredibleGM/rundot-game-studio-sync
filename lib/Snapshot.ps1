@@ -298,6 +298,32 @@ function ConvertFrom-RemoteFileContent {
 }
 
 
+function Get-RemoteFileContentSha256 {
+    # The one hash of a decoded remote payload. Every route that verifies
+    # remote bytes goes through here, so the decode guard and the hex
+    # conversion cannot drift between the overwrite and delete paths.
+    #
+    # ConvertFrom-RemoteFileContent always returns byte[] (including empty and
+    # single-byte payloads), which matters because SHA256.ComputeHash raises an
+    # ambiguous-overload error on a bare Byte and returns $null for $null.
+    param(
+        [Parameter(Mandatory)]
+        $Response
+    )
+
+    $bytes = ConvertFrom-RemoteFileContent -Response $Response
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    return Convert-HashBytesToHex -Hash $hash
+}
+
+
 $script:RemoteSnapshotMaxAttempts = 3
 $script:RemoteSnapshotIdleMessage = @(
     'The remote project changed while being read. No plan was generated.',

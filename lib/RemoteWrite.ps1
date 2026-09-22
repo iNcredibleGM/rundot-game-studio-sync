@@ -160,21 +160,14 @@ function Invoke-RemoteTextPut {
 
 
 function Get-RemoteTextPutResponseSha256 {
+    # The shared decoder+hash in Snapshot.ps1 owns the byte[] guard; this is
+    # only the PUT response's name for it.
     param(
         [Parameter(Mandatory)]
         $Response
     )
 
-    $bytes = ConvertFrom-RemoteFileContent -Response $Response
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($bytes)
-    }
-    finally {
-        $sha.Dispose()
-    }
-
-    return [System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    return Get-RemoteFileContentSha256 -Response $Response
 }
 
 
