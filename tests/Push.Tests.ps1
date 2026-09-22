@@ -20,6 +20,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\RemoteWrite.ps1")
+. (Join-Path $repoRoot "lib\RemoteDelete.ps1")
 . (Join-Path $repoRoot "lib\Push.ps1")
 
 $pushTestShaA = 'a' * 64
@@ -323,6 +324,137 @@ function Get-PushTestBaseEntrySha {
     }
 
     return [string]$Base.files.($Path).sha256
+}
+
+function New-PushTestDeleteScenario {
+    # A BASE=A LOCAL=- REMOTE=A row: the remote file still matches the last
+    # verified shared state, and LOCAL has no copy. This is the only shape a
+    # delete may be applied to.
+    param(
+        [string]$Root,
+        [string]$Path = 'src/gone.ts',
+        [string]$Workspace = $null
+    )
+
+    if ([string]::IsNullOrEmpty($Workspace)) {
+        $Workspace = New-PushTestWorkspace -Root $Root
+    }
+
+    $remoteBytes = $pushTestUtf8.GetBytes("remote delete baseline $Path`n")
+    $staging = Join-Path $Root ("remote-del-" + [Guid]::NewGuid().ToString('N') + '.txt')
+    Write-PushTestBytes -LiteralPath $staging -Bytes $remoteBytes
+    $remoteSha = (Get-LocalFileIdentity -LiteralPath $staging).Sha256
+    $remoteText = $pushTestUtf8.GetString($remoteBytes)
+
+    $baseMap = @{ $Path = (New-PushTestBaseEntry -Sha256 $remoteSha) }
+    $localMap = @{}
+    $remoteMap = @{ $Path = (New-PushTestRemoteEntry -Sha256 $remoteSha) }
+
+    Save-BaseManifest `
+        -WorkspaceRoot $Workspace `
+        -ProjectId $pushTestProjectId `
+        -Files $baseMap
+
+    $resolution = New-PushTestResolution -Files $baseMap
+    $localHash = Get-SyncLocalManifestFingerprint -Local $localMap
+    $snapshot = New-PushTestSnapshot
+
+    $operation = New-PushTestPlanOperation `
+        -Path $Path `
+        -Status 'deleteRemoteCandidate' `
+        -Applicable $true `
+        -LocalSha256 $null `
+        -RemoteSha256 $remoteSha `
+        -ExpectedRemoteHash $remoteSha
+
+    $artifact = New-PushTestArtifact `
+        -WorkspaceRoot $Workspace `
+        -Operations @($operation) `
+        -LocalManifestHash $localHash
+
+    # The remote file is still present until the DELETE is sent, so the list
+    # call reports it. The callbacks read a shared state object rather than a
+    # bare local: a scriptblock invoked from another scope would not resolve
+    # the function's locals.
+    $script:PushTestDeleteState = [pscustomobject]@{
+        Deleted    = $false
+        RemoteText = $remoteText
+        Path       = $Path
+        Size       = $remoteBytes.Length
+    }
+
+    $getRemote = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        return [pscustomobject]@{
+            encoding = 'utf8'
+            content  = [string]$script:PushTestDeleteState.RemoteText
+        }
+    }
+
+    $deleteRemote = {
+        param($Origin, $Id, $Canonical, $Hdr)
+        $script:PushTestDeleteCalls++
+        $script:PushTestDeleteState.Deleted = $true
+        return [pscustomobject]@{ success = $true; data = [pscustomobject]@{ deleted = ('/' + $Canonical) } }
+    }
+
+    $listRemote = {
+        param($Origin, $Id, $Hdr)
+        if ($script:PushTestDeleteState.Deleted) {
+            return [pscustomobject]@{ files = @() }
+        }
+
+        return [pscustomobject]@{
+            files = @(
+                [pscustomobject]@{
+                    path = ('/' + [string]$script:PushTestDeleteState.Path)
+                    type = 'file'
+                    size = $script:PushTestDeleteState.Size
+                }
+            )
+        }
+    }
+
+    # A reserved-path variant: the plan row exists and is applicable, but the
+    # engine must refuse it against the route rules. '.rundot' is reserved but
+    # is not in the default ignore set, so the classifier still calls it a
+    # delete candidate rather than an ignored path.
+    $reservedPath = '.rundot/config'
+    $reservedBaseMap = @{ $reservedPath = (New-PushTestBaseEntry -Sha256 $remoteSha) }
+    $reservedRemoteMap = @{ $reservedPath = (New-PushTestRemoteEntry -Sha256 $remoteSha) }
+    $reservedArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $Workspace `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path $reservedPath `
+                -Status 'deleteRemoteCandidate' `
+                -Applicable $true `
+                -LocalSha256 $null `
+                -RemoteSha256 $remoteSha `
+                -ExpectedRemoteHash $remoteSha)
+        ) `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local @{})
+
+    return [pscustomobject]@{
+        Workspace           = $Workspace
+        Path                = $Path
+        RemoteSha           = $remoteSha
+        RemoteText          = $remoteText
+        BaseMap             = $baseMap
+        LocalMap            = $localMap
+        RemoteMap           = $remoteMap
+        ReappearedLocalMap  = @{ $Path = (New-PushTestLocalEntry -Sha256 $pushTestShaB) }
+        Resolution          = $resolution
+        Snapshot            = $snapshot
+        Artifact            = $artifact
+        GetRemoteFile       = $getRemote
+        DeleteRemoteFile    = $deleteRemote
+        GetRemoteFileList   = $listRemote
+        ReservedBaseMap     = $reservedBaseMap
+        ReservedLocalMap    = @{}
+        ReservedRemoteMap   = $reservedRemoteMap
+        ReservedArtifact    = $reservedArtifact
+    }
 }
 
 
@@ -992,6 +1124,336 @@ try {
         0 `
         @(Read-RundotSyncJournal -WorkspaceRoot $gateWorkspace).Count `
         'a no-op push must not write a journal record'
+
+
+    # --------------------------------------------------------------------------
+    # Remote delete: selection, confirmation, backup, apply, BASE drop
+    # --------------------------------------------------------------------------
+
+    $deleteScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+
+    # The plan row is applicable, the live tree still matches, and selection
+    # yields exactly one delete action and no overwrite action.
+    $deleteSelection = Get-SyncPushSelection `
+        -Artifact $deleteScenario.Artifact `
+        -Base $deleteScenario.BaseMap `
+        -Local $deleteScenario.LocalMap `
+        -Remote $deleteScenario.RemoteMap
+
+    $selectedDeleteActions = @($deleteSelection.DeleteActions)
+    $selectedOverwriteActions = @($deleteSelection.Actions)
+    Assert-Equal 0 $selectedOverwriteActions.Count 'a delete-only plan must select no overwrite'
+    Assert-Equal 1 $selectedDeleteActions.Count 'a delete-only plan must select one delete action'
+    Assert-Equal `
+        $deleteScenario.Path `
+        ([string]$selectedDeleteActions[0].Path) `
+        'the selected delete path must be the planned one'
+
+    # A reserved path is refused live even when a stale artifact said it was
+    # applicable. The refusal must be the route rule, not a hash mismatch.
+    Assert-PushTestThrowsLike {
+        Get-SyncPushSelection `
+            -Artifact $deleteScenario.ReservedArtifact `
+            -Base $deleteScenario.ReservedBaseMap `
+            -Local $deleteScenario.ReservedLocalMap `
+            -Remote $deleteScenario.ReservedRemoteMap | Out-Null
+    } 'Reserved path' 'a reserved path must refuse the whole run at selection'
+
+    # A path that reappeared locally is no longer a remote delete.
+    Assert-PushTestThrowsLike {
+        Get-SyncPushSelection `
+            -Artifact $deleteScenario.Artifact `
+            -Base $deleteScenario.BaseMap `
+            -Local $deleteScenario.ReappearedLocalMap `
+            -Remote $deleteScenario.RemoteMap | Out-Null
+    } 'no longer a remote delete candidate' 'a locally reappeared path must refuse the delete'
+
+    # A declined delete confirmation changes nothing: no DELETE, no backup set,
+    # no journal record, and BASE is untouched.
+    $script:PushTestDeleteCalls = 0
+    $deleteDeclineResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $deleteScenario.Workspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution $deleteScenario.Resolution `
+        -Artifact $deleteScenario.Artifact `
+        -Local $deleteScenario.LocalMap `
+        -Remote $deleteScenario.RemoteMap `
+        -Snapshot $deleteScenario.Snapshot `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -ConfirmDelete {
+            param($Count, $Paths)
+            return $false
+        } `
+        -GetRemoteFile $deleteScenario.GetRemoteFile `
+        -DeleteRemoteFile $deleteScenario.DeleteRemoteFile `
+        -GetRemoteFileList $deleteScenario.GetRemoteFileList
+
+    Assert-Equal $true $deleteDeclineResult.Cancelled 'a declined delete must report as cancelled'
+    Assert-Equal 0 $deleteDeclineResult.Deleted 'a declined delete must delete nothing'
+    Assert-Equal 0 $script:PushTestDeleteCalls 'a declined delete must not send DELETE'
+    Assert-Equal `
+        0 `
+        @(Get-RundotSyncBackupSets -WorkspaceRoot $deleteScenario.Workspace).Count `
+        'a declined delete must not create a backup set'
+    Assert-Equal `
+        0 `
+        @(Read-RundotSyncJournal -WorkspaceRoot $deleteScenario.Workspace).Count `
+        'a declined delete must not write a journal record'
+
+    $deleteBaseBefore = Read-BaseManifest -WorkspaceRoot $deleteScenario.Workspace
+    Assert-Equal `
+        $deleteScenario.RemoteSha `
+        (Get-PushTestBaseEntrySha -Base $deleteBaseBefore -Path $deleteScenario.Path) `
+        'a declined delete must leave BASE unchanged'
+
+    # No confirmation callback at all must fail closed rather than delete.
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPush `
+            -WorkspaceRoot $deleteScenario.Workspace `
+            -ProjectId $pushTestProjectId `
+            -Resolution $deleteScenario.Resolution `
+            -Artifact $deleteScenario.Artifact `
+            -Local $deleteScenario.LocalMap `
+            -Remote $deleteScenario.RemoteMap `
+            -Snapshot $deleteScenario.Snapshot `
+            -StudioOrigin $pushTestOrigin `
+            -Headers $headers `
+            -GetRemoteFile $deleteScenario.GetRemoteFile `
+            -DeleteRemoteFile $deleteScenario.DeleteRemoteFile `
+            -GetRemoteFileList $deleteScenario.GetRemoteFileList | Out-Null
+    } 'Confirm the delete' 'a delete must fail closed without a confirmation callback'
+
+    # A confirmed delete: backup holds the previous bytes, the DELETE is sent,
+    # the path leaves BASE, and the journal records it without secrets.
+    $script:PushTestDeleteCalls = 0
+    $deleteResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $deleteScenario.Workspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution $deleteScenario.Resolution `
+        -Artifact $deleteScenario.Artifact `
+        -Local $deleteScenario.LocalMap `
+        -Remote $deleteScenario.RemoteMap `
+        -Snapshot $deleteScenario.Snapshot `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -Force `
+        -GetRemoteFile $deleteScenario.GetRemoteFile `
+        -DeleteRemoteFile $deleteScenario.DeleteRemoteFile `
+        -GetRemoteFileList $deleteScenario.GetRemoteFileList
+
+    Assert-Equal 1 $deleteResult.Deleted 'a confirmed delete must delete one path'
+    Assert-Equal 0 $deleteResult.Applied 'a delete-only push must not report an overwrite'
+    Assert-Equal 1 $script:PushTestDeleteCalls 'a confirmed delete must send DELETE once'
+    Assert-Equal $true $deleteResult.BaseUpdated 'BASE must move after a verified delete'
+
+    $deleteBackupPath = Join-Path $deleteResult.BackupSet.Path ($deleteScenario.Path.Replace('/', '\'))
+    Assert-True `
+        (Test-Path -LiteralPath $deleteBackupPath -PathType Leaf) `
+        'the remote original must be backed up before DELETE'
+    Assert-Equal `
+        ($pushTestUtf8.GetBytes($deleteScenario.RemoteText)) `
+        (Get-PushTestBytes -LiteralPath $deleteBackupPath) `
+        'the backup must hold the deleted remote bytes'
+
+    $deleteBaseAfter = Read-BaseManifest -WorkspaceRoot $deleteScenario.Workspace
+    Assert-True `
+        ($null -eq $deleteBaseAfter.files.PSObject.Properties[$deleteScenario.Path]) `
+        'a verified delete must drop the path from BASE rather than tombstone it'
+
+    $deleteJournal = @(Read-RundotSyncJournal -WorkspaceRoot $deleteScenario.Workspace)
+    $deleteRunRecord = @($deleteJournal | Where-Object { [string]$_.event -eq 'push' })[0]
+    Assert-Equal 'success' ([string]$deleteRunRecord.status) 'a successful delete must journal success'
+    Assert-Equal 1 $deleteRunRecord.deleted 'the run record must report the deleted count'
+    Assert-Equal $true $deleteRunRecord.baseUpdated 'a successful delete must journal baseUpdated true'
+    Assert-True `
+        (@($deleteJournal | Where-Object { [string]$_.event -eq 'push-delete' }).Count -eq 1) `
+        'a delete must write one push-delete record'
+
+    $deleteRecord = @($deleteJournal | Where-Object { [string]$_.event -eq 'push-delete' })[0]
+    Assert-Equal `
+        $deleteScenario.Path `
+        ([string]$deleteRecord.path) `
+        'a push-delete record must name the deleted path'
+
+    $deleteJournalRaw = [System.IO.File]::ReadAllText(
+        (Get-RundotSyncJournalPath -WorkspaceRoot $deleteScenario.Workspace)
+    )
+    Assert-True `
+        ($deleteJournalRaw -notmatch '(?i)bearer|authoriz|accesstoken|refreshtoken|"content"') `
+        'the delete journal must never record tokens or contents'
+    Assert-True `
+        (([string]$deleteResult.Report) -match 'DELETED') `
+        'the report must print a DELETED section'
+    Assert-True `
+        (([string]$deleteResult.Report) -notmatch '(?i)bearer|authoriz|accesstoken|refreshtoken|"content"') `
+        'the report must not contain tokens or file contents'
+
+    # A remote hash mismatch refuses that path before any DELETE.
+    $mismatchScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    $script:PushTestMismatchDeleteCalls = 0
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $mismatchScenario.Workspace `
+            -Actions @() `
+            -DeleteActions @(
+                [pscustomobject]@{
+                    Path               = $mismatchScenario.Path
+                    ExpectedRemoteHash = $mismatchScenario.RemoteSha
+                    RemoteSha256       = $mismatchScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -GetRemoteFile {
+                param($Origin, $Id, $ApiPath, $Hdr)
+                return [pscustomobject]@{ encoding = 'utf8'; content = 'stale remote bytes' }
+            } `
+            -DeleteRemoteFile {
+                param($Origin, $Id, $Canonical, $Hdr)
+                $script:PushTestMismatchDeleteCalls++
+                return [pscustomobject]@{ success = $true }
+            } `
+            -GetRemoteFileList $mismatchScenario.GetRemoteFileList | Out-Null
+    } 'no longer matches expectedRemoteHash' 'a remote hash mismatch must refuse before DELETE'
+    Assert-Equal 0 $script:PushTestMismatchDeleteCalls 'a hash mismatch must not send DELETE'
+
+    # A backup failure aborts before any DELETE.
+    $deleteBackupFailScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    $script:PushTestDeleteBackupFailCalls = 0
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $deleteBackupFailScenario.Workspace `
+            -Actions @() `
+            -DeleteActions @(
+                [pscustomobject]@{
+                    Path               = $deleteBackupFailScenario.Path
+                    ExpectedRemoteHash = $deleteBackupFailScenario.RemoteSha
+                    RemoteSha256       = $deleteBackupFailScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -GetRemoteFile $deleteBackupFailScenario.GetRemoteFile `
+            -DeleteRemoteFile {
+                param($Origin, $Id, $Canonical, $Hdr)
+                $script:PushTestDeleteBackupFailCalls++
+                return [pscustomobject]@{ success = $true }
+            } `
+            -GetRemoteFileList $deleteBackupFailScenario.GetRemoteFileList `
+            -CopyBackupFile {
+                throw [System.InvalidOperationException]::new('Injected delete backup failure.')
+            } | Out-Null
+    } 'Injected delete backup failure' 'a delete backup failure must abort before any DELETE'
+    Assert-Equal 0 $script:PushTestDeleteBackupFailCalls 'a delete backup failure must not send DELETE'
+
+    # A 404 on the DELETE is success when the postcondition holds: the path is
+    # already absent, so this is not a new failure.
+    $alreadyGoneScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    $script:PushTestAlreadyGoneDeleteCalls = 0
+    $alreadyGoneResult = Invoke-RundotSyncPushApply `
+        -WorkspaceRoot $alreadyGoneScenario.Workspace `
+        -Actions @() `
+        -DeleteActions @(
+            [pscustomobject]@{
+                Path               = $alreadyGoneScenario.Path
+                ExpectedRemoteHash = $alreadyGoneScenario.RemoteSha
+                RemoteSha256       = $alreadyGoneScenario.RemoteSha
+            }
+        ) `
+        -StudioOrigin $pushTestOrigin `
+        -ProjectId $pushTestProjectId `
+        -Headers $headers `
+        -GetRemoteFile $alreadyGoneScenario.GetRemoteFile `
+        -DeleteRemoteFile {
+            param($Origin, $Id, $Canonical, $Hdr)
+            $script:PushTestAlreadyGoneDeleteCalls++
+            throw (New-RemoteHttpException -StatusCode 404 -Message 'not found')
+        } `
+        -GetRemoteFileList {
+            param($Origin, $Id, $Hdr)
+            return [pscustomobject]@{ files = @() }
+        }
+
+    Assert-Equal 1 $script:PushTestAlreadyGoneDeleteCalls 'the second DELETE must be attempted'
+    Assert-Equal 1 $alreadyGoneResult.Deleted 'a 404 with the postcondition holding must count as deleted'
+    Assert-Equal $true $alreadyGoneResult.DeletedActions[0].AlreadyAbsent 'an already-absent delete must be flagged'
+
+    # A 404 whose postcondition does NOT hold is a real failure: the path is
+    # still listed, so something is wrong and the run must not report success.
+    $notGoneScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $notGoneScenario.Workspace `
+            -Actions @() `
+            -DeleteActions @(
+                [pscustomobject]@{
+                    Path               = $notGoneScenario.Path
+                    ExpectedRemoteHash = $notGoneScenario.RemoteSha
+                    RemoteSha256       = $notGoneScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -GetRemoteFile $notGoneScenario.GetRemoteFile `
+            -DeleteRemoteFile {
+                param($Origin, $Id, $Canonical, $Hdr)
+                throw (New-RemoteHttpException -StatusCode 404 -Message 'not found')
+            } `
+            -GetRemoteFileList $notGoneScenario.GetRemoteFileList | Out-Null
+    } 'still lists it' 'a 404 with the path still listed must fail rather than report success'
+
+    # A 200 whose postcondition does not hold is also a failure: a status is
+    # not the proof the file is gone.
+    $stillListedScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $stillListedScenario.Workspace `
+            -Actions @() `
+            -DeleteActions @(
+                [pscustomobject]@{
+                    Path               = $stillListedScenario.Path
+                    ExpectedRemoteHash = $stillListedScenario.RemoteSha
+                    RemoteSha256       = $stillListedScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -GetRemoteFile $stillListedScenario.GetRemoteFile `
+            -DeleteRemoteFile {
+                param($Origin, $Id, $Canonical, $Hdr)
+                return [pscustomobject]@{ success = $true }
+            } `
+            -GetRemoteFileList $stillListedScenario.GetRemoteFileList | Out-Null
+    } 'still lists it' 'a 200 with the path still listed must fail the absence check'
+
+    # A reserved path must never reach DELETE even when injected directly into
+    # the apply layer, which is the last line of defense before the request.
+    $reservedApplyScenario = New-PushTestDeleteScenario -Root $pushTestRoot
+    $script:PushTestReservedApplyCalls = 0
+    Assert-PushTestThrowsLike {
+        Invoke-RundotSyncDeleteAction `
+            -WorkspaceRoot $reservedApplyScenario.Workspace `
+            -Action ([pscustomobject]@{
+                Path               = '.rundot/config'
+                ExpectedRemoteHash = $reservedApplyScenario.RemoteSha
+            }) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -GetRemoteFile $reservedApplyScenario.GetRemoteFile `
+            -DeleteRemoteFile {
+                param($Origin, $Id, $Canonical, $Hdr)
+                $script:PushTestReservedApplyCalls++
+                return [pscustomobject]@{ success = $true }
+            } `
+            -GetRemoteFileList $reservedApplyScenario.GetRemoteFileList | Out-Null
+    } 'Reserved path' 'the apply layer must refuse a reserved path'
+    Assert-Equal 0 $script:PushTestReservedApplyCalls 'a reserved path must never send DELETE'
 }
 finally {
     if (Test-Path -LiteralPath $pushTestRoot) {

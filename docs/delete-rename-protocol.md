@@ -5,11 +5,13 @@ concurrency and revision-identity controls around them. These are undocumented
 implementation details captured from a disposable project and may change
 without notice.
 
-This document is **evidence only**. Nothing in the product calls a delete:
-`game-studio-sync.ps1` remains GET-only, and `Push`/`Apply` do not exist. The
-purpose of the record is to constrain the design of
-[#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17), not to
-permit a mutation. `deleteRemoteCandidate` stays classification-only.
+This document is the **evidence** behind the delete route. The product now
+implements one of these verbs: `DELETE /api/projects/{id}/file` is applied by a
+confirmed `Push` for a route-allowed `deleteRemoteCandidate` row
+([delete.md](delete.md)), in `lib/RemoteDelete.ps1`. Rename (`POST /move`)
+remains evidence only and is not emitted by any command. The four constraints
+below still govern the implementation, and the client-side guard they require
+is what `Push` performs.
 
 Read paths are in [protocol.md](protocol.md). The text write route is
 [text-write-protocol.md](text-write-protocol.md) and the binary upload flow is
@@ -421,9 +423,12 @@ The four constraints that matter:
 For [#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17)
 this means a `deleteRemoteCandidate` row could in principle be applied with a
 client-side re-fingerprint immediately before the `DELETE`, plus a backup of
-the bytes being removed — but only once the milestone permits remote mutation.
-Nothing in this evidence authorizes emitting a standing `DELETE` today, and
-`deleteRemoteCandidate` remains classification-only.
+the bytes being removed. [#39](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/39)
+implemented exactly that: a confirmed `Push` re-reads the remote bytes and
+compares them to the plan's `expectedRemoteHash` immediately before the
+request, backs those bytes up first, and proves the path is gone from
+`GET /files` afterwards ([delete.md](delete.md)). Rename detection and
+`POST /move` remain out of scope.
 
 ## How this was observed
 
@@ -466,7 +471,8 @@ redacts credential-shaped text before writing evidence.
 - The binary upload flow, which cannot choose a path or replace a file:
   [binary-upload-protocol.md](binary-upload-protocol.md).
 - The composed landing this route enables: [binary-place-protocol.md](binary-place-protocol.md).
-- The deletion statuses that stay classification-only: [classifier.md](classifier.md).
+- The deletion statuses and how a delete is applied:
+  [classifier.md](classifier.md), [delete.md](delete.md).
 - Plan fingerprints a future `Apply` must re-verify: [plan.md](plan.md).
 - Local path safety and reserved paths: [path-safety.md](path-safety.md).
 - Why the `GET /files` list is not atomic: [remote-snapshot.md](remote-snapshot.md).

@@ -60,11 +60,12 @@ $ErrorActionPreference = "Stop"
 # Pull never deletes anything, locally or remotely.
 #
 # Push is the only command that writes REMOTE. It consumes the last Plan
-# artifact, re-verifies every fingerprint, and publishes only clean utf8 text
-# overwrites via documented PUT /file. Push asks for confirmation before
-# overwriting; -ForcePush or -ConfirmPush skips the prompt but never a backup,
-# and never bypasses conflict refusal or the concurrent-edit guard. Push never
-# creates files, never uploads binaries, and never deletes anything.
+# artifact, re-verifies every fingerprint, and publishes clean utf8 text
+# overwrites via documented PUT /file plus confirmed deleteRemoteCandidate rows
+# via documented DELETE /file. Push asks for confirmation before overwriting
+# and before deleting; -ForcePush or -ConfirmPush skips both prompts but never
+# a backup, and never bypasses conflict refusal or the concurrent-edit guard.
+# Push never creates files and never uploads binaries.
 # ============================================================================
 
 
@@ -96,6 +97,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteDelete.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
@@ -500,9 +502,10 @@ function Invoke-SyncPullCommand {
 # Push
 #
 # Push is the only command that writes REMOTE. It consumes last-plan.json,
-# re-verifies every fingerprint against the live tree, and publishes only clean
-# utf8 text overwrites. -ForcePush or -ConfirmPush skips the prompt; a console
-# run otherwise requires typing yes before any PUT runs.
+# re-verifies every fingerprint against the live tree, and publishes clean utf8
+# text overwrites plus confirmed deleteRemoteCandidate rows. -ForcePush or
+# -ConfirmPush skips the prompts; a console run otherwise requires typing yes
+# before any PUT or DELETE runs.
 # ============================================================================
 
 function Read-RundotSyncPushConfirmation {
@@ -528,6 +531,43 @@ function Read-RundotSyncPushConfirmation {
     $answer = $null
     try {
         $answer = Read-Host "Overwrite $OverwriteCount remote file(s)?"
+    }
+    catch {
+        # No console to prompt on. Fail closed.
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Read-RundotSyncPushDeleteConfirmation {
+    # A delete is not recoverable from Studio, so it gets its own deliberate
+    # confirmation even when overwrites were already confirmed. The user must
+    # type the whole word; anything else declines.
+    param(
+        [int]$DeleteCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will DELETE $DeleteCount remote file(s) from Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each one is copied into .rundot-sync/backups before it is removed."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "DELETE $DeleteCount remote file(s)?"
     }
     catch {
         # No console to prompt on. Fail closed.
@@ -607,6 +647,13 @@ function Invoke-SyncPushCommand {
         return (Read-RundotSyncPushConfirmation -OverwriteCount $OverwriteCount -Paths $Paths)
     }
 
+    # A delete gets its own confirmation so declining it changes nothing even
+    # when the overwrite half was accepted.
+    $ConfirmDelete = {
+        param($DeleteCount, $Paths)
+        return (Read-RundotSyncPushDeleteConfirmation -DeleteCount $DeleteCount -Paths $Paths)
+    }
+
     try {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
@@ -634,6 +681,7 @@ function Invoke-SyncPushCommand {
             -StudioOrigin $Origin `
             -Headers $Headers `
             -ConfirmOverwrite $ConfirmOverwrite `
+            -ConfirmDelete $ConfirmDelete `
             -Force:$Force
 
         Write-Host ""

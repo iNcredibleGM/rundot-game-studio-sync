@@ -1,12 +1,13 @@
 # Safe Push
 
-`Push` is the only command in this milestone that writes to REMOTE. It consumes
-the last `Plan` artifact, re-verifies every fingerprint, and publishes only
-clean utf8 text overwrites via documented `PUT /file`.
+`Push` is the only command that writes to REMOTE. It consumes the last `Plan`
+artifact, re-verifies every fingerprint, and applies two classifications:
+a clean utf8 text overwrite via documented `PUT /file`, and a
+`deleteRemoteCandidate` via documented `DELETE /file`.
 
-`Push` never changes LOCAL files, never creates remote files, never uploads
-binaries, and never deletes anything ([classifier.md](classifier.md),
-[text-write-protocol.md](text-write-protocol.md)).
+`Push` never changes LOCAL files, never creates remote files, and never uploads
+binaries ([classifier.md](classifier.md), [text-write-protocol.md](text-write-protocol.md),
+[delete.md](delete.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
@@ -28,30 +29,42 @@ binaries, and never deletes anything ([classifier.md](classifier.md),
 6. **Fingerprint gates.** The engine compares the artifact to the live BASE,
    LOCAL manifest hash, and REMOTE manifest hashes. Any drift refuses the
    whole run.
-7. **Select.** Only applicable `upload` rows that are still clean utf8 text
-   overwrites may be published. Every other plan row is reported in `SKIPPED`
-   with a reason.
+7. **Select.** An applicable `upload` row that is still a clean utf8 text
+   overwrite, or an applicable `deleteRemoteCandidate` row that is still a
+   clean remote delete, may be published. Every other plan row is reported in
+   `SKIPPED` with a reason.
 8. **Confirm.** If any publishable row remains, Push prints the remote
-   overwrite list and requires the whole word `yes` before continuing.
-9. **Back up.** Every remote original that will be replaced is copied into a
-   backup set first. A backup failure aborts the push before any `PUT`.
-10. **Apply.** For each selected path: re-hash LOCAL, `GET` remote, verify
-    `expectedRemoteHash`, `PUT` utf8 text, echo-verify the response hash.
-11. **Update BASE.** After every `PUT` succeeds, BASE is overlaid additively
-    with the published local identity.
-12. **Journal and prune.** A metadata-only record is appended, then old backup
+   overwrite list, then the delete list, and requires the whole word `yes` for
+   each. Both confirmations are collected before any backup or mutation.
+9. **Back up.** Every remote original that will be replaced **or deleted** is
+   copied into a backup set first. A backup failure aborts the push before any
+   `PUT` or `DELETE`.
+10. **Apply.** For each selected overwrite: re-hash LOCAL, `GET` remote, verify
+    `expectedRemoteHash`, `PUT` utf8 text, echo-verify the response hash. For
+    each selected delete: re-read remote and verify `expectedRemoteHash`,
+    `DELETE`, then prove the path is absent from `GET /files`.
+11. **Update BASE.** After every write and delete succeeds, BASE is overlaid
+    additively with the published local identities, and each deleted path is
+    **dropped** from BASE.
+12. **Journal and prune.** Metadata-only records are appended, then old backup
     sets are pruned best-effort.
 
 ## Allowed automatic remote writes
 
-Exactly one classification may be published:
+Two classifications may be published:
 
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
 | A | B | A | `upload` (utf8 text) | applies |
+| A | — | A | `deleteRemoteCandidate` | applies |
 
 `BASE=A LOCAL=B REMOTE=A` means LOCAL moved on while REMOTE still matched the
 last verified shared state. REMOTE owns no change, so nothing is lost on Studio.
+
+`BASE=A LOCAL=— REMOTE=A` means LOCAL no longer has the path while REMOTE still
+matches the last verified shared state. Removing it destroys nothing that was
+not already gone locally. A delete is applied with the documented `DELETE /file`
+route and its own client-side guard; see [delete.md](delete.md).
 
 ## Must not publish
 
@@ -62,34 +75,37 @@ last verified shared state. REMOTE owns no change, so nothing is lost on Studio.
 | A | A | B | `download` | skipped: Push never downloads |
 | A | B | C | `conflict` | skipped: no safe direction |
 | A | B | B | `synchronized-change` | skipped: both sides already agree |
-| A | — | A | `deleteRemoteCandidate` | skipped: Push does not delete |
+| A | — | A | `deleteRemoteCandidate` (reserved or directory-shaped path) | skipped: route refuses it |
 | any | any | any | `ignored` | skipped: out of sync scope |
 | text ↔ binary | | | `conflict` | skipped: `KindChange` |
 
 Every skipped path is printed with its status and a reason. A skipped path is
 never a silent no-op.
 
-The plan artifact may mark only utf8 text overwrites as `applicable: true`
-([plan.md](plan.md)). Even when a row is applicable in the artifact, Push
-re-classifies it live and refuses the whole run if it is no longer a clean
-upload.
+The plan artifact may mark only utf8 text overwrites and route-allowed remote
+deletes as `applicable: true` ([plan.md](plan.md)). Even when a row is
+applicable in the artifact, Push re-classifies it live and refuses the whole run
+if it is no longer the clean action it was planned as.
 
 ## Confirmation and `-ForcePush`
 
 If any remote text file would be overwritten, Push prints the count and the
-paths, and requires the whole word `yes` before continuing. Anything else
-cancels: no `PUT` runs, no backup set is created, and BASE does not move.
+paths, and requires the whole word `yes` before continuing. If any remote file
+would be deleted, Push prints a second, separate list and requires `yes` again:
+accepting an overwrite never accepts a delete. Anything declined cancels the
+run: no `PUT` or `DELETE` runs, no backup set is created, BASE does not move,
+and no journal record is written.
 
-`-ForcePush` skips the prompt. It never skips a backup, and it never bypasses
-the concurrent-edit guard below. Force is not a way to disable safety; it is a
-way to run unattended.
+`-ForcePush` skips both prompts. It never skips a backup, and it never bypasses
+the concurrent-edit guard, the live hash guard, or the path-shape refusal.
+Force is not a way to disable safety; it is a way to run unattended.
 
 `-ConfirmPush` is a skip-prompt alias for `-ForcePush`, kept so existing
 examples still work.
 
-With overwrites to make and neither `-ForcePush` nor `-ConfirmPush` nor a
-console to confirm on, Push **fails closed**: it aborts rather than writing
-without consent.
+With overwrites or deletes to make and neither `-ForcePush` nor `-ConfirmPush`
+nor a console to confirm on, Push **fails closed**: it aborts rather than
+mutating without consent.
 
 ### Concurrent-edit guard
 

@@ -23,6 +23,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
+. (Join-Path $repoRoot "lib\RemoteDelete.ps1")
 . (Join-Path $repoRoot "lib\Backup.ps1")
 . (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\Pull.ps1")

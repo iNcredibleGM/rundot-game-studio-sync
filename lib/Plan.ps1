@@ -12,10 +12,10 @@ $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
 # Push consumes plan fingerprints but a plan is never permission to write.
-# Only a clean text overwrite may be marked applicable; creates, binaries, and
-# deletes stay blocked with explicit reasons.
+# Only a clean text overwrite and a route-allowed remote delete may be marked
+# applicable; creates, binaries, and refused deletes stay blocked with reasons.
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
-$script:SyncPlanDeleteRemoteBlockedReason = 'Push does not delete remote files.'
+$script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
 
 $script:SyncPlanDryRunClosingLines = @(
     'Dry run only. No remote files were modified.'
@@ -138,6 +138,32 @@ function Get-SyncLocalManifestFingerprint {
     return Convert-Utf8Sha256Hex -Text ([string]::Join("`n", $lines.ToArray()))
 }
 
+function Get-SyncPlanRemotePaths {
+    # The canonical paths the live REMOTE map lists. Used by the delete
+    # applicability check to tell a leaf from a directory-shaped path.
+    param($Remote)
+
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($null -eq $Remote) {
+        return @()
+    }
+
+    if ($Remote -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Remote.Keys)) {
+            [void]$paths.Add([string]$key)
+        }
+
+        return $paths.ToArray()
+    }
+
+    foreach ($property in $Remote.PSObject.Properties) {
+        [void]$paths.Add([string]$property.Name)
+    }
+
+    return $paths.ToArray()
+}
+
 function Get-SyncPlanOperationRows {
     # Display-ready operation rows. The classifier decides status; Plan adds
     # the publish policy on top: only a utf8 text overwrite may be applicable,
@@ -181,8 +207,27 @@ function Get-SyncPlanOperationRows {
                 }
             }
             elseif ($status -eq $script:SyncStatusDeleteRemoteCandidate) {
-                $applicable = $false
-                $reason = $script:SyncPlanDeleteRemoteBlockedReason
+                # A delete is applicable only when the route may touch the
+                # path: not reserved, not directory-shaped, and carrying the
+                # expectedRemoteHash the engine re-verifies before DELETE.
+                # Plan and Push share one predicate so they cannot drift.
+                $refusal = Get-SyncDeletePathRefusalReason `
+                    -CanonicalPath $path `
+                    -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+
+                if ([string]::IsNullOrEmpty($refusal) -and -not [string]::IsNullOrEmpty($remoteSha)) {
+                    $applicable = $true
+                    $reason = $null
+                }
+                else {
+                    $applicable = $false
+                    if (-not [string]::IsNullOrEmpty($refusal)) {
+                        $reason = $refusal
+                    }
+                    else {
+                        $reason = $script:SyncPlanDeleteRemoteRefusalReason
+                    }
+                }
             }
             else {
                 $applicable = $false

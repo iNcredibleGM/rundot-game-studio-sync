@@ -482,9 +482,10 @@ else {
             $planNoBaseResult.ExitCode, $refusalMentionsBase, $refusalPointsAtInit, (Test-Path -LiteralPath $planArtifactPath))
 }
 
-# Gate 10: mutation grep (documented PUT /file only in lib/RemoteWrite.ps1)
+# Gate 10: mutation grep (documented PUT /file in lib/RemoteWrite.ps1 and
+# documented DELETE /file in lib/RemoteDelete.ps1)
 Write-Host ""
-Write-Host "Gate 10: mutation grep allows only documented PUT /file"
+Write-Host "Gate 10: mutation grep allows only documented PUT /file and DELETE /file"
 $productFiles = @()
 foreach ($candidate in @($syncCli, (Join-Path $repoRoot "game-studio-export.ps1"))) {
     if (Test-Path -LiteralPath $candidate) { $productFiles += Get-Item $candidate }
@@ -502,6 +503,7 @@ $setFunctionPattern = '(?im)^\s*function\s+Set-'
 $removeFunctionPattern = '(?im)^\s*function\s+Remove-'
 $probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
 $allowedPutRelative = 'lib/RemoteWrite.ps1'
+$allowedDeleteRelative = 'lib/RemoteDelete.ps1'
 
 $mutationHits = New-Object 'System.Collections.Generic.List[string]'
 foreach ($file in $productFiles) {
@@ -519,8 +521,10 @@ foreach ($file in $productFiles) {
         }
     }
 
-    foreach ($match in [regex]::Matches($text, $httpDeletePattern)) {
-        [void]$mutationHits.Add("${relative}: HTTP DELETE '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedDeleteRelative) {
+        foreach ($match in [regex]::Matches($text, $httpDeletePattern)) {
+            [void]$mutationHits.Add("${relative}: HTTP DELETE '$($match.Value)'")
+        }
     }
 
     foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
@@ -543,11 +547,11 @@ foreach ($file in $productFiles) {
 }
 
 if ($mutationHits.Count -eq 0) {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "PASS" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file and DELETE /file" -Status "PASS" `
         -Detail ("scanned {0} product file(s)" -f $productFiles.Count)
 }
 else {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "FAIL" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file and DELETE /file" -Status "FAIL" `
         -Detail ($mutationHits -join "; ")
 }
 

@@ -3,6 +3,7 @@
 # never this file or markdown.
 #
 # PUT is allowed only in lib/RemoteWrite.ps1 (documented text overwrite).
+# DELETE is allowed only in lib/RemoteDelete.ps1 (documented delete, #39).
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 
@@ -43,6 +44,7 @@ $removeFunctionPattern = '(?im)^\s*function\s+Remove-'
 # this ban without tripping any pattern above.
 $probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
 $allowedPutRelative = 'lib/RemoteWrite.ps1'
+$allowedDeleteRelative = 'lib/RemoteDelete.ps1'
 
 $violations = @()
 
@@ -63,9 +65,11 @@ foreach ($file in $productFiles) {
         }
     }
 
-    $lineMatches = [regex]::Matches($text, $httpDeletePattern)
-    foreach ($match in $lineMatches) {
-        $violations += "${relative}: HTTP DELETE '$($match.Value)'"
+    if ($normalizedRelative -ne $allowedDeleteRelative) {
+        $lineMatches = [regex]::Matches($text, $httpDeletePattern)
+        foreach ($match in $lineMatches) {
+            $violations += "${relative}: HTTP DELETE '$($match.Value)'"
+        }
     }
 
     $lineMatches = [regex]::Matches($text, $httpMovePattern)
@@ -99,4 +103,23 @@ if ($violations.Count -gt 0) {
     }
 }
 
-Assert-Equal 0 $violations.Count "product PowerShell must expose only the documented text PUT surface"
+Assert-Equal 0 $violations.Count "product PowerShell must expose only the documented text PUT and file DELETE surface"
+
+# The one file allowed to send DELETE must stay narrow: no upload, no move,
+# no probe reachability. The delete route is one verb on one path.
+$deleteLibPath = Join-Path $repoRoot $allowedDeleteRelative
+Assert-True (Test-Path $deleteLibPath) "lib/RemoteDelete.ps1 must exist"
+
+if (Test-Path $deleteLibPath) {
+    $deleteLibText = [System.IO.File]::ReadAllText($deleteLibPath)
+
+    Assert-True `
+        ($deleteLibText -notmatch $uploadPattern) `
+        "lib/RemoteDelete.ps1 must not reference a Studio upload endpoint"
+    Assert-True `
+        ($deleteLibText -notmatch $httpMovePattern) `
+        "lib/RemoteDelete.ps1 must not reference the Studio move endpoint"
+    Assert-True `
+        ($deleteLibText -notmatch $probeReachabilityPattern) `
+        "lib/RemoteDelete.ps1 must not reach the non-product Studio probe"
+}

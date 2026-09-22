@@ -443,8 +443,9 @@ Delete semantics are now characterized in
 [delete-rename-protocol.md](delete-rename-protocol.md): it removes exactly the
 named path, a repeated delete returns `404` rather than an error, a
 directory-shaped path is `404` rather than recursive, and `If-Match` is
-ignored. `Push` must still not use this route in v0.1.3, because
-`deleteRemoteCandidate` remains classification-only.
+ignored. `Push` applies this route only for a route-allowed
+`deleteRemoteCandidate` row, with a client-side hash guard and a backup first
+([delete.md](delete.md)).
 
 Two safeguards keep cleanup safe:
 

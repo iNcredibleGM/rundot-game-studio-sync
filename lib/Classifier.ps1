@@ -34,18 +34,18 @@ $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
 # states the real shape instead of claiming replacement is impossible.
 $script:SyncBinaryUploadReason = 'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.'
 
-# The delete verb is now characterized (docs/delete-rename-protocol.md): it
+# The delete verb is characterized in docs/delete-rename-protocol.md: it
 # removes exactly the named path, a repeated delete returns 404 rather than an
 # error, and a stale write against a deleted path is refused rather than
 # resurrecting it. What it cannot do is refuse a stale delete: there is no
 # ETag, no version field, and If-Match is ignored, so nothing server-side can
-# reject a delete computed against content that has since changed. That is why
-# a delete candidate stays classification-only — the client would have to
-# re-verify on its own, immediately before the request, and this milestone
-# emits no remote mutation at all.
+# reject a delete computed against content that has since changed. The guard
+# therefore lives in the client, immediately before the request: a confirmed
+# Push re-reads the remote bytes, backs them up, and proves the path is absent
+# afterwards (docs/delete.md). Pull never deletes anything.
 $script:SyncDeletionCandidateReason = @(
-    'Deletion is classification-only in this milestone.',
-    'No local or remote file is deleted.',
+    'Pull never deletes anything, locally or remotely.',
+    'A deletion candidate is reported here and applied only by a confirmed Push.',
     'Studio cannot make a delete conditional: there is no ETag or version field and If-Match is ignored, so a stale delete cannot be refused server-side.'
 ) -join "`n"
 

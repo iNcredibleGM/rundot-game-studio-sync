@@ -257,7 +257,8 @@ $syncEngineStatusCases = @(
     @{ Name = '- / A / A'; Base = $null; Local = $localA; Remote = $remoteA; Status = 'synchronized-addition' }
     @{ Name = '- / A / B'; Base = $null; Local = $localA; Remote = $remoteB; Status = 'conflict' }
 
-    # Deletions (classification only; v0.1.3 performs no delete)
+    # Deletions: a deleteRemoteCandidate may be applied by a confirmed Push;
+    # a deleteLocalCandidate is reported and the local file is left in place.
     @{ Name = 'A / - / A'; Base = $baseA; Local = $null; Remote = $remoteA; Status = 'deleteRemoteCandidate' }
     @{ Name = 'A / A / -'; Base = $baseA; Local = $localA; Remote = $null; Status = 'deleteLocalCandidate' }
     @{ Name = 'A / - / B'; Base = $baseA; Local = $null; Remote = $remoteB; Status = 'conflict' }
@@ -316,14 +317,15 @@ Assert-Equal 'conflict' ([string]$conflictRow.Status) "a three-way difference ke
 Assert-Equal $false $conflictRow.Applicable "a conflict is never actionable"
 Assert-True ($null -ne $conflictRow.Reason) "a conflict should explain itself"
 
-# Deletions are classified but never applicable in v0.1.3, and the reason must
-# say so rather than implying a delete will happen.
+# Deletions are classified but never applicable at the classifier layer; only
+# the Plan policy decides applicability, and the reason must name the missing
+# server-side guard rather than implying a delete already happened.
 $deleteRemoteRow = Get-SyncPlanChange -Path 'src/a.ts' -Base $baseA -Local $null -Remote $remoteA
 Assert-Equal 'deleteRemoteCandidate' ([string]$deleteRemoteRow.Status) "a remote deletion keeps its status"
-Assert-Equal $false $deleteRemoteRow.Applicable "a delete candidate is not actionable in this milestone"
+Assert-Equal $false $deleteRemoteRow.Applicable "a delete candidate is not actionable at the classifier layer"
 Assert-True `
-    ([string]$deleteRemoteRow.Reason -match '(?i)classification-only') `
-    "a delete candidate reason should say deletion is classification-only"
+    ([string]$deleteRemoteRow.Reason -match '(?i)never deletes') `
+    "a delete candidate reason should say Pull never deletes anything"
 Assert-True `
     ([string]$deleteRemoteRow.Reason -match '(?i)etag') `
     "a delete candidate reason should name the missing ETag that makes a stale delete unrefusable"

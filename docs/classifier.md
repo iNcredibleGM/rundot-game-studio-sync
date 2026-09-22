@@ -75,12 +75,15 @@ constants so `Plan` renders one source of truth.
 | `download` | REMOTE differs from BASE while LOCAL still matches BASE | yes |
 | `conflict` | no single safe direction | no |
 | `ignored` | out of sync scope by the default ignore set | no |
-| `deleteRemoteCandidate` | LOCAL gone, REMOTE still matches BASE | no |
+| `deleteRemoteCandidate` | LOCAL gone, REMOTE still matches BASE | yes, when the path is route-allowed |
 | `deleteLocalCandidate` | REMOTE gone, LOCAL still matches BASE | no |
 
-`Applicable` is about **this milestone**, not about correctness: this version
-can publish a utf8 text overwrite via `Push` and still never deletes, so delete
-candidates are classified but never actionable.
+`Applicable` is about **what a confirmed command may apply**, not about
+correctness: this version can publish a utf8 text overwrite and apply a
+route-allowed remote delete via `Push` ([delete.md](delete.md)). It never
+creates files, uploads binaries, or deletes a local file, so a
+`deleteLocalCandidate` is classified but never actionable. A reserved or
+directory-shaped delete candidate is classified but refused by the route rules.
 
 ## Decision table
 
@@ -105,16 +108,15 @@ side.
 | A | — | — | `settledAbsent` |
 
 `A / — / —` is `settledAbsent`: a deletion already agreed on by both sides is
-not a standing `DELETE`. Deletions are classification only; the delete verb is
-characterized in
-[delete-rename-protocol.md](delete-rename-protocol.md), and nothing in this
-milestone emits one.
+not a standing `DELETE`. A `deleteRemoteCandidate` is applied only by a
+confirmed `Push` ([delete.md](delete.md)); the delete verb is characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md).
 
-A delete candidate carries the reason that constrains a future `Apply`:
+A delete candidate carries the reason that constrains a `Push` delete:
 
 ```text
-Reason   : Deletion is classification-only in this milestone.
-           No local or remote file is deleted.
+Reason   : Pull never deletes anything, locally or remotely.
+           A deletion candidate is reported here and applied only by a confirmed Push.
            Studio cannot make a delete conditional: there is no ETag or
            version field and If-Match is ignored, so a stale delete cannot be
            refused server-side.
@@ -209,7 +211,8 @@ create a different path than the plan promised. Text uploads, by contrast, are
   the snapshot retries and then aborts, so a partial map is never classified.
 - `Plan` must call `Assert-BaseOwnership` before reading BASE
   ([base-schema.md](base-schema.md)).
-- Why a delete candidate stays classification-only, and what the delete verb
-  actually does: [delete-rename-protocol.md](delete-rename-protocol.md).
+- Why a delete candidate is applied only by a confirmed `Push`, and what the
+  delete verb actually does: [delete.md](delete.md),
+  [delete-rename-protocol.md](delete-rename-protocol.md).
 
 Unit coverage lives in `tests/SyncEngine.Tests.ps1` and requires no network.

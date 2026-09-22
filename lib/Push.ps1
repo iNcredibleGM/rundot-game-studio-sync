@@ -1,18 +1,27 @@
-# Safe Push: publish clean local text overwrites to Studio.
+# Safe Push: publish clean local text overwrites and confirmed remote deletes.
 #
-# Push applies exactly one classification from a verified plan artifact: a clean
-# text overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set).
-# Creates, binaries, conflicts, kind mismatches, and deletes are refused.
+# Push applies two classifications from a verified plan artifact: a clean text
+# overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set) and a
+# remote delete (BASE=A LOCAL=- REMOTE=A, expectedRemoteHash set, path not
+# reserved and not directory-shaped). Creates, binaries, conflicts, and kind
+# mismatches are refused.
+#
+# A delete cannot be made conditional: Studio exposes no ETag or version and
+# ignores If-Match (docs/delete-rename-protocol.md), so the guard is a client
+# re-read of the remote bytes immediately before the request, plus a backup of
+# those bytes first. A 404 after a 200 means the path is already absent, and
+# absence is proven from GET /files rather than from a status code.
 #
 # This file owns three layers:
 #
 #   1. validation   - plan artifact fingerprints and live state gates
 #   2. selection    - which plan rows Push may apply, and why the rest are not
-#   3. apply/BASE   - remote backup, per-file GET+PUT with echo verify, additive BASE
+#   3. apply/BASE   - remote backup, per-file GET+PUT with echo verify, DELETE
+#                     with absence verify, and the verified BASE update
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
 # Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1, Journal.ps1,
-# RemoteApi.ps1, RemoteWrite.ps1, and Push.ps1 first.
+# RemoteApi.ps1, RemoteWrite.ps1, RemoteDelete.ps1, and Push.ps1 first.
 
 
 # ----------------------------------------------------------------------------
@@ -177,7 +186,7 @@ function Get-SyncPushExclusionReason {
             return 'REMOTE no longer has this path while LOCAL still matches BASE. Push does not delete local content.'
         }
         $script:SyncStatusDeleteRemoteCandidate {
-            return $script:SyncPlanDeleteRemoteBlockedReason
+            return $script:SyncPlanDeleteRemoteRefusalReason
         }
         $script:SyncStatusIgnored {
             return $script:SyncIgnoredReason
@@ -200,9 +209,10 @@ function Get-SyncPushExclusionReason {
 }
 
 function Get-SyncPushSelection {
-    # Split the plan artifact into publishable text overwrites and everything
-    # else. Pure over the supplied maps except for the hard refusal when a row
-    # the plan marked applicable is no longer a clean upload.
+    # Split the plan artifact into publishable text overwrites, applicable
+    # remote deletes, and everything else. Pure over the supplied maps except
+    # for the hard refusal when a row the plan marked applicable is no longer
+    # the clean action it was planned as.
     param(
         [Parameter(Mandatory)]
         $Artifact,
@@ -213,14 +223,19 @@ function Get-SyncPushSelection {
     )
 
     $actions = New-Object 'System.Collections.Generic.List[object]'
+    $deletes = New-Object 'System.Collections.Generic.List[object]'
     $excluded = New-Object 'System.Collections.Generic.List[object]'
+    $remotePaths = @(Get-SyncPlanRemotePaths -Remote $Remote)
 
     foreach ($operation in @($Artifact.operations)) {
         $path = [string]$operation.path
         $status = [string]$operation.status
         $applicable = [bool]$operation.applicable
 
-        if ($status -ne $script:SyncStatusUpload -or -not $applicable) {
+        $isUploadRow = ($status -eq $script:SyncStatusUpload -and $applicable)
+        $isDeleteRow = ($status -eq $script:SyncStatusDeleteRemoteCandidate -and $applicable)
+
+        if (-not $isUploadRow -and -not $isDeleteRow) {
             $excluded.Add([pscustomobject]@{
                 Path       = $path
                 Status     = $status
@@ -232,12 +247,71 @@ function Get-SyncPushSelection {
             continue
         }
 
+        $baseEntry = Get-SyncMapEntry -Map $Base -Path $path
+        $localEntry = Get-SyncMapEntry -Map $Local -Path $path
+        $remoteEntry = Get-SyncMapEntry -Map $Remote -Path $path
+
         $change = Get-SyncPlanChange `
             -Path $path `
-            -Base (Get-SyncMapEntry -Map $Base -Path $path) `
-            -Local (Get-SyncMapEntry -Map $Local -Path $path) `
-            -Remote (Get-SyncMapEntry -Map $Remote -Path $path)
+            -Base $baseEntry `
+            -Local $localEntry `
+            -Remote $remoteEntry
         $liveStatus = [string]$change.Status
+
+        if ($isDeleteRow) {
+            if ($liveStatus -ne $script:SyncStatusDeleteRemoteCandidate) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is no longer a remote delete candidate (now {1}). Re-run Plan." -f $path, $liveStatus)
+                )
+            }
+
+            # LOCAL must still be genuinely absent, and REMOTE must still match
+            # the verified BASE the plan was computed against. Otherwise the
+            # delete would remove content nobody agreed to remove.
+            if ($null -ne $localEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: LOCAL for '{0}' reappeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            $baseSha = [string](Get-SyncEntrySha256 -Entry $baseEntry)
+            $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+            if (-not (Test-SyncHashEqual -LeftSha256 $baseSha -RightSha256 $liveRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' no longer matches BASE. Re-run Plan." -f $path)
+                )
+            }
+
+            $expectedRemoteSha = [string]$operation.expectedRemoteHash
+            if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' has no expectedRemoteHash to verify before DELETE." -f $path)
+                )
+            }
+
+            if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+                )
+            }
+
+            # Defense in depth: the plan already refused a reserved or
+            # directory-shaped path, and the engine refuses it again against
+            # the live remote list rather than trusting the artifact.
+            Assert-SyncDeletePathAllowed `
+                -CanonicalPath $path `
+                -RemotePaths $remotePaths
+
+            $deletes.Add([pscustomobject]@{
+                Path               = $path
+                Status             = $status
+                ExpectedRemoteHash = $expectedRemoteSha
+                RemoteSha256       = $liveRemoteSha
+                RemotePaths        = @($remotePaths)
+            })
+
+            continue
+        }
 
         if ($liveStatus -ne $script:SyncStatusUpload) {
             throw [System.InvalidOperationException]::new(
@@ -251,8 +325,6 @@ function Get-SyncPushSelection {
             )
         }
 
-        $localEntry = Get-SyncMapEntry -Map $Local -Path $path
-        $remoteEntry = Get-SyncMapEntry -Map $Remote -Path $path
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
         $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
 
@@ -299,14 +371,20 @@ function Get-SyncPushSelection {
         $actionRows = $actions.ToArray()
     }
 
+    $deleteRows = @()
+    if ($deletes.Count -gt 0) {
+        $deleteRows = $deletes.ToArray()
+    }
+
     $excludedRows = @()
     if ($excluded.Count -gt 0) {
         $excludedRows = $excluded.ToArray()
     }
 
     return [pscustomobject]@{
-        Actions  = $actionRows
-        Excluded = $excludedRows
+        Actions       = $actionRows
+        DeleteActions = $deleteRows
+        Excluded      = $excludedRows
     }
 }
 
@@ -597,6 +675,111 @@ function Invoke-RundotSyncPushWriteAction {
     }
 }
 
+function Invoke-RundotSyncDeleteAction {
+    # Remove exactly one remote file. The order matters and cannot be
+    # rearranged: the route is unversioned, so the remote bytes are re-read and
+    # compared to expectedRemoteHash immediately before DELETE, and the proof
+    # that the file is gone is that GET /files stops listing it.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        $Action,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [AllowNull()]
+        [string[]]$RemotePaths,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null
+    )
+
+    $path = [string]$Action.Path
+    Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+    # Resolve the live remote list when the caller did not supply one, so the
+    # directory-shape refusal is never skipped rather than silently passing.
+    if ($null -eq $RemotePaths) {
+        $RemotePaths = @(Get-RemoteListedFilePaths `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFileList $GetRemoteFileList)
+    }
+
+    Assert-SyncDeletePathAllowed -CanonicalPath $path -RemotePaths $RemotePaths
+
+    # Re-read the remote bytes and compare to expectedRemoteHash immediately
+    # before the request. This is the only guard a delete can have: If-Match is
+    # ignored, so the server cannot refuse a stale delete for us.
+    $null = Get-SyncPushVerifiedRemoteResponse `
+        -Path $path `
+        -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers `
+        -GetRemoteFile $GetRemoteFile
+
+    if ($null -eq $DeleteRemoteFile) {
+        $DeleteRemoteFile = {
+            param($Origin, $Id, $Canonical, $Hdr)
+            Invoke-RemoteDeleteFile `
+                -StudioOrigin $Origin `
+                -ProjectId $Id `
+                -CanonicalPath $Canonical `
+                -Headers $Hdr
+        }
+    }
+
+    try {
+        $null = & $DeleteRemoteFile $StudioOrigin $ProjectId $path $Headers
+    }
+    catch {
+        # A 404 after an ambiguous failure means the postcondition already
+        # holds. Treat it as already-deleted only when GET /files agrees.
+        if (Test-RemoteNotFoundException -Exception $_.Exception) {
+            Assert-RemotePathAbsent `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -CanonicalPath $path `
+                -GetRemoteFileList $GetRemoteFileList
+
+            return [pscustomobject]@{
+                Path          = $path
+                AlreadyAbsent = $true
+            }
+        }
+
+        throw
+    }
+
+    # A 200 is not the proof. Confirm the path is gone from the file list.
+    Assert-RemotePathAbsent `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers `
+        -CanonicalPath $path `
+        -GetRemoteFileList $GetRemoteFileList
+
+    return [pscustomobject]@{
+        Path          = $path
+        AlreadyAbsent = $false
+    }
+}
+
 function Invoke-RundotSyncPushApply {
     param(
         [Parameter(Mandatory)]
@@ -617,19 +800,30 @@ function Invoke-RundotSyncPushApply {
 
         [string]$BackupSetPath,
 
+        [AllowEmptyCollection()]
+        [object[]]$DeleteActions = @(),
+
         [scriptblock]$GetRemoteFile = $null,
 
         [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null,
 
         [scriptblock]$CopyBackupFile = $null
     )
 
     $actionRows = @($Actions)
-    if ($actionRows.Count -eq 0) {
+    $deleteRows = @($DeleteActions)
+
+    if ($actionRows.Count -eq 0 -and $deleteRows.Count -eq 0) {
         return [pscustomobject]@{
             AppliedActions = @()
             AppliedLocals  = @()
+            DeletedActions = @()
             Applied        = 0
+            Deleted        = 0
             BackupSet      = $null
             BackupSetPath  = $null
         }
@@ -663,11 +857,37 @@ function Invoke-RundotSyncPushApply {
             -LocalFullPath $localFullPath
     }
 
+    $remotePaths = @()
+    foreach ($action in $deleteRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        if ($null -ne $action.PSObject.Properties['RemotePaths'] -and $null -ne $action.RemotePaths) {
+            $remotePaths = @($action.RemotePaths)
+            break
+        }
+    }
+
     $appliedActions = New-Object 'System.Collections.Generic.List[object]'
     $appliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    $deletedActions = New-Object 'System.Collections.Generic.List[object]'
 
     try {
+        # Back up every path first, writes and deletes alike. No DELETE runs
+        # until every backup it depends on has verified.
         foreach ($action in $actionRows) {
+            Save-RundotSyncPushRemoteBackup `
+                -WorkspaceRoot $WorkspaceRoot `
+                -BackupSetPath $BackupSetPath `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -CopyBackupFile $CopyBackupFile | Out-Null
+        }
+
+        foreach ($action in $deleteRows) {
             Save-RundotSyncPushRemoteBackup `
                 -WorkspaceRoot $WorkspaceRoot `
                 -BackupSetPath $BackupSetPath `
@@ -692,6 +912,21 @@ function Invoke-RundotSyncPushApply {
             [void]$appliedActions.Add($action)
             [void]$appliedLocals.Add($appliedLocal)
         }
+
+        foreach ($action in $deleteRows) {
+            $deleted = Invoke-RundotSyncDeleteAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -RemotePaths $remotePaths `
+                -GetRemoteFile $GetRemoteFile `
+                -DeleteRemoteFile $DeleteRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList
+
+            [void]$deletedActions.Add($deleted)
+        }
     }
     catch {
         $originalError = $_.Exception
@@ -700,13 +935,16 @@ function Invoke-RundotSyncPushApply {
             $originalError
         )
         $wrapper.Data['PushAppliedCount'] = $appliedActions.Count
+        $wrapper.Data['PushDeletedCount'] = $deletedActions.Count
         throw $wrapper
     }
 
     return [pscustomobject]@{
         AppliedActions = @($appliedActions.ToArray())
         AppliedLocals  = @($appliedLocals.ToArray())
+        DeletedActions = @($deletedActions.ToArray())
         Applied        = $appliedActions.Count
+        Deleted        = $deletedActions.Count
         BackupSet      = $backupSet
         BackupSetPath  = $BackupSetPath
     }
@@ -720,7 +958,10 @@ function Invoke-RundotSyncPushApply {
 function New-RundotSyncPushBaseFiles {
     param(
         $BaseFiles,
-        [object[]]$AppliedLocals
+        [object[]]$AppliedLocals,
+
+        [AllowNull()]
+        [string[]]$DeletedPaths
     )
 
     $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
@@ -747,6 +988,19 @@ function New-RundotSyncPushBaseFiles {
             LocalDetectedKind = [string]$applied.LocalDetectedKind
             LineEnding        = $applied.LineEnding
             HasBom            = [bool]$applied.HasBom
+        }
+    }
+
+    # A deleted path is dropped from BASE, not tombstoned. The path is now gone
+    # from both LOCAL and REMOTE, so a later identical re-create in Studio
+    # classifies as a download rather than another delete candidate.
+    foreach ($deletedPath in @($DeletedPaths)) {
+        if ([string]::IsNullOrEmpty([string]$deletedPath)) {
+            continue
+        }
+
+        if ($files.ContainsKey([string]$deletedPath)) {
+            [void]$files.Remove([string]$deletedPath)
         }
     }
 
@@ -794,6 +1048,9 @@ function Update-RundotSyncBaseAfterPush {
 
         [object[]]$AppliedLocals,
 
+        [AllowNull()]
+        [string[]]$DeletedPaths,
+
         $BaseFiles
     )
 
@@ -803,7 +1060,8 @@ function Update-RundotSyncBaseAfterPush {
 
     $files = New-RundotSyncPushBaseFiles `
         -BaseFiles $BaseFiles `
-        -AppliedLocals $AppliedLocals
+        -AppliedLocals $AppliedLocals `
+        -DeletedPaths $DeletedPaths
 
     Save-BaseManifest `
         -WorkspaceRoot $WorkspaceRoot `
@@ -828,6 +1086,10 @@ function Format-SyncPushReport {
         [object[]]$AppliedActions,
 
         [int]$Applied = 0,
+
+        [object[]]$DeletedActions = $null,
+
+        [int]$Deleted = 0,
 
         [object[]]$Skipped = $null,
 
@@ -856,21 +1118,32 @@ function Format-SyncPushReport {
     }
 
     $actionRows = @($AppliedActions)
+    $deletedRows = @($DeletedActions)
     $skippedRows = @($Skipped)
     if ($null -eq $Skipped -and $null -ne $Selection) {
         $skippedRows = @($Selection.Excluded)
     }
 
-    if ($actionRows.Count -eq 0) {
+    if ($actionRows.Count -eq 0 -and $deletedRows.Count -eq 0) {
         [void]$lines.Add('')
-        [void]$lines.Add('Nothing to push: no publishable text overwrite remains in this plan.')
+        [void]$lines.Add('Nothing to push: no publishable overwrite or confirmed delete remains in this plan.')
         [void]$lines.Add('BASE was not updated.')
     }
     else {
-        [void]$lines.Add('')
-        [void]$lines.Add('APPLIED')
-        foreach ($action in $actionRows) {
-            [void]$lines.Add(('  {0}  (overwrite)' -f [string]$action.Path))
+        if ($actionRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('APPLIED')
+            foreach ($action in $actionRows) {
+                [void]$lines.Add(('  {0}  (overwrite)' -f [string]$action.Path))
+            }
+        }
+
+        if ($deletedRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('DELETED')
+            foreach ($action in $deletedRows) {
+                [void]$lines.Add(('  {0}  (delete)' -f [string]$action.Path))
+            }
         }
     }
 
@@ -886,6 +1159,7 @@ function Format-SyncPushReport {
     [void]$lines.Add('')
     [void]$lines.Add('SUMMARY')
     [void]$lines.Add(('  applied:      {0}' -f $Applied))
+    [void]$lines.Add(('  deleted:      {0}' -f $Deleted))
     [void]$lines.Add(('  skipped:      {0}' -f $skippedRows.Count))
     [void]$lines.Add(('  BASE updated: {0}' -f ([bool]$BaseUpdated).ToString().ToLowerInvariant()))
 
@@ -935,11 +1209,17 @@ function Invoke-RundotSyncPush {
 
         [scriptblock]$ConfirmOverwrite = $null,
 
+        [scriptblock]$ConfirmDelete = $null,
+
         [switch]$Force,
 
         [scriptblock]$GetRemoteFile = $null,
 
-        [scriptblock]$PutRemoteFile = $null
+        [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null
     )
 
     Assert-RundotSyncPushPlanArtifact `
@@ -958,11 +1238,30 @@ function Invoke-RundotSyncPush {
         -Remote $Remote
 
     $actions = @($selection.Actions)
+    $deleteActions = @($selection.DeleteActions)
     $planId = [string]$Artifact.planId
     $backupRoot = Get-RundotSyncBackupRoot -WorkspaceRoot $WorkspaceRoot
 
-    # Confirmation before any write. A declined overwrite changes nothing, so
-    # it is not journaled as a run.
+    $cancelledResult = {
+        return [pscustomobject]@{
+            Applied        = 0
+            Deleted        = 0
+            Cancelled      = $true
+            BaseUpdated    = $false
+            PlanId         = $planId
+            Selection      = $selection
+            AppliedActions = @()
+            DeletedActions = @()
+            Report         = (Format-SyncPushReport `
+                -Selection $selection `
+                -AppliedActions @() `
+                -Cancelled $true `
+                -PlanId $planId)
+        }
+    }
+
+    # Confirmation before any write or delete. Every confirmation is collected
+    # before the first backup, so a decline changes nothing at all.
     if ($actions.Count -gt 0 -and -not $Force) {
         if ($null -eq $ConfirmOverwrite) {
             throw [System.InvalidOperationException]::new(
@@ -974,30 +1273,37 @@ function Invoke-RundotSyncPush {
 
         $confirmed = [bool](& $ConfirmOverwrite $actions.Count @($actions | ForEach-Object { [string]$_.Path }))
         if (-not $confirmed) {
-            return [pscustomobject]@{
-                Applied        = 0
-                Cancelled      = $true
-                BaseUpdated    = $false
-                PlanId         = $planId
-                Selection      = $selection
-                AppliedActions = @()
-                Report         = (Format-SyncPushReport `
-                    -Selection $selection `
-                    -AppliedActions @() `
-                    -Cancelled $true `
-                    -PlanId $planId)
-            }
+            return (& $cancelledResult)
         }
     }
 
-    if ($actions.Count -eq 0) {
+    # A delete is unrecoverable from Studio, so it gets its own confirmation
+    # even when the overwrite half was accepted.
+    if ($deleteActions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmDelete) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote file(s) would be deleted. " -f $deleteActions.Count) +
+                'Confirm the delete, or pass -ForcePush to proceed. ' +
+                'A backup of each remote original is always created first.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmDelete $deleteActions.Count @($deleteActions | ForEach-Object { [string]$_.Path }))
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
+    if ($actions.Count -eq 0 -and $deleteActions.Count -eq 0) {
         return [pscustomobject]@{
             Applied        = 0
+            Deleted        = 0
             Cancelled      = $false
             BaseUpdated    = $false
             PlanId         = $planId
             Selection      = $selection
             AppliedActions = @()
+            DeletedActions = @()
             Report         = (Format-SyncPushReport `
                 -Selection $selection `
                 -AppliedActions @() `
@@ -1011,18 +1317,25 @@ function Invoke-RundotSyncPush {
         $applyResult = Invoke-RundotSyncPushApply `
             -WorkspaceRoot $WorkspaceRoot `
             -Actions $actions `
+            -DeleteActions $deleteActions `
             -StudioOrigin $StudioOrigin `
             -ProjectId $ProjectId `
             -Headers $Headers `
             -BackupSetPath ([string]$backupSet.Path) `
             -GetRemoteFile $GetRemoteFile `
-            -PutRemoteFile $PutRemoteFile
+            -PutRemoteFile $PutRemoteFile `
+            -DeleteRemoteFile $DeleteRemoteFile `
+            -GetRemoteFileList $GetRemoteFileList
     }
     catch {
         $applyError = $_.Exception
         $appliedBeforeFailure = 0
+        $deletedBeforeFailure = 0
         if ($applyError.Data.Contains('PushAppliedCount')) {
             $appliedBeforeFailure = [int]$applyError.Data['PushAppliedCount']
+        }
+        if ($applyError.Data.Contains('PushDeletedCount')) {
+            $deletedBeforeFailure = [int]$applyError.Data['PushDeletedCount']
         }
 
         try {
@@ -1036,6 +1349,7 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $appliedBeforeFailure
                     overwritten = $appliedBeforeFailure
+                    deleted     = $deletedBeforeFailure
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
                     reason      = 'Push failed while writing REMOTE. BASE was not updated. The backup set holds the previous remote bytes.'
@@ -1053,12 +1367,15 @@ function Invoke-RundotSyncPush {
         $baseFiles = $Resolution.Base.files
     }
 
+    $deletedPaths = @($applyResult.DeletedActions | ForEach-Object { [string]$_.Path })
+
     try {
         Update-RundotSyncBaseAfterPush `
             -WorkspaceRoot $WorkspaceRoot `
             -ProjectId $ProjectId `
             -AppliedActions $applyResult.AppliedActions `
             -AppliedLocals $applyResult.AppliedLocals `
+            -DeletedPaths $deletedPaths `
             -BaseFiles $baseFiles | Out-Null
 
         Add-RundotSyncJournalRecord `
@@ -1071,6 +1388,7 @@ function Invoke-RundotSyncPush {
                 backupSet   = [string]$backupSet.Name
                 applied     = $applyResult.Applied
                 overwritten = $applyResult.Applied
+                deleted     = $applyResult.Deleted
                 skipped     = @($selection.Excluded).Count
                 baseUpdated = $true
             } | Out-Null
@@ -1079,6 +1397,19 @@ function Invoke-RundotSyncPush {
             Add-RundotSyncJournalRecord `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Event 'push-backup' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.DeletedActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-delete' `
                 -Record @{
                     status    = 'success'
                     projectId = $ProjectId
@@ -1100,6 +1431,7 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $applyResult.Applied
                     overwritten = $applyResult.Applied
+                    deleted     = $applyResult.Deleted
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
                     reason      = 'Push applied remote writes, but the verified BASE update did not complete. The previous BASE remains authoritative.'
@@ -1123,11 +1455,13 @@ function Invoke-RundotSyncPush {
 
     return [pscustomobject]@{
         Applied        = [int]$applyResult.Applied
+        Deleted        = [int]$applyResult.Deleted
         Cancelled      = $false
         BaseUpdated    = $true
         PlanId         = $planId
         Selection      = $selection
         AppliedActions = @($applyResult.AppliedActions)
+        DeletedActions = @($applyResult.DeletedActions)
         BackupSet      = $backupSet
         BackupSetPath  = [string]$backupSet.Path
         BackupSetName  = [string]$backupSet.Name
@@ -1136,6 +1470,8 @@ function Invoke-RundotSyncPush {
             -Selection $selection `
             -AppliedActions $applyResult.AppliedActions `
             -Applied $applyResult.Applied `
+            -DeletedActions $applyResult.DeletedActions `
+            -Deleted $applyResult.Deleted `
             -BaseUpdated $true `
             -PlanId $planId `
             -BackupRoot $backupRoot `

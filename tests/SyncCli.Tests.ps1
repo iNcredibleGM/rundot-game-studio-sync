@@ -479,3 +479,40 @@ $pushAuthClearCount = ([regex]::Matches($pushFunctionText, 'Authorization\s*=\s*
 Assert-True `
     ($pushAuthClearCount -ge 1) `
     "Invoke-SyncPushCommand should clear the Authorization header before exiting"
+
+
+# --------------------------------------------------------------------------
+# Push delete wiring: the documented DELETE route stays explicit and confirmed
+# --------------------------------------------------------------------------
+
+foreach ($requiredDeleteLibrary in @(
+    'RemoteDelete.ps1'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredDeleteLibrary)) `
+        "the CLI should load lib\$requiredDeleteLibrary"
+}
+
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushDeleteConfirmation')) `
+    "the CLI should define Read-RundotSyncPushDeleteConfirmation for Push deletes"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmDelete')) `
+    "the CLI should hand the delete prompt to the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Invoke-RundotSyncPush')) `
+    "the Push command should call the engine that owns the delete"
+
+# The delete confirmation must be its own deliberate prompt, not a silent
+# extension of the overwrite prompt.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Push will DELETE')) `
+    "the delete confirmation must say what will be removed"
+
+# The one file allowed to send DELETE must be the only one.
+Assert-True `
+    ($syncCliSource -notmatch "\.Method\s*=\s*['`"]DELETE['`"]") `
+    "the CLI must not send DELETE itself; lib/RemoteDelete.ps1 owns the route"
+Assert-True `
+    ($pushFunctionText -notmatch "\.Method\s*=\s*['`"]DELETE['`"]") `
+    "Invoke-SyncPushCommand must not send DELETE itself"

@@ -44,4 +44,4 @@ Tests must not require Pester to be installed.
 
 - Never print, log, or commit access tokens, refresh tokens, or auth files (`%APPDATA%\.rundot\`).
 - Do not include those values in bug reports, PR bodies, or issue comments.
-- v0.2.0 on `main` adds the documented text overwrite route only: `PUT /api/projects/{projectId}/file` in `lib/RemoteWrite.ps1`. v0.3.0 may add a further Studio write route only in the issue that owns it, and only after that issue's protocol evidence exists. A missing route stays a refusal. Firebase `securetoken` POST for token refresh is allowed.
+- v0.2.0 on `main` adds the documented text overwrite route only: `PUT /api/projects/{projectId}/file` in `lib/RemoteWrite.ps1`. v0.3.0 adds the documented delete route, `DELETE /api/projects/{projectId}/file` in `lib/RemoteDelete.ps1`, owned by #39 after #16 recorded the evidence. A further Studio write route may be added only in the issue that owns it, and only after that issue's protocol evidence exists. A missing route stays a refusal. Firebase `securetoken` POST for token refresh is allowed.
