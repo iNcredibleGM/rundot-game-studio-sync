@@ -401,7 +401,7 @@ try {
 
 
     # --------------------------------------------------------------------------
-    # Publish policy: only a utf8 text overwrite may be applicable
+    # Publish policy: utf8 text overwrite and text create may be applicable
     # --------------------------------------------------------------------------
 
     $guardBase = @{
@@ -481,11 +481,26 @@ try {
 
     $textCreate = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/new.ts'
     Assert-Equal 'upload' $textCreate.status "a new local text file must still display as upload"
-    Assert-Equal $false $textCreate.applicable "a text create must not be applicable"
-    Assert-Equal `
-        'PUT /file cannot create a new path; a missing remote file returns 404.' `
-        ([string]$textCreate.reason) `
-        "a text create must explain that PUT is overwrite-only"
+    Assert-Equal $true $textCreate.applicable "a clean utf8 text create must be applicable"
+    Assert-Null $textCreate.reason "a publishable text create must not carry a block reason"
+
+    $blockedCreateLocal = @{
+        '.rundot/blocked.txt' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC)
+    }
+    $blockedCreateArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $guardResolution `
+        -Local $blockedCreateLocal `
+        -Remote @{} `
+        -Snapshot $snapshot
+    $blockedCreateRow = Get-SyncPlanTestRowForPath `
+        -Rows @($blockedCreateArtifact.operations) `
+        -Path '.rundot/blocked.txt'
+    Assert-Equal $false $blockedCreateRow.applicable "a reserved-path text create must not be applicable"
+    Assert-True `
+        ([string]$blockedCreateRow.reason -match 'Reserved path') `
+        "a reserved-path text create must explain the refusal"
 
     $binaryUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'public/x.png'
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"

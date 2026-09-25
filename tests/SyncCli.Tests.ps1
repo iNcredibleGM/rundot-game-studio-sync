@@ -485,14 +485,23 @@ Assert-True `
 # Push delete wiring: the documented DELETE route stays explicit and confirmed
 # --------------------------------------------------------------------------
 
-foreach ($requiredDeleteLibrary in @(
+foreach ($requiredPushLibrary in @(
     'RemoteDelete.ps1'
+    'RemoteUpload.ps1'
+    'RemoteMove.ps1'
+    'RemoteTextCreate.ps1'
 )) {
     Assert-True `
-        ($syncCliSource -match [regex]::Escape($requiredDeleteLibrary)) `
-        "the CLI should load lib\$requiredDeleteLibrary"
+        ($syncCliSource -match [regex]::Escape($requiredPushLibrary)) `
+        "the CLI should load lib\$requiredPushLibrary"
 }
 
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushCreateConfirmation')) `
+    "the CLI should define Read-RundotSyncPushCreateConfirmation for Push creates"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmCreate')) `
+    "the CLI should hand the create prompt to the engine"
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushDeleteConfirmation')) `
     "the CLI should define Read-RundotSyncPushDeleteConfirmation for Push deletes"
@@ -505,6 +514,9 @@ Assert-True `
 
 # The delete confirmation must be its own deliberate prompt, not a silent
 # extension of the overwrite prompt.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Push will CREATE')) `
+    "the create confirmation must say what will be created"
 Assert-True `
     ($syncCliSource -match [regex]::Escape('Push will DELETE')) `
     "the delete confirmation must say what will be removed"

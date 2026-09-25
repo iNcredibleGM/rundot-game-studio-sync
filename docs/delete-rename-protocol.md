@@ -8,8 +8,9 @@ without notice.
 This document is the **evidence** behind the delete route. The product now
 implements one of these verbs: `DELETE /api/projects/{id}/file` is applied by a
 confirmed `Push` for a route-allowed `deleteRemoteCandidate` row
-([delete.md](delete.md)), in `lib/RemoteDelete.ps1`. Rename (`POST /move`)
-remains evidence only and is not emitted by any command. The four constraints
+([delete.md](delete.md)), in `lib/RemoteDelete.ps1`. `POST /move` is emitted
+only for utf8 text create placement (#40) in `lib/RemoteMove.ps1`; rename
+publish is not implemented. The four constraints
 below still govern the implementation, and the client-side guard they require
 is what `Push` performs.
 

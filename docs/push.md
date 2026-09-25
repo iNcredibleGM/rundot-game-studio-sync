@@ -1,13 +1,14 @@
 # Safe Push
 
 `Push` is the only command that writes to REMOTE. It consumes the last `Plan`
-artifact, re-verifies every fingerprint, and applies two classifications:
-a clean utf8 text overwrite via documented `PUT /file`, and a
+artifact, re-verifies every fingerprint, and applies three classifications:
+a clean utf8 text overwrite via documented `PUT /file`, a utf8 text create via
+the documented upload + move + `PUT /file` place sequence, and a
 `deleteRemoteCandidate` via documented `DELETE /file`.
 
-`Push` never changes LOCAL files, never creates remote files, and never uploads
-binaries ([classifier.md](classifier.md), [text-write-protocol.md](text-write-protocol.md),
-[delete.md](delete.md)).
+`Push` never changes LOCAL files and never uploads binaries
+([classifier.md](classifier.md), [text-write-protocol.md](text-write-protocol.md),
+[text-create.md](text-create.md), [delete.md](delete.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
@@ -30,20 +31,23 @@ binaries ([classifier.md](classifier.md), [text-write-protocol.md](text-write-pr
    LOCAL manifest hash, and REMOTE manifest hashes. Any drift refuses the
    whole run.
 7. **Select.** An applicable `upload` row that is still a clean utf8 text
-   overwrite, or an applicable `deleteRemoteCandidate` row that is still a
-   clean remote delete, may be published. Every other plan row is reported in
-   `SKIPPED` with a reason.
+   overwrite or create, or an applicable `deleteRemoteCandidate` row that is
+   still a clean remote delete, may be published. Every other plan row is
+   reported in `SKIPPED` with a reason.
 8. **Confirm.** If any publishable row remains, Push prints the remote
-   overwrite list, then the delete list, and requires the whole word `yes` for
-   each. Both confirmations are collected before any backup or mutation.
+   overwrite list, then the create list, then the delete list, and requires
+   the whole word `yes` for each. All confirmations are collected before any
+   backup or mutation.
 9. **Back up.** Every remote original that will be replaced **or deleted** is
    copied into a backup set first. A backup failure aborts the push before any
    `PUT` or `DELETE`.
 10. **Apply.** For each selected overwrite: re-hash LOCAL, `GET` remote, verify
     `expectedRemoteHash`, `PUT` utf8 text, echo-verify the response hash. For
-    each selected delete: re-read remote and verify `expectedRemoteHash`,
-    `DELETE`, then prove the path is absent from `GET /files`.
-11. **Update BASE.** After every write and delete succeeds, BASE is overlaid
+    each selected create: prove the path is absent, run the upload + move +
+    `PUT /file` sequence, echo-verify. For each selected delete: re-read remote
+    and verify `expectedRemoteHash`, `DELETE`, then prove the path is absent
+    from `GET /files`.
+11. **Update BASE.** After every write, create, and delete succeeds, BASE is overlaid
     additively with the published local identities, and each deleted path is
     **dropped** from BASE.
 12. **Journal and prune.** Metadata-only records are appended, then old backup
@@ -51,11 +55,12 @@ binaries ([classifier.md](classifier.md), [text-write-protocol.md](text-write-pr
 
 ## Allowed automatic remote writes
 
-Two classifications may be published:
+Three classifications may be published:
 
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
-| A | B | A | `upload` (utf8 text) | applies |
+| A | B | A | `upload` (utf8 text overwrite) | applies |
+| — | A | — | `upload` (utf8 text create) | applies |
 | A | — | A | `deleteRemoteCandidate` | applies |
 
 `BASE=A LOCAL=B REMOTE=A` means LOCAL moved on while REMOTE still matched the
@@ -70,7 +75,7 @@ route and its own client-side guard; see [delete.md](delete.md).
 
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
-| — | A | — | `upload` (text create) | skipped: no create route |
+| — | A | — | `upload` (text create) | applies |
 | — | A | — | `upload` (binary) | skipped: binary blocked |
 | A | A | B | `download` | skipped: Push never downloads |
 | A | B | C | `conflict` | skipped: no safe direction |
@@ -82,17 +87,18 @@ route and its own client-side guard; see [delete.md](delete.md).
 Every skipped path is printed with its status and a reason. A skipped path is
 never a silent no-op.
 
-The plan artifact may mark only utf8 text overwrites and route-allowed remote
-deletes as `applicable: true` ([plan.md](plan.md)). Even when a row is
+The plan artifact may mark utf8 text overwrites, utf8 text creates, and
+route-allowed remote deletes as `applicable: true` ([plan.md](plan.md)). Even when a row is
 applicable in the artifact, Push re-classifies it live and refuses the whole run
 if it is no longer the clean action it was planned as.
 
 ## Confirmation and `-ForcePush`
 
 If any remote text file would be overwritten, Push prints the count and the
-paths, and requires the whole word `yes` before continuing. If any remote file
-would be deleted, Push prints a second, separate list and requires `yes` again:
-accepting an overwrite never accepts a delete. Anything declined cancels the
+paths, and requires the whole word `yes` before continuing. If any remote text
+file would be created, Push prints a separate list and requires `yes` again. If
+any remote file would be deleted, Push prints a third list and requires `yes`:
+accepting an overwrite never accepts a create or delete. Anything declined cancels the
 run: no `PUT` or `DELETE` runs, no backup set is created, BASE does not move,
 and no journal record is written.
 

@@ -40,7 +40,8 @@ route** was found among guessed API shapes; `PUT /file` remains overwrite-only
 (#14). Studio’s UI does not expose a new text-file create (and does not offer
 text upload; binary upload is separate). New source text at a chosen path was
 observed only through the **API**: unique **upload adopt**, **`POST /move`**, then
-**`PUT /file`** for exact bytes. Nothing in the product creates remote text files.
+**`PUT /file`** for exact bytes. A confirmed `Push` applies this for applicable
+utf8 text creates in `lib/RemoteTextCreate.ps1` ([text-create.md](text-create.md)).
 
 ## Delete file
 
@@ -57,7 +58,7 @@ route, so the guard is client-side ([delete.md](delete.md)). A rename or move is
 `POST /api/projects/{id}/move` with `{from,to}`, characterized in
 [delete-rename-protocol.md](delete-rename-protocol.md). It honors an arbitrary
 destination path, preserves bytes, and refuses to overwrite an existing
-destination with `409 ALREADY_EXISTS`. Rename is not emitted by any command.
+destination with `409 ALREADY_EXISTS`. `POST /move` is emitted only for utf8 text create placement (#40), not for renames.
 
 ## Move / rename file
 
@@ -98,8 +99,9 @@ supported tool. Three findings dominate: the requested `path` is **ignored**,
 so the file is always recorded at `/uploads/{basename}`; a repeated filename
 **never replaces** the existing file, it creates a numeric-suffixed sibling
 (`name-1.png`); and the flow **can create a text file** at that path, which
-`PUT /file` cannot. Replacement was not achievable by any attempt. Nothing in
-the product calls these routes.
+`PUT /file` cannot. Replacement was not achievable by any attempt. The upload
+and adopt routes are called only from `lib/RemoteUpload.ps1` for utf8 text
+create (#40); binary placement (#41) remains refused.
 
 ## Place a binary at a chosen project path
 

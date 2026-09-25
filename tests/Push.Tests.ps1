@@ -21,6 +21,9 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\RemoteWrite.ps1")
 . (Join-Path $repoRoot "lib\RemoteDelete.ps1")
+. (Join-Path $repoRoot "lib\RemoteUpload.ps1")
+. (Join-Path $repoRoot "lib\RemoteMove.ps1")
+. (Join-Path $repoRoot "lib\RemoteTextCreate.ps1")
 . (Join-Path $repoRoot "lib\Push.ps1")
 
 $pushTestShaA = 'a' * 64
@@ -579,6 +582,33 @@ try {
     Assert-Equal 1 $selection.Actions.Count 'only one text overwrite may be selected'
     Assert-Equal 'src/text.ts' $selection.Actions[0].Path 'the text overwrite path must be selected'
     Assert-Equal 4 $selection.Excluded.Count 'every non-applicable plan row must be excluded with a reason'
+
+    $createOnlyLocal = @{
+        'src/new.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaC)
+    }
+    $createOnlyBase = @{
+        'src/text.ts' = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+    }
+    $createOnlyArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $gateWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $createOnlyLocal) `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path 'src/new.ts' `
+                -LocalSha256 $pushTestShaC `
+                -RemoteSha256 $null `
+                -ExpectedRemoteHash $null `
+                -Applicable $true)
+        )
+    $createSelection = Get-SyncPushSelection `
+        -Artifact $createOnlyArtifact `
+        -Base $createOnlyBase `
+        -Local $createOnlyLocal `
+        -Remote @{}
+
+    Assert-Equal 0 $createSelection.Actions.Count 'a text create must not land in overwrite actions'
+    Assert-Equal 1 $createSelection.CreateActions.Count 'a text create must be selected for create'
+    Assert-Equal 'src/new.ts' $createSelection.CreateActions[0].Path 'the create path must be selected'
 
     $conflictExcluded = @($selection.Excluded | Where-Object { [string]$_.Path -eq 'src/conflict.ts' })
     Assert-Equal 1 $conflictExcluded.Count 'a conflict row must appear in SKIPPED'

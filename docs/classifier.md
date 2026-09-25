@@ -13,12 +13,13 @@ or any input map. `Plan`/`Status` ([#9](https://github.com/iNcredibleGM/rundot-g
 compose it ([plan.md](plan.md)); `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
 filters its rows for applicable downloads, and `Push`
 ([#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17))
-filters plan rows for applicable utf8 text overwrites ([push.md](push.md)).
+filters plan rows for applicable utf8 text overwrites and creates ([push.md](push.md)).
 
 `Applicable` is the classifier's own view of a path. `Plan` is stricter for
-publish work: only a utf8 text **overwrite** may stay `applicable: true` in the
-artifact. Text creates, binary uploads, and delete candidates are forced to
-`applicable: false` with explicit reasons ([plan.md](plan.md)). A plan is never
+publish work: utf8 text **overwrites** and **creates**, plus route-allowed
+remote deletes, may stay `applicable: true` in the artifact. Binaries and
+refused paths are forced to `applicable: false` with explicit reasons
+([plan.md](plan.md)). A plan is never
 permission to write: `Push` must still re-verify every fingerprint.
 
 ## Inputs
@@ -79,9 +80,9 @@ constants so `Plan` renders one source of truth.
 | `deleteLocalCandidate` | REMOTE gone, LOCAL still matches BASE | no |
 
 `Applicable` is about **what a confirmed command may apply**, not about
-correctness: this version can publish a utf8 text overwrite and apply a
-route-allowed remote delete via `Push` ([delete.md](delete.md)). It never
-creates files, uploads binaries, or deletes a local file, so a
+correctness: this version can publish a utf8 text overwrite, create a utf8 text
+file, and apply a route-allowed remote delete via `Push` ([text-create.md](text-create.md),
+[delete.md](delete.md)). It never uploads binaries or deletes a local file, so a
 `deleteLocalCandidate` is classified but never actionable. A reserved or
 directory-shaped delete candidate is classified but refused by the route rules.
 
