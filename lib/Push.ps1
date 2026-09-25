@@ -1,10 +1,12 @@
-# Safe Push: publish clean local text overwrites and confirmed remote deletes.
+# Safe Push: publish clean local text overwrites, utf8 text creates, and
+# confirmed remote deletes.
 #
-# Push applies two classifications from a verified plan artifact: a clean text
-# overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set) and a
-# remote delete (BASE=A LOCAL=- REMOTE=A, expectedRemoteHash set, path not
-# reserved and not directory-shaped). Creates, binaries, conflicts, and kind
-# mismatches are refused.
+# Push applies three classifications from a verified plan artifact: a clean text
+# overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set), a
+# utf8 text create (BASE=- LOCAL=A REMOTE=-, documented upload + move + PUT /file), and
+# a remote delete (BASE=A LOCAL=- REMOTE=A, expectedRemoteHash set, path not
+# reserved and not directory-shaped). Binaries, conflicts, and kind mismatches
+# are refused.
 #
 # A delete cannot be made conditional: Studio exposes no ETag or version and
 # ignores If-Match (docs/delete-rename-protocol.md), so the guard is a client
@@ -21,7 +23,8 @@
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
 # Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1, Journal.ps1,
-# RemoteApi.ps1, RemoteWrite.ps1, RemoteDelete.ps1, and Push.ps1 first.
+# RemoteApi.ps1, RemoteWrite.ps1, RemoteDelete.ps1, RemoteUpload.ps1,
+# RemoteMove.ps1, RemoteTextCreate.ps1, and Push.ps1 first.
 
 
 # ----------------------------------------------------------------------------
@@ -223,6 +226,7 @@ function Get-SyncPushSelection {
     )
 
     $actions = New-Object 'System.Collections.Generic.List[object]'
+    $creates = New-Object 'System.Collections.Generic.List[object]'
     $deletes = New-Object 'System.Collections.Generic.List[object]'
     $excluded = New-Object 'System.Collections.Generic.List[object]'
     $remotePaths = @(Get-SyncPlanRemotePaths -Remote $Remote)
@@ -326,14 +330,6 @@ function Get-SyncPushSelection {
         }
 
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
-        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
-
-        if ($localKind -ne 'utf8' -or $remoteKind -ne 'utf8') {
-            throw [System.InvalidOperationException]::new(
-                ("Refusing to push: '{0}' is not a utf8 text overwrite." -f $path)
-            )
-        }
-
         $planLocalSha = [string]$operation.localSha256
         $liveLocalSha = [string](Get-SyncEntrySha256 -Entry $localEntry)
         if (-not (Test-SyncHashEqual -LeftSha256 $planLocalSha -RightSha256 $liveLocalSha)) {
@@ -343,13 +339,53 @@ function Get-SyncPushSelection {
         }
 
         $expectedRemoteSha = [string]$operation.expectedRemoteHash
-        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
         if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+            if ($localKind -ne 'utf8') {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is not a utf8 text create." -f $path)
+                )
+            }
+
+            if ($null -ne $baseEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: BASE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            if ($null -ne $remoteEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            $createRefusal = Get-SyncTextCreatePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $remotePaths
+            if (-not [string]::IsNullOrEmpty($createRefusal)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is no longer a publishable text create. {1}" -f $path, $createRefusal)
+                )
+            }
+
+            $creates.Add([pscustomobject]@{
+                Path        = $path
+                Status      = $status
+                Kind        = $localKind
+                LocalSha256 = $planLocalSha
+            })
+
+            continue
+        }
+
+        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
+
+        if ($localKind -ne 'utf8' -or $remoteKind -ne 'utf8') {
             throw [System.InvalidOperationException]::new(
-                ("Refusing to push: '{0}' has no expectedRemoteHash to verify." -f $path)
+                ("Refusing to push: '{0}' is not a utf8 text overwrite." -f $path)
             )
         }
 
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
         if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
             throw [System.InvalidOperationException]::new(
                 ("Refusing to push: REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
@@ -371,6 +407,11 @@ function Get-SyncPushSelection {
         $actionRows = $actions.ToArray()
     }
 
+    $createRows = @()
+    if ($creates.Count -gt 0) {
+        $createRows = $creates.ToArray()
+    }
+
     $deleteRows = @()
     if ($deletes.Count -gt 0) {
         $deleteRows = $deletes.ToArray()
@@ -383,6 +424,7 @@ function Get-SyncPushSelection {
 
     return [pscustomobject]@{
         Actions       = $actionRows
+        CreateActions = $createRows
         DeleteActions = $deleteRows
         Excluded      = $excludedRows
     }
@@ -656,6 +698,58 @@ function Invoke-RundotSyncPushWriteAction {
     }
 }
 
+function Invoke-RundotSyncPushCreateAction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        $Action,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$InvokeTextCreate = $null
+    )
+
+    $path = [string]$Action.Path
+
+    if ($null -eq $InvokeTextCreate) {
+        $InvokeTextCreate = {
+            param($Ws, $Canonical, $Sha, $Origin, $Id, $Hdr, $GetFile, $PutFile)
+            Invoke-RemoteTextCreate `
+                -WorkspaceRoot $Ws `
+                -CanonicalPath $Canonical `
+                -LocalSha256 $Sha `
+                -StudioOrigin $Origin `
+                -ProjectId $Id `
+                -Headers $Hdr `
+                -GetRemoteFile $GetFile `
+                -PutRemoteFile $PutFile
+        }
+    }
+
+    return & $InvokeTextCreate `
+        $WorkspaceRoot `
+        $path `
+        ([string]$Action.LocalSha256) `
+        $StudioOrigin `
+        $ProjectId `
+        $Headers `
+        $GetRemoteFile `
+        $PutRemoteFile
+}
+
 function Invoke-RundotSyncDeleteAction {
     # Remove exactly one remote file. The order matters and cannot be
     # rearranged: the route is unversioned, so the remote bytes are re-read and
@@ -784,6 +878,9 @@ function Invoke-RundotSyncPushApply {
         [AllowEmptyCollection()]
         [object[]]$DeleteActions = @(),
 
+        [AllowEmptyCollection()]
+        [object[]]$CreateActions = @(),
+
         [scriptblock]$GetRemoteFile = $null,
 
         [scriptblock]$PutRemoteFile = $null,
@@ -792,18 +889,24 @@ function Invoke-RundotSyncPushApply {
 
         [scriptblock]$GetRemoteFileList = $null,
 
-        [scriptblock]$CopyBackupFile = $null
+        [scriptblock]$CopyBackupFile = $null,
+
+        [scriptblock]$InvokeTextCreate = $null
     )
 
     $actionRows = @($Actions)
+    $createRows = @($CreateActions)
     $deleteRows = @($DeleteActions)
 
-    if ($actionRows.Count -eq 0 -and $deleteRows.Count -eq 0) {
+    if ($actionRows.Count -eq 0 -and $createRows.Count -eq 0 -and $deleteRows.Count -eq 0) {
         return [pscustomobject]@{
             AppliedActions = @()
             AppliedLocals  = @()
+            CreatedActions = @()
+            CreatedLocals  = @()
             DeletedActions = @()
             Applied        = 0
+            Created        = 0
             Deleted        = 0
             BackupSet      = $null
             BackupSetPath  = $null
@@ -838,6 +941,20 @@ function Invoke-RundotSyncPushApply {
             -LocalFullPath $localFullPath
     }
 
+    foreach ($action in $createRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
     $remotePaths = @()
     foreach ($action in $deleteRows) {
         $path = [string]$action.Path
@@ -851,6 +968,8 @@ function Invoke-RundotSyncPushApply {
 
     $appliedActions = New-Object 'System.Collections.Generic.List[object]'
     $appliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    $createdActions = New-Object 'System.Collections.Generic.List[object]'
+    $createdLocals = New-Object 'System.Collections.Generic.List[object]'
     $deletedActions = New-Object 'System.Collections.Generic.List[object]'
 
     try {
@@ -894,6 +1013,21 @@ function Invoke-RundotSyncPushApply {
             [void]$appliedLocals.Add($appliedLocal)
         }
 
+        foreach ($action in $createRows) {
+            $createdLocal = Invoke-RundotSyncPushCreateAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile `
+                -InvokeTextCreate $InvokeTextCreate
+
+            [void]$createdActions.Add($action)
+            [void]$createdLocals.Add($createdLocal)
+        }
+
         foreach ($action in $deleteRows) {
             $deleted = Invoke-RundotSyncDeleteAction `
                 -WorkspaceRoot $WorkspaceRoot `
@@ -916,15 +1050,27 @@ function Invoke-RundotSyncPushApply {
             $originalError
         )
         $wrapper.Data['PushAppliedCount'] = $appliedActions.Count
+        $wrapper.Data['PushCreatedCount'] = $createdActions.Count
         $wrapper.Data['PushDeletedCount'] = $deletedActions.Count
         throw $wrapper
     }
 
+    $allAppliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($local in @($appliedLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+    foreach ($local in @($createdLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+
     return [pscustomobject]@{
         AppliedActions = @($appliedActions.ToArray())
-        AppliedLocals  = @($appliedLocals.ToArray())
+        AppliedLocals  = @($allAppliedLocals.ToArray())
+        CreatedActions = @($createdActions.ToArray())
+        CreatedLocals  = @($createdLocals.ToArray())
         DeletedActions = @($deletedActions.ToArray())
         Applied        = $appliedActions.Count
+        Created        = $createdActions.Count
         Deleted        = $deletedActions.Count
         BackupSet      = $backupSet
         BackupSetPath  = $BackupSetPath
@@ -1057,6 +1203,10 @@ function Format-SyncPushReport {
 
         [int]$Applied = 0,
 
+        [object[]]$CreatedActions = $null,
+
+        [int]$Created = 0,
+
         [object[]]$DeletedActions = $null,
 
         [int]$Deleted = 0,
@@ -1088,15 +1238,16 @@ function Format-SyncPushReport {
     }
 
     $actionRows = @($AppliedActions)
+    $createdRows = @($CreatedActions)
     $deletedRows = @($DeletedActions)
     $skippedRows = @($Skipped)
     if ($null -eq $Skipped -and $null -ne $Selection) {
         $skippedRows = @($Selection.Excluded)
     }
 
-    if ($actionRows.Count -eq 0 -and $deletedRows.Count -eq 0) {
+    if ($actionRows.Count -eq 0 -and $createdRows.Count -eq 0 -and $deletedRows.Count -eq 0) {
         [void]$lines.Add('')
-        [void]$lines.Add('Nothing to push: no publishable overwrite or confirmed delete remains in this plan.')
+        [void]$lines.Add('Nothing to push: no publishable overwrite, text create, or confirmed delete remains in this plan.')
         [void]$lines.Add('BASE was not updated.')
     }
     else {
@@ -1105,6 +1256,14 @@ function Format-SyncPushReport {
             [void]$lines.Add('APPLIED')
             foreach ($action in $actionRows) {
                 [void]$lines.Add(('  {0}  (overwrite)' -f [string]$action.Path))
+            }
+        }
+
+        if ($createdRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('CREATED')
+            foreach ($action in $createdRows) {
+                [void]$lines.Add(('  {0}  (create)' -f [string]$action.Path))
             }
         }
 
@@ -1129,6 +1288,7 @@ function Format-SyncPushReport {
     [void]$lines.Add('')
     [void]$lines.Add('SUMMARY')
     [void]$lines.Add(('  applied:      {0}' -f $Applied))
+    [void]$lines.Add(('  created:      {0}' -f $Created))
     [void]$lines.Add(('  deleted:      {0}' -f $Deleted))
     [void]$lines.Add(('  skipped:      {0}' -f $skippedRows.Count))
     [void]$lines.Add(('  BASE updated: {0}' -f ([bool]$BaseUpdated).ToString().ToLowerInvariant()))
@@ -1181,6 +1341,8 @@ function Invoke-RundotSyncPush {
 
         [scriptblock]$ConfirmDelete = $null,
 
+        [scriptblock]$ConfirmCreate = $null,
+
         [switch]$Force,
 
         [scriptblock]$GetRemoteFile = $null,
@@ -1208,6 +1370,7 @@ function Invoke-RundotSyncPush {
         -Remote $Remote
 
     $actions = @($selection.Actions)
+    $createActions = @($selection.CreateActions)
     $deleteActions = @($selection.DeleteActions)
     $planId = [string]$Artifact.planId
     $backupRoot = Get-RundotSyncBackupRoot -WorkspaceRoot $WorkspaceRoot
@@ -1215,12 +1378,14 @@ function Invoke-RundotSyncPush {
     $cancelledResult = {
         return [pscustomobject]@{
             Applied        = 0
+            Created        = 0
             Deleted        = 0
             Cancelled      = $true
             BaseUpdated    = $false
             PlanId         = $planId
             Selection      = $selection
             AppliedActions = @()
+            CreatedActions = @()
             DeletedActions = @()
             Report         = (Format-SyncPushReport `
                 -Selection $selection `
@@ -1247,6 +1412,20 @@ function Invoke-RundotSyncPush {
         }
     }
 
+    if ($createActions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmCreate) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote text file(s) would be created. " -f $createActions.Count) +
+                'Confirm the create, or pass -ForcePush to proceed.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmCreate $createActions.Count @($createActions | ForEach-Object { [string]$_.Path }))
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
     # A delete is unrecoverable from Studio, so it gets its own confirmation
     # even when the overwrite half was accepted.
     if ($deleteActions.Count -gt 0 -and -not $Force) {
@@ -1264,15 +1443,17 @@ function Invoke-RundotSyncPush {
         }
     }
 
-    if ($actions.Count -eq 0 -and $deleteActions.Count -eq 0) {
+    if ($actions.Count -eq 0 -and $createActions.Count -eq 0 -and $deleteActions.Count -eq 0) {
         return [pscustomobject]@{
             Applied        = 0
+            Created        = 0
             Deleted        = 0
             Cancelled      = $false
             BaseUpdated    = $false
             PlanId         = $planId
             Selection      = $selection
             AppliedActions = @()
+            CreatedActions = @()
             DeletedActions = @()
             Report         = (Format-SyncPushReport `
                 -Selection $selection `
@@ -1287,6 +1468,7 @@ function Invoke-RundotSyncPush {
         $applyResult = Invoke-RundotSyncPushApply `
             -WorkspaceRoot $WorkspaceRoot `
             -Actions $actions `
+            -CreateActions $createActions `
             -DeleteActions $deleteActions `
             -StudioOrigin $StudioOrigin `
             -ProjectId $ProjectId `
@@ -1307,6 +1489,10 @@ function Invoke-RundotSyncPush {
         if ($applyError.Data.Contains('PushDeletedCount')) {
             $deletedBeforeFailure = [int]$applyError.Data['PushDeletedCount']
         }
+        $createdBeforeFailure = 0
+        if ($applyError.Data.Contains('PushCreatedCount')) {
+            $createdBeforeFailure = [int]$applyError.Data['PushCreatedCount']
+        }
 
         try {
             Add-RundotSyncJournalRecord `
@@ -1319,6 +1505,7 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $appliedBeforeFailure
                     overwritten = $appliedBeforeFailure
+                    created     = $createdBeforeFailure
                     deleted     = $deletedBeforeFailure
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
@@ -1339,11 +1526,13 @@ function Invoke-RundotSyncPush {
 
     $deletedPaths = @($applyResult.DeletedActions | ForEach-Object { [string]$_.Path })
 
+    $baseUpdateActions = @($applyResult.AppliedActions) + @($applyResult.CreatedActions)
+
     try {
         Update-RundotSyncBaseAfterPush `
             -WorkspaceRoot $WorkspaceRoot `
             -ProjectId $ProjectId `
-            -AppliedActions $applyResult.AppliedActions `
+            -AppliedActions $baseUpdateActions `
             -AppliedLocals $applyResult.AppliedLocals `
             -DeletedPaths $deletedPaths `
             -BaseFiles $baseFiles | Out-Null
@@ -1358,6 +1547,7 @@ function Invoke-RundotSyncPush {
                 backupSet   = [string]$backupSet.Name
                 applied     = $applyResult.Applied
                 overwritten = $applyResult.Applied
+                created     = $applyResult.Created
                 deleted     = $applyResult.Deleted
                 skipped     = @($selection.Excluded).Count
                 baseUpdated = $true
@@ -1367,6 +1557,19 @@ function Invoke-RundotSyncPush {
             Add-RundotSyncJournalRecord `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Event 'push-backup' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.CreatedActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-create' `
                 -Record @{
                     status    = 'success'
                     projectId = $ProjectId
@@ -1401,6 +1604,7 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $applyResult.Applied
                     overwritten = $applyResult.Applied
+                    created     = $applyResult.Created
                     deleted     = $applyResult.Deleted
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
@@ -1425,12 +1629,14 @@ function Invoke-RundotSyncPush {
 
     return [pscustomobject]@{
         Applied        = [int]$applyResult.Applied
+        Created        = [int]$applyResult.Created
         Deleted        = [int]$applyResult.Deleted
         Cancelled      = $false
         BaseUpdated    = $true
         PlanId         = $planId
         Selection      = $selection
         AppliedActions = @($applyResult.AppliedActions)
+        CreatedActions = @($applyResult.CreatedActions)
         DeletedActions = @($applyResult.DeletedActions)
         BackupSet      = $backupSet
         BackupSetPath  = [string]$backupSet.Path
@@ -1440,6 +1646,8 @@ function Invoke-RundotSyncPush {
             -Selection $selection `
             -AppliedActions $applyResult.AppliedActions `
             -Applied $applyResult.Applied `
+            -CreatedActions $applyResult.CreatedActions `
+            -Created $applyResult.Created `
             -DeletedActions $applyResult.DeletedActions `
             -Deleted $applyResult.Deleted `
             -BaseUpdated $true `

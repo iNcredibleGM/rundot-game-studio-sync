@@ -98,6 +98,9 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteDelete.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteUpload.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteMove.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteTextCreate.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
@@ -544,6 +547,39 @@ function Read-RundotSyncPushConfirmation {
     )
 }
 
+function Read-RundotSyncPushCreateConfirmation {
+    param(
+        [int]$CreateCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will CREATE $CreateCount remote text file(s) on Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each path is checked absent immediately before create. There is no remote backup for a new file."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "CREATE $CreateCount remote file(s)?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Read-RundotSyncPushDeleteConfirmation {
     # A delete is not recoverable from Studio, so it gets its own deliberate
     # confirmation even when overwrites were already confirmed. The user must
@@ -649,6 +685,11 @@ function Invoke-SyncPushCommand {
 
     # A delete gets its own confirmation so declining it changes nothing even
     # when the overwrite half was accepted.
+    $ConfirmCreate = {
+        param($CreateCount, $Paths)
+        return (Read-RundotSyncPushCreateConfirmation -CreateCount $CreateCount -Paths $Paths)
+    }
+
     $ConfirmDelete = {
         param($DeleteCount, $Paths)
         return (Read-RundotSyncPushDeleteConfirmation -DeleteCount $DeleteCount -Paths $Paths)
@@ -681,6 +722,7 @@ function Invoke-SyncPushCommand {
             -StudioOrigin $Origin `
             -Headers $Headers `
             -ConfirmOverwrite $ConfirmOverwrite `
+            -ConfirmCreate $ConfirmCreate `
             -ConfirmDelete $ConfirmDelete `
             -Force:$Force
 

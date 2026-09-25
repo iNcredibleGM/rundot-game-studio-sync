@@ -12,10 +12,36 @@ $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
 # Push consumes plan fingerprints but a plan is never permission to write.
-# Only a clean text overwrite and a route-allowed remote delete may be marked
-# applicable; creates, binaries, and refused deletes stay blocked with reasons.
+# A clean text overwrite, a route-allowed utf8 text create, and a route-allowed
+# remote delete may be marked applicable; binaries and refused deletes stay
+# blocked with reasons.
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
 $script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
+
+function Get-SyncTextCreatePathRefusalReason {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath,
+
+        [AllowNull()]
+        [string[]]$RemotePaths
+    )
+
+    $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
+    if (-not [string]::IsNullOrEmpty($reservedRoot)) {
+        return (
+            "Reserved path '$reservedRoot': a text create never touches sync state or repository metadata."
+        )
+    }
+
+    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+        return (
+            'Directory-shaped path: a text create must target a new file path, not a directory prefix.'
+        )
+    }
+
+    return $null
+}
 
 $script:SyncPlanDryRunClosingLines = @(
     'Dry run only. No remote files were modified.'
@@ -158,8 +184,18 @@ function Get-SyncPlanOperationRows {
                 }
                 elseif ($localKind -eq 'utf8') {
                     if ([string]::IsNullOrEmpty($remoteSha)) {
-                        $applicable = $false
-                        $reason = $script:SyncPlanTextCreateReason
+                        $createRefusal = Get-SyncTextCreatePathRefusalReason `
+                            -CanonicalPath $path `
+                            -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+
+                        if ([string]::IsNullOrEmpty($createRefusal)) {
+                            $applicable = $true
+                            $reason = $null
+                        }
+                        else {
+                            $applicable = $false
+                            $reason = $createRefusal
+                        }
                     }
                 }
                 else {

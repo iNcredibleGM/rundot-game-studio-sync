@@ -8,9 +8,9 @@ A delete candidate means LOCAL no longer has the path while REMOTE still matches
 the last verified shared state. REMOTE owns no change, so removing it destroys
 nothing that was not already gone locally.
 
-`Push` never deletes LOCAL files, never creates remote files, and never uploads
-binaries. Text creates, binary placement, conflict clobber, and rename
-detection stay out of scope.
+`Push` never deletes LOCAL files and never uploads binaries. Binary placement,
+conflict clobber, and rename detection stay out of scope. Utf8 text creates are
+documented separately ([text-create.md](text-create.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan

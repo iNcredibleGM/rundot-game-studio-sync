@@ -192,10 +192,9 @@ That sequence is still not safe to call blindly:
 
 ## Consequence for [#40](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/40)
 
-This issue does **not** implement `Push` text creates. A trustworthy create,
-if #40 adopts it, is: unique upload, `POST /move` onto an absent path, then
-`PUT /file` so BOM and empty files match the local bytes. Product text creates
-stay **`applicable: false`** until that issue lands.
+`Push` implements this place sequence for applicable utf8 text creates:
+unique upload, `POST /move` onto an absent path, then `PUT /file` so BOM and
+empty files match the local bytes. Product contract: [text-create.md](text-create.md).
 
 ## How this was observed
 

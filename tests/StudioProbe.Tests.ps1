@@ -418,7 +418,9 @@ if (Test-Path $libRoot) {
     )
 }
 
-$reachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe|upload-adopt|upload-url'
+$probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
+$uploadReachabilityPattern = '(?i)upload-adopt|upload-url'
+$allowedUploadRelative = 'lib/RemoteUpload.ps1'
 
 foreach ($productPath in $productPaths) {
     if (-not (Test-Path $productPath)) {
@@ -426,8 +428,13 @@ foreach ($productPath in $productPaths) {
     }
 
     $relative = $productPath.Substring($repoRoot.Length).TrimStart("\", "/")
+    $normalizedRelative = $relative -replace '\\', '/'
     $text = Get-Content -Path $productPath -Raw
-    $matches = [regex]::Matches($text, $reachabilityPattern)
+    $matches = [regex]::Matches($text, $probeReachabilityPattern)
+
+    if ($normalizedRelative -ne $allowedUploadRelative) {
+        $matches += [regex]::Matches($text, $uploadReachabilityPattern)
+    }
 
     Assert-Equal 0 $matches.Count (
         "product file $relative must not reference the probe or Studio upload endpoints"

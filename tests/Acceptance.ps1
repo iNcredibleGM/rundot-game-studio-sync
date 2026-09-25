@@ -502,8 +502,13 @@ $httpMovePattern = '(?i)/move\b|projects/\{[^}]+\}/move'
 $setFunctionPattern = '(?im)^\s*function\s+Set-'
 $removeFunctionPattern = '(?im)^\s*function\s+Remove-'
 $probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
-$allowedPutRelative = 'lib/RemoteWrite.ps1'
+$allowedUploadRelative = 'lib/RemoteUpload.ps1'
+$allowedPutRelatives = @(
+    'lib/RemoteWrite.ps1'
+    'lib/RemoteUpload.ps1'
+)
 $allowedDeleteRelative = 'lib/RemoteDelete.ps1'
+$allowedMoveRelative = 'lib/RemoteMove.ps1'
 
 $mutationHits = New-Object 'System.Collections.Generic.List[string]'
 foreach ($file in $productFiles) {
@@ -511,11 +516,13 @@ foreach ($file in $productFiles) {
     $relative = $file.FullName.Substring($repoRoot.Length).TrimStart("\", "/")
     $normalizedRelative = $relative -replace '\\', '/'
 
-    foreach ($match in [regex]::Matches($text, $uploadPattern)) {
-        [void]$mutationHits.Add("${relative}: Studio upload endpoint '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedUploadRelative) {
+        foreach ($match in [regex]::Matches($text, $uploadPattern)) {
+            [void]$mutationHits.Add("${relative}: Studio upload endpoint '$($match.Value)'")
+        }
     }
 
-    if ($normalizedRelative -ne $allowedPutRelative) {
+    if ($allowedPutRelatives -notcontains $normalizedRelative) {
         foreach ($match in [regex]::Matches($text, $httpPutPattern)) {
             [void]$mutationHits.Add("${relative}: HTTP PUT '$($match.Value)'")
         }
@@ -527,8 +534,10 @@ foreach ($file in $productFiles) {
         }
     }
 
-    foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
-        [void]$mutationHits.Add("${relative}: Studio move endpoint '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedMoveRelative) {
+        foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
+            [void]$mutationHits.Add("${relative}: Studio move endpoint '$($match.Value)'")
+        }
     }
 
     foreach ($match in [regex]::Matches($text, $probeReachabilityPattern)) {
@@ -547,11 +556,11 @@ foreach ($file in $productFiles) {
 }
 
 if ($mutationHits.Count -eq 0) {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file and DELETE /file" -Status "PASS" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented Studio write routes" -Status "PASS" `
         -Detail ("scanned {0} product file(s)" -f $productFiles.Count)
 }
 else {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file and DELETE /file" -Status "FAIL" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented Studio write routes" -Status "FAIL" `
         -Detail ($mutationHits -join "; ")
 }
 
