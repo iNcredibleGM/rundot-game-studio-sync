@@ -1,9 +1,7 @@
-# Acceptance: v0.1.3 safe pull planner and v0.2.0 Push
+# Acceptance: v0.1.3 pull, v0.2.0 Push, and v0.3.0 binary place
 
-This is the acceptance record for the safe pull planner milestone and the Push
-write route shipped on the v0.2.0 integration branch. It maps each public gate
-to the evidence that proves it, so a reviewer can check the claims without
-trusting the release notes.
+This is the acceptance record for the safe pull planner, the Push write routes,
+and binary place. It maps each public gate to the evidence that proves it.
 
 Two kinds of evidence appear below:
 
@@ -85,6 +83,8 @@ not a license to leave workspace state lying around.
 | 11 | Push without force refuses in a non-interactive run | `tests/Push.Tests.ps1` + live check | Both |
 | 12 | Push `-ForcePush` applies with remote backup and BASE update | `tests/Push.Tests.ps1` + live check | Both |
 | 13 | Push journals success and `push-backup` without secrets | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` + live check | Both |
+| 14 | Binary create via documented place sequence | `tests/Acceptance.ps1` gate 14 + live check | Both |
+| 15 | Binary replace with remote backup | `tests/Acceptance.ps1` gate 15 + live check | Both |
 
 ### 1. Test suite green
 
@@ -269,12 +269,35 @@ it). Expect at least one `push` record with `status: success` and one
 `push-backup` record per backed-up path, with no credential or `"content"`
 patterns in the raw file.
 
-## What this milestone deliberately does not do
+### 14. Binary create via documented place sequence
 
-Confirmed absent, not merely undocumented:
+| Property | Evidence |
+| --- | --- |
+| Plan marks one applicable binary `upload` for a new path | `tests/SyncPlan.Tests.ps1`, `tests/Acceptance.ps1` gate 14 |
+| Non-interactive `Push` refuses before mutation | gate 14a |
+| `Push -ForcePush` places bytes at the planned path | gate 14b |
+| Journal records `push-binary` | gate 14b |
 
-- No remote create except the documented utf8 text overwrite route (`Push`).
-- No binary upload or adopt.
+**Live check:** run the full harness on a disposable project. Before gate 2, the harness deletes unpublished files it previously wrote under `sync-acceptance/` so a re-run is not an extra upload. After gates 2–13, no other upload rows should remain. Gate 14 writes `sync-acceptance/acceptance-*.bin` (bytes that are not valid UTF-8),
+plans, declines a non-interactive push, then `-ForcePush` creates the file.
+Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
+`push-binary` journal line for that path.
+
+### 15. Binary replace with remote backup
+
+| Property | Evidence |
+| --- | --- |
+| Replace plans with `expectedRemoteHash` | `tests/SyncPlan.Tests.ps1` |
+| Backup holds pre-replace remote bytes | gate 15 |
+| Journal records `push-backup` and `push-binary` | gate 15 |
+
+**Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
+and `Push -ForcePush`. Expect `(binary replace)`, backup SHA matching the
+pre-replace content (not the new local bytes), and both journal events.
+
+## What this record deliberately does not claim
+
+- No content merge of a conflict, and no guessed sibling path as success.
 - No automatic local deletion. `deleteLocalCandidate` leaves the file in place.
   A remote delete happens only through a confirmed `Push` delete
   ([delete.md](delete.md)).
@@ -290,7 +313,8 @@ Direction beyond this milestone is in [ROADMAP.md](../ROADMAP.md).
 - Initializing a workspace: [init.md](init.md)
 - Dry-run planning and the artifact: [plan.md](plan.md)
 - Applying remote-only changes: [pull.md](pull.md)
-- Publishing local text overwrites: [push.md](push.md)
+- Publishing local changes: [push.md](push.md)
+- Placing binaries: [binary-place.md](binary-place.md)
 - BASE ownership and atomic writes: [base-schema.md](base-schema.md)
 - Canonical paths, safety, and ignores: [path-safety.md](path-safety.md)
 - Torn-read protection: [remote-snapshot.md](remote-snapshot.md)
