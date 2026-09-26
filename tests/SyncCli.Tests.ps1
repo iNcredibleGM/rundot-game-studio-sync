@@ -392,6 +392,9 @@ Assert-True `
 Assert-True `
     ($syncCliSource -match '\$ForcePush') `
     "the CLI should accept -ForcePush"
+Assert-True `
+    ($syncCliSource -match '\$LocalWins') `
+    "the CLI should accept -LocalWins"
 
 foreach ($requiredPushFunction in @(
     'Invoke-RundotSyncPush',
@@ -448,6 +451,9 @@ Assert-True `
     ($syncCliSource -match [regex]::Escape('-ForcePush applies to Push only')) `
     "the CLI should refuse -ForcePush outside Push"
 Assert-True `
+    ($syncCliSource -match [regex]::Escape('-LocalWins applies to Push only')) `
+    "the CLI should refuse -LocalWins outside Push"
+Assert-True `
     ($syncCliSource -match [regex]::Escape('[bool]$ForcePush -or [bool]$ConfirmPush')) `
     "the CLI should treat -ConfirmPush as a skip-prompt alias for Push"
 
@@ -460,6 +466,15 @@ Assert-True `
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushConfirmation')) `
     "the CLI should define Read-RundotSyncPushConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncLocalWinsConfirmation')) `
+    "the CLI should define Read-RundotSyncLocalWinsConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-LocalWins')) `
+    "the CLI should forward -LocalWins into the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('result.HadRefusals')) `
+    "the CLI should exit non-zero when local-wins refuses paths after confirmation"
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('result.Cancelled')) `
     "the CLI should handle a cancelled Push confirmation"

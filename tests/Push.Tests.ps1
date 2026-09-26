@@ -29,6 +29,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $pushTestShaA = 'a' * 64
 $pushTestShaB = 'b' * 64
 $pushTestShaC = 'c' * 64
+$pushTestShaD = 'd' * 64
 $pushTestUtf8 = New-Object System.Text.UTF8Encoding $false
 $pushTestProjectId = 'proj-push-test'
 $pushTestOrigin = 'https://example.test'
@@ -1484,6 +1485,209 @@ try {
             -GetRemoteFileList $reservedApplyScenario.GetRemoteFileList | Out-Null
     } 'Reserved path' 'the apply layer must refuse a reserved path'
     Assert-Equal 0 $script:PushTestReservedApplyCalls 'a reserved path must never send DELETE'
+
+
+    # --------------------------------------------------------------------------
+    # Local-wins selection and apply
+    # --------------------------------------------------------------------------
+
+    $lwBase = @{
+        'src/conflict.ts' = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+        'src/kind.ts'     = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+        'src/remote.ts'   = (New-PushTestBaseEntry -Sha256 $pushTestShaA)
+    }
+    $lwLocal = @{
+        'src/conflict.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaB)
+        'src/kind.ts'     = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary')
+        'src/remote.ts'   = (New-PushTestLocalEntry -Sha256 $pushTestShaA)
+        'src/local-only.ts' = (New-PushTestLocalEntry -Sha256 $pushTestShaC)
+    }
+    $lwRemote = @{
+        'src/conflict.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaC)
+        'src/kind.ts'     = (New-PushTestRemoteEntry -Sha256 $pushTestShaA)
+        'src/remote.ts'   = (New-PushTestRemoteEntry -Sha256 $pushTestShaB)
+        'remote-only.ts'  = (New-PushTestRemoteEntry -Sha256 $pushTestShaD)
+    }
+    $lwArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $gateWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $lwLocal) `
+        -Operations @(
+            (New-PushTestPlanOperation -Path 'src/conflict.ts' -Status 'conflict' -Applicable $false -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaC -ExpectedRemoteHash $pushTestShaC),
+            (New-PushTestPlanOperation -Path 'src/kind.ts' -Status 'conflict' -Applicable $false -KindChange $true -LocalSha256 $pushTestShaB -RemoteSha256 $pushTestShaA -ExpectedRemoteHash $pushTestShaA -Kind 'binary'),
+            (New-PushTestPlanOperation -Path 'src/remote.ts' -Status 'download' -Applicable $true -LocalSha256 $pushTestShaA -RemoteSha256 $pushTestShaB -ExpectedRemoteHash $pushTestShaB),
+            (New-PushTestPlanOperation -Path 'remote-only.ts' -Status 'download' -Applicable $true -LocalSha256 $null -RemoteSha256 $pushTestShaD -ExpectedRemoteHash $pushTestShaD),
+            (New-PushTestPlanOperation -Path 'src/local-only.ts' -Status 'upload' -Applicable $false -LocalSha256 $pushTestShaC -RemoteSha256 $null -ExpectedRemoteHash $null -Reason 'blocked')
+        )
+
+    $lwSelection = Get-SyncPushLocalWinsSelection `
+        -Artifact $lwArtifact `
+        -Base $lwBase `
+        -Local $lwLocal `
+        -Remote $lwRemote
+
+    Assert-Equal 1 $lwSelection.Actions.Count 'local-wins must select a utf8 conflict overwrite'
+    Assert-Equal 'src/conflict.ts' ([string]$lwSelection.Actions[0].Path) 'the conflict overwrite path must be selected'
+
+    $lwRemoteDownload = @($lwSelection.DeleteActions | Where-Object { [string]$_.Path -eq 'remote-only.ts' })
+    Assert-Equal 1 $lwRemoteDownload.Count 'local-wins must delete a remote-only download'
+
+    $lwPullDownload = @($lwSelection.Excluded | Where-Object { [string]$_.Path -eq 'src/remote.ts' })
+    Assert-Equal 1 $lwPullDownload.Count 'local-wins must skip A/A/B download rows'
+    Assert-Equal 'download' ([string]$lwPullDownload[0].Status) 'the skipped row must stay download'
+
+    $lwKind = @($lwSelection.Excluded | Where-Object { [string]$_.Path -eq 'src/kind.ts' })
+    Assert-Equal 1 $lwKind.Count 'local-wins must skip kind-change conflicts'
+
+    $defaultStill = Get-SyncPushSelection `
+        -Artifact $lwArtifact `
+        -Base $lwBase `
+        -Local $lwLocal `
+        -Remote $lwRemote
+    Assert-Equal 0 $defaultStill.Actions.Count 'default Push must still refuse conflict overwrites'
+
+    $lwDeclineWorkspace = New-PushTestWorkspace -Root $pushTestRoot
+    $lwDecline = New-PushTestTextOverwriteScenario -Root $pushTestRoot -Path 'src/lw-decline.ts' -Workspace $lwDeclineWorkspace
+    $lwDeclineArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $lwDeclineWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local @{ 'src/lw-decline.ts' = $lwDecline.LocalEntry }) `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path 'src/lw-decline.ts' `
+                -Status 'conflict' `
+                -Applicable $false `
+                -LocalSha256 $lwDecline.LocalEntry.Sha256 `
+                -RemoteSha256 $pushTestShaC `
+                -ExpectedRemoteHash $pushTestShaC)
+        )
+    Save-BaseManifest `
+        -WorkspaceRoot $lwDeclineWorkspace `
+        -ProjectId $pushTestProjectId `
+        -Files @{ 'src/lw-decline.ts' = (New-PushTestBaseEntry -Sha256 $lwDecline.RemoteSha) }
+
+    $lwDeclineSelection = Get-SyncPushLocalWinsSelection `
+        -Artifact $lwDeclineArtifact `
+        -Base @{ 'src/lw-decline.ts' = (New-PushTestBaseEntry -Sha256 $lwDecline.RemoteSha) } `
+        -Local @{ 'src/lw-decline.ts' = $lwDecline.LocalEntry } `
+        -Remote @{ 'src/lw-decline.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaC) }
+    Assert-Equal 1 $lwDeclineSelection.Actions.Count 'local-wins must select a declined conflict overwrite'
+
+    $script:PushTestLwPutCalls = 0
+    $lwDeclineResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $lwDeclineWorkspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution (New-PushTestResolution -Files @{ 'src/lw-decline.ts' = (New-PushTestBaseEntry -Sha256 $lwDecline.RemoteSha) }) `
+        -Artifact $lwDeclineArtifact `
+        -Local @{ 'src/lw-decline.ts' = $lwDecline.LocalEntry } `
+        -Remote @{ 'src/lw-decline.ts' = (New-PushTestRemoteEntry -Sha256 $pushTestShaC) } `
+        -Snapshot (New-PushTestSnapshot) `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -LocalWins `
+        -ConfirmLocalWins { return $false } `
+        -GetRemoteFile $getRemote `
+        -PutRemoteFile {
+            param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+            $script:PushTestLwPutCalls++
+            return [pscustomobject]@{ encoding = 'utf8'; content = $BodyText }
+        }
+
+    Assert-Equal $true $lwDeclineResult.Cancelled 'a declined local-wins confirm must cancel'
+    Assert-Equal 0 $script:PushTestLwPutCalls 'a declined local-wins confirm must not PUT'
+
+    $lwPartialWorkspace = New-PushTestWorkspace -Root $pushTestRoot
+    $lwOne = New-PushTestTextOverwriteScenario -Root $pushTestRoot -Path 'src/lw-one.ts' -Workspace $lwPartialWorkspace
+    $lwTwo = New-PushTestTextOverwriteScenario -Root $pushTestRoot -Path 'src/lw-two.ts' -Workspace $lwPartialWorkspace
+
+    $lwOneRemoteStaging = Join-Path $pushTestRoot ('lw-one-remote-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    $lwTwoRemoteStaging = Join-Path $pushTestRoot ('lw-two-remote-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    Write-PushTestBytes -LiteralPath $lwOneRemoteStaging -Bytes ($pushTestUtf8.GetBytes("conflict remote one`n"))
+    Write-PushTestBytes -LiteralPath $lwTwoRemoteStaging -Bytes ($pushTestUtf8.GetBytes("conflict remote two`n"))
+    $lwOneConflictRemoteSha = (Get-LocalFileIdentity -LiteralPath $lwOneRemoteStaging).Sha256
+    $lwTwoConflictRemoteSha = (Get-LocalFileIdentity -LiteralPath $lwTwoRemoteStaging).Sha256
+    $lwOneConflictRemoteText = $pushTestUtf8.GetString((Get-PushTestBytes -LiteralPath $lwOneRemoteStaging))
+    $lwTwoConflictRemoteText = $pushTestUtf8.GetString((Get-PushTestBytes -LiteralPath $lwTwoRemoteStaging))
+
+    $lwPartialLocal = @{
+        'src/lw-one.ts' = $lwOne.LocalEntry
+        'src/lw-two.ts' = $lwTwo.LocalEntry
+    }
+    $lwPartialRemote = @{
+        'src/lw-one.ts' = (New-PushTestRemoteEntry -Sha256 $lwOneConflictRemoteSha)
+        'src/lw-two.ts' = (New-PushTestRemoteEntry -Sha256 $lwTwoConflictRemoteSha)
+    }
+    $lwPartialBase = @{
+        'src/lw-one.ts' = (New-PushTestBaseEntry -Sha256 $lwOne.RemoteSha)
+        'src/lw-two.ts' = (New-PushTestBaseEntry -Sha256 $lwTwo.RemoteSha)
+    }
+    $lwPartialArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $lwPartialWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $lwPartialLocal) `
+        -Operations @(
+            (New-PushTestPlanOperation -Path 'src/lw-one.ts' -Status 'conflict' -Applicable $false -LocalSha256 $lwOne.LocalEntry.Sha256 -RemoteSha256 $lwOneConflictRemoteSha -ExpectedRemoteHash $lwOneConflictRemoteSha),
+            (New-PushTestPlanOperation -Path 'src/lw-two.ts' -Status 'conflict' -Applicable $false -LocalSha256 $lwTwo.LocalEntry.Sha256 -RemoteSha256 $lwTwoConflictRemoteSha -ExpectedRemoteHash $lwTwoConflictRemoteSha)
+        )
+    Save-BaseManifest `
+        -WorkspaceRoot $lwPartialWorkspace `
+        -ProjectId $pushTestProjectId `
+        -Files $lwPartialBase
+
+    $script:PushTestLwTwoGetCount = 0
+    $lwPartialGet = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        if ($ApiPath -match 'lw-one') {
+            return [pscustomobject]@{ encoding = 'utf8'; content = $lwOneConflictRemoteText }
+        }
+        if ($ApiPath -match 'lw-two') {
+            $script:PushTestLwTwoGetCount++
+            if ($script:PushTestLwTwoGetCount -eq 1) {
+                return [pscustomobject]@{ encoding = 'utf8'; content = $lwTwoConflictRemoteText }
+            }
+            return [pscustomobject]@{ encoding = 'utf8'; content = 'stale remote for two' }
+        }
+        return [pscustomobject]@{ encoding = 'utf8'; content = '' }
+    }
+    $script:PushTestLwPartialPut = 0
+    $lwPartialResult = Invoke-RundotSyncPush `
+        -WorkspaceRoot $lwPartialWorkspace `
+        -ProjectId $pushTestProjectId `
+        -Resolution (New-PushTestResolution -Files $lwPartialBase) `
+        -Artifact $lwPartialArtifact `
+        -Local $lwPartialLocal `
+        -Remote $lwPartialRemote `
+        -Snapshot (New-PushTestSnapshot) `
+        -StudioOrigin $pushTestOrigin `
+        -Headers $headers `
+        -LocalWins `
+        -Force `
+        -GetRemoteFile $lwPartialGet `
+        -PutRemoteFile {
+            param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+            $script:PushTestLwPartialPut++
+            return [pscustomobject]@{ encoding = 'utf8'; content = $BodyText }
+        }
+
+    Assert-Equal $true $lwPartialResult.HadRefusals 'local-wins must report refusals when a path drifts'
+    Assert-Equal $true $lwPartialResult.BaseUpdated 'local-wins must update BASE for verified paths only'
+    Assert-Equal 1 $lwPartialResult.AppliedActions.Count 'only one conflict overwrite must verify'
+    Assert-Equal 1 $script:PushTestLwPartialPut 'only one PUT must succeed when the second path drifts'
+
+    $lwPartialJournal = @(
+        Read-RundotSyncJournal -WorkspaceRoot $lwPartialWorkspace |
+        Where-Object { [string]$_.event -eq 'push' }
+    )
+    Assert-Equal 1 $lwPartialJournal.Count 'local-wins partial failure must journal one push run record'
+    Assert-Equal 'failed' ([string]$lwPartialJournal[0].status) 'local-wins partial failure must journal failed'
+    Assert-Equal $true $lwPartialJournal[0].baseUpdated 'local-wins partial failure must journal baseUpdated true when some paths verified'
+
+    $lwPartialBaseAfter = Read-BaseManifest -WorkspaceRoot $lwPartialWorkspace
+    Assert-Equal `
+        $lwOne.LocalEntry.Sha256 `
+        (Get-PushTestBaseEntrySha -Base $lwPartialBaseAfter -Path 'src/lw-one.ts') `
+        'verified local-wins paths must update BASE'
+    Assert-Equal `
+        $lwTwo.RemoteSha `
+        (Get-PushTestBaseEntrySha -Base $lwPartialBaseAfter -Path 'src/lw-two.ts') `
+        'refused local-wins paths must keep the previous BASE entry'
 }
 finally {
     if (Test-Path -LiteralPath $pushTestRoot) {
