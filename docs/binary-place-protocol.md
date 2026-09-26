@@ -280,10 +280,9 @@ What stays refused:
   sequence can reach any path, but a plan row is only satisfied when the
   recorded destination equals the planned path.
 
-Nothing in this evidence authorizes emitting `upload-url`, `upload-adopt`,
-`DELETE`, or `POST /move` from the product. `Push` still refuses binary publish,
-and [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
-owns wiring this sequence if it is adopted.
+The product sequence lives in `lib/RemoteBinaryPlace.ps1` and is applied by
+`Push` ([#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)).
+See [binary-place.md](binary-place.md).
 
 ## How this was observed
 

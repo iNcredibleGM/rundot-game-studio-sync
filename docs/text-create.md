@@ -5,8 +5,8 @@ path. It applies an applicable `upload` row (`BASE=— LOCAL=A REMOTE=—`) from
 verified plan artifact, using the documented place sequence in
 [text-create-protocol.md](text-create-protocol.md).
 
-`Push` never creates binaries, never overwrites an existing remote file on this
-path, and never downloads. Binaries stay blocked until [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41).
+`Push` never overwrites an existing remote file on this path and never downloads.
+Binaries use the separate place sequence ([binary-place.md](binary-place.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan

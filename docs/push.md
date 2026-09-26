@@ -1,14 +1,15 @@
 # Safe Push
 
 `Push` is the only command that writes to REMOTE. It consumes the last `Plan`
-artifact, re-verifies every fingerprint, and applies three classifications:
+artifact, re-verifies every fingerprint, and applies four classifications:
 a clean utf8 text overwrite via documented `PUT /file`, a utf8 text create via
-the documented upload + move + `PUT /file` place sequence, and a
+the documented upload + move + `PUT /file` place sequence, a binary create or
+replace via the documented upload + move place sequence, and a
 `deleteRemoteCandidate` via documented `DELETE /file`.
 
-`Push` never changes LOCAL files and never uploads binaries
+`Push` never changes LOCAL files
 ([classifier.md](classifier.md), [text-write-protocol.md](text-write-protocol.md),
-[text-create.md](text-create.md), [delete.md](delete.md)).
+[text-create.md](text-create.md), [binary-place.md](binary-place.md), [delete.md](delete.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
@@ -35,9 +36,9 @@ the documented upload + move + `PUT /file` place sequence, and a
    still a clean remote delete, may be published. Every other plan row is
    reported in `SKIPPED` with a reason.
 8. **Confirm.** If any publishable row remains, Push prints the remote
-   overwrite list, then the create list, then the delete list, and requires
-   the whole word `yes` for each. All confirmations are collected before any
-   backup or mutation.
+   overwrite list, then the text create list, then the binary place list, then
+   the delete list, and requires the whole word `yes` for each. All
+   confirmations are collected before any backup or mutation.
 9. **Back up.** Every remote original that will be replaced **or deleted** is
    copied into a backup set first. A backup failure aborts the push before any
    `PUT` or `DELETE`.
@@ -76,7 +77,8 @@ route and its own client-side guard; see [delete.md](delete.md).
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
 | — | A | — | `upload` (text create) | applies |
-| — | A | — | `upload` (binary) | skipped: binary blocked |
+| — | A | — | `upload` (binary create) | applies |
+| A | B | A | `upload` (binary replace) | applies |
 | A | A | B | `download` | skipped: Push never downloads |
 | A | B | C | `conflict` | skipped: no safe direction |
 | A | B | B | `synchronized-change` | skipped: both sides already agree |

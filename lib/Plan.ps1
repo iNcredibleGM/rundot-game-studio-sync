@@ -12,11 +12,11 @@ $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
 # Push consumes plan fingerprints but a plan is never permission to write.
-# A clean text overwrite, a route-allowed utf8 text create, and a route-allowed
-# remote delete may be marked applicable; binaries and refused deletes stay
-# blocked with reasons.
+# Applicability for text overwrites, text creates, binary places, and remote
+# deletes is decided here; refused paths carry explicit reasons.
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
 $script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
+$script:SyncPlanBinaryEmptyReason = 'An empty binary cannot be placed: the upload route requires a positive declared size, and there is no later write that restores exact empty bytes.'
 
 function Get-SyncTextCreatePathRefusalReason {
     param(
@@ -37,6 +37,31 @@ function Get-SyncTextCreatePathRefusalReason {
     if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
         return (
             'Directory-shaped path: a text create must target a new file path, not a directory prefix.'
+        )
+    }
+
+    return $null
+}
+
+function Get-SyncBinaryPlacePathRefusalReason {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath,
+
+        [AllowNull()]
+        [string[]]$RemotePaths
+    )
+
+    $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
+    if (-not [string]::IsNullOrEmpty($reservedRoot)) {
+        return (
+            "Reserved path '$reservedRoot': a binary place never touches sync state or repository metadata."
+        )
+    }
+
+    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+        return (
+            'Directory-shaped path: a binary place must target a file path, not a directory prefix.'
         )
     }
 
@@ -152,8 +177,7 @@ function Get-SyncPlanRemotePaths {
 
 function Get-SyncPlanOperationRows {
     # Display-ready operation rows. The classifier decides status; Plan adds
-    # the publish policy on top: only a utf8 text overwrite may be applicable,
-    # and every blocked remote-mutating row carries a reason.
+    # the publish policy on top, and every blocked remote-mutating row carries a reason.
     param(
         [object[]]$Changes,
         $Base,
@@ -171,7 +195,14 @@ function Get-SyncPlanOperationRows {
 
         $status = [string]$change.Status
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
+        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
         $remoteMutating = Test-SyncRemoteMutatingStatus -Status $status
+        $remotePathsList = @(Get-SyncPlanRemotePaths -Remote $Remote)
+        $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+        $localSizeValue = 0
+        if ($null -ne $localSize) {
+            $localSizeValue = [int64]$localSize
+        }
 
         $applicable = [bool]$change.Applicable
         $reason = $change.Reason
@@ -180,13 +211,42 @@ function Get-SyncPlanOperationRows {
         if ($remoteMutating) {
             if ($status -eq $script:SyncStatusUpload) {
                 if ($localKind -eq 'binary') {
-                    $applicable = $false
+                    $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                        -CanonicalPath $path `
+                        -RemotePaths $remotePathsList
+
+                    if ($localSizeValue -le 0) {
+                        $applicable = $false
+                        $reason = $script:SyncPlanBinaryEmptyReason
+                    }
+                    elseif (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                        $applicable = $false
+                        $reason = $placeRefusal
+                    }
+                    elseif ([string]::IsNullOrEmpty($remoteSha)) {
+                        if ($null -ne $remoteEntry) {
+                            $applicable = $false
+                            $reason = 'REMOTE is present, so this is not a binary create.'
+                        }
+                        else {
+                            $applicable = $true
+                            $reason = $null
+                        }
+                    }
+                    elseif ($remoteKind -ne 'binary') {
+                        $applicable = $false
+                        $reason = 'REMOTE is not a binary file, so a binary replace cannot apply.'
+                    }
+                    else {
+                        $applicable = $true
+                        $reason = $null
+                    }
                 }
                 elseif ($localKind -eq 'utf8') {
                     if ([string]::IsNullOrEmpty($remoteSha)) {
                         $createRefusal = Get-SyncTextCreatePathRefusalReason `
                             -CanonicalPath $path `
-                            -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+                            -RemotePaths $remotePathsList
 
                         if ([string]::IsNullOrEmpty($createRefusal)) {
                             $applicable = $true

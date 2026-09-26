@@ -414,7 +414,7 @@ try {
     $guardLocal = @{
         'src/text.ts'     = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB)
         'src/new.ts'      = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC)
-        'public/x.png'    = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary')
+        'public/x.png'    = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary' -Size 71)
         'src/dl.ts'       = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
         'src/localdel.ts' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
     }
@@ -504,11 +504,8 @@ try {
 
     $binaryUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'public/x.png'
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"
-    Assert-Equal $false $binaryUpload.applicable "a binary upload must not be applicable"
-    Assert-Equal `
-        'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
-        ([string]$binaryUpload.reason) `
-        "a binary upload must keep the fixed replacement-impossible reason"
+    Assert-Equal $true $binaryUpload.applicable "a clean binary replace must be applicable"
+    Assert-Null $binaryUpload.reason "an applicable binary replace carries no reason"
 
     $download = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/dl.ts'
     Assert-Equal 'download' $download.status "a remote-only change keeps the download status"
