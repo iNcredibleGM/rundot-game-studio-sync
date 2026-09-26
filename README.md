@@ -157,6 +157,16 @@ runs:
 
 `-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
 
+When Adopt left many conflicts and remote-only files, use **local-wins** publish
+after `Plan` to make Studio match your tree in one confirmed set (not a merge):
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -LocalWins
+```
+
+See [docs/push.md](docs/push.md) for what is included, refused, and how partial
+BASE updates work.
+
 `Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`) and
 applies confirmed remote deletes (`BASE=A LOCAL=— REMOTE=A`). Text creates,
 binaries, conflicts, and local deletions are reported and left alone. Before

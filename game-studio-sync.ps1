@@ -25,7 +25,10 @@ param(
     [switch]$ForcePush,
 
     # Push only: skip-prompt alias for -ForcePush.
-    [switch]$ConfirmPush
+    [switch]$ConfirmPush,
+
+    # Push only: publish local bytes over conflicts and remote-only paths.
+    [switch]$LocalWins
 )
 
 $ErrorActionPreference = "Stop"
@@ -145,6 +148,8 @@ function Stop-WithUsageError {
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ForcePush"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ConfirmPush"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins -ForcePush"
     Write-Host ""
 
     Clear-SensitiveVariables
@@ -614,6 +619,77 @@ function Read-RundotSyncPushBinaryConfirmation {
     )
 }
 
+function Read-RundotSyncLocalWinsConfirmation {
+    param(
+        [object[]]$OverwriteActions,
+        [object[]]$CreateActions,
+        [object[]]$BinaryActions,
+        [object[]]$DeleteActions
+    )
+
+    $overwriteRows = @($OverwriteActions)
+    $createRows = @($CreateActions)
+    $binaryRows = @($BinaryActions)
+    $deleteRows = @($DeleteActions)
+    $total = $overwriteRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+
+    Write-Host ""
+    Write-Host "Local-wins confirmation required"
+    Write-Host "================================"
+    Write-Host "Push will publish $total path(s) so Studio matches LOCAL."
+    Write-Host "Local bytes replace remote bytes. This is not a content merge."
+    Write-Host ""
+
+    if ($overwriteRows.Count -gt 0) {
+        Write-Host "TEXT OVERWRITES ($($overwriteRows.Count)):"
+        foreach ($action in $overwriteRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    if ($createRows.Count -gt 0) {
+        Write-Host "TEXT CREATES ($($createRows.Count)):"
+        foreach ($action in $createRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    if ($binaryRows.Count -gt 0) {
+        Write-Host "BINARY CREATE OR REPLACE ($($binaryRows.Count)):"
+        foreach ($action in $binaryRows) {
+            Write-Host "  $([string]$action.Path) ($([string]$action.Mode))"
+        }
+        Write-Host ""
+    }
+
+    if ($deleteRows.Count -gt 0) {
+        Write-Host "REMOTE DELETES ($($deleteRows.Count)):"
+        foreach ($action in $deleteRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    Write-Host "Each remote original is copied into .rundot-sync/backups before overwrite or delete."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "Publish $total path(s) with local-wins?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Read-RundotSyncPushDeleteConfirmation {
     # A delete is not recoverable from Studio, so it gets its own deliberate
     # confirmation even when overwrites were already confirmed. The user must
@@ -656,6 +732,7 @@ function Invoke-SyncPushCommand {
         [string]$WorkspaceRoot,
         [string]$StudioProjectId,
         [bool]$Force,
+        [bool]$LocalWins,
         [string]$Origin,
         [string]$SyncAuthDir,
         [string]$SyncAuthPath,
@@ -734,6 +811,15 @@ function Invoke-SyncPushCommand {
         return (Read-RundotSyncPushBinaryConfirmation -BinaryCount $BinaryCount -Paths $Paths)
     }
 
+    $ConfirmLocalWins = {
+        param($OverwriteActions, $CreateActions, $BinaryActions, $DeleteActions)
+        return (Read-RundotSyncLocalWinsConfirmation `
+            -OverwriteActions $OverwriteActions `
+            -CreateActions $CreateActions `
+            -BinaryActions $BinaryActions `
+            -DeleteActions $DeleteActions)
+    }
+
     try {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
@@ -764,6 +850,8 @@ function Invoke-SyncPushCommand {
             -ConfirmCreate $ConfirmCreate `
             -ConfirmBinary $ConfirmBinary `
             -ConfirmDelete $ConfirmDelete `
+            -ConfirmLocalWins $ConfirmLocalWins `
+            -LocalWins:$LocalWins `
             -Force:$Force
 
         Write-Host ""
@@ -780,6 +868,10 @@ function Invoke-SyncPushCommand {
         Clear-SensitiveVariables
 
         if ($result.Cancelled) {
+            exit 1
+        }
+
+        if ($result.HadRefusals) {
             exit 1
         }
     }
@@ -928,6 +1020,10 @@ if ($Command -eq 'Init') {
         Stop-WithUsageError "-ConfirmPush applies to Push only."
     }
 
+    if ($LocalWins) {
+        Stop-WithUsageError "-LocalWins applies to Push only."
+    }
+
     $resolvedInitMode = Get-ResolvedInitMode `
         -RequestedInitMode $InitMode `
         -FromRemoteAlias ([bool]$FromRemote) `
@@ -977,6 +1073,7 @@ if ($Command -eq 'Push') {
         -WorkspaceRoot $LocalDir `
         -StudioProjectId $ProjectId `
         -Force ([bool]$ForcePush -or [bool]$ConfirmPush) `
+        -LocalWins ([bool]$LocalWins) `
         -Origin $StudioOrigin `
         -SyncAuthDir $AuthDir `
         -SyncAuthPath $AuthPath `
@@ -993,6 +1090,10 @@ if ($ForcePush) {
 
 if ($ConfirmPush) {
     Stop-WithUsageError "-ConfirmPush applies to Push only."
+}
+
+if ($LocalWins) {
+    Stop-WithUsageError "-LocalWins applies to Push only."
 }
 
 Invoke-SyncPlanCommand `

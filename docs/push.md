@@ -115,6 +115,53 @@ With overwrites or deletes to make and neither `-ForcePush` nor `-ConfirmPush`
 nor a console to confirm on, Push **fails closed**: it aborts rather than
 mutating without consent.
 
+## Local-wins publish (`-LocalWins`)
+
+Default `Push` still refuses `conflict` rows. When an Adopted tree already
+disagrees with Studio, `Plan` may list many `upload` and `conflict` rows with
+nothing applicable. `-LocalWins` is a separate publish mode that makes Studio
+match LOCAL for every path you confirm in one list. Local bytes replace remote
+bytes. It is not a content merge.
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins
+.\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins -ForcePush
+```
+
+Before any write, Push prints up to four groups (empty groups are omitted):
+
+1. **Text overwrites** — clean utf8 overwrites and utf8 conflicts where REMOTE
+   already has a file
+2. **Text creates** — local-only utf8 paths and utf8 conflicts where REMOTE is
+   absent
+3. **Binary create or replace** — documented place-at-path rows
+4. **Remote deletes** — `deleteRemoteCandidate`, remote-only `download` rows
+   (LOCAL absent), and conflicts where LOCAL is gone but REMOTE remains
+
+One `yes` confirms that whole set. Declining, or a non-interactive run without
+`-ForcePush`, changes nothing: no backup set, no writes, no journal, BASE
+untouched.
+
+`-ForcePush` / `-ConfirmPush` skip only the prompt. They never skip backups or
+live hash checks.
+
+Paths that stay out of the list are never published: `download` where LOCAL
+still matches BASE (`A / A / B`), `deleteLocalCandidate`, `KindChange`, ignored
+paths, reserved or directory-shaped routes, empty binaries, and any row whose
+live status no longer matches the plan artifact.
+
+Immediately before each write, Push re-checks the live remote hash against the
+plan row. On `-LocalWins`, a drift on one path refuses that path and continues
+with the rest. It does not clobber using a guessed hash. Default `Push` still
+aborts the whole run on drift.
+
+Every remote original is backed up before overwrite or delete. A backup failure
+aborts before any write.
+
+BASE updates only for paths that verified. A partial failure leaves previous
+BASE entries for paths that did not verify. The report lists `REFUSED` paths
+separately from pre-confirm `SKIPPED` rows.
+
 ### Concurrent-edit guard
 
 Immediately before each `PUT`, Push re-hashes the local file and compares it to
