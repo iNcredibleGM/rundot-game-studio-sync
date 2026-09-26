@@ -470,20 +470,14 @@ Assert-Equal 'upload' ([string]$binaryUploadRow.Status) "a binary upload candida
 Assert-True `
     (([string]$binaryUploadRow.Status) -ne 'skip') `
     "a binary upload candidate must never be relabelled 'skip'"
-Assert-Equal $false $binaryUploadRow.Applicable "a binary upload candidate is not applicable until #15"
-Assert-Equal `
-    'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
-    ([string]$binaryUploadRow.Reason) `
-    "a binary upload candidate must carry the fixed replacement-impossible reason"
+Assert-Equal $true $binaryUploadRow.Applicable "a binary upload candidate is applicable at the classifier layer"
+Assert-Null $binaryUploadRow.Reason "an applicable binary upload carries no classifier reason"
 
 # A brand-new binary file is the same conservative case.
 $newBinaryRow = Get-SyncPlanChange -Path 'public/new.png' -Base $null -Local $binaryLocalB -Remote $null
 Assert-Equal 'upload' ([string]$newBinaryRow.Status) "a new binary file must still display as upload"
-Assert-Equal $false $newBinaryRow.Applicable "a new binary file is not applicable until #15"
-Assert-Equal `
-    'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.' `
-    ([string]$newBinaryRow.Reason) `
-    "a new binary file must carry the fixed replacement-impossible reason"
+Assert-Equal $true $newBinaryRow.Applicable "a new binary file is applicable at the classifier layer"
+Assert-Null $newBinaryRow.Reason "a new binary file carries no classifier reason"
 
 # A text upload stays applicable, so the flag is genuinely about binaries.
 $textUploadRow = Get-SyncPlanChange -Path 'src/new.ts' -Base $null -Local $localA -Remote $null
@@ -546,7 +540,7 @@ try {
 
     $largeRow = Get-SyncPlanChange -Path 'public/large-binary.bin' -Base $null -Local $largeLocal -Remote $null
     Assert-Equal 'upload' ([string]$largeRow.Status) "a large binary local-only file must classify as upload"
-    Assert-Equal $false $largeRow.Applicable "a large binary upload candidate is not applicable until #15"
+    Assert-Equal $true $largeRow.Applicable "a large binary upload candidate is applicable at the classifier layer"
 
     # A large binary already identical on both sides is a synchronized
     # addition, proving size does not change the decision.

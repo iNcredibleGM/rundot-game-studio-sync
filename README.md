@@ -17,10 +17,10 @@ machine** without guessing:
   and applies confirmed remote deletes, with a backup of every remote original
   it replaces or removes
 
-**Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
-text files and delete a remote file whose local copy is gone. It never creates
-files and never uploads binaries. There is no `Apply` shortcut that skips the
-plan fingerprint gates.
+**Remote writes are narrow on purpose.** `Push` may overwrite utf8 text, create
+utf8 text, place binaries by the documented sequence, and delete a remote file
+whose local copy is gone. There is no `Apply` shortcut that skips the plan
+fingerprint gates.
 
 If all you want is a plain raw copy of a project, the original exporter
 (`game-studio-export.ps1`) still does that into a new or empty directory —

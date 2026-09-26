@@ -22,17 +22,8 @@ $script:SyncStatusIgnored               = 'ignored'
 $script:SyncStatusDeleteRemoteCandidate = 'deleteRemoteCandidate'
 $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
 
-# Binary uploads are displayed as UPLOAD but never marked applicable. #15
-# verified that the upload flow cannot choose a project path and cannot replace
-# a file — the requested path is ignored (the file always lands at
-# /uploads/{basename}) and a repeated name creates a numeric-suffixed sibling
-# rather than replacing the existing file. #38 then proved the capability
-# exists, but only through a composed sequence: upload-then-move lands one
-# binary at a chosen path, and a replacement is delete-then-place rather than
-# an in-place overwrite (docs/binary-place-protocol.md). The product still
-# emits none of those routes, so the row stays inapplicable and the reason now
-# states the real shape instead of claiming replacement is impossible.
-$script:SyncBinaryUploadReason = 'Binary placement needs upload-then-move: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing, and a replacement is delete-then-place rather than an in-place overwrite.'
+# Binary uploads display as UPLOAD. Path, size, and publish policy live in
+# Plan.ps1 (docs/binary-place-protocol.md, #41).
 
 # The delete verb is characterized in docs/delete-rename-protocol.md: it
 # removes exactly the named path, a repeated delete returns 404 rather than an
@@ -399,13 +390,7 @@ function Get-SyncPlanChange {
 
     switch ($status) {
         $script:SyncStatusUpload {
-            if ((Get-SyncEntryKind -Entry $Local) -eq 'binary') {
-                $applicable = $false
-                $reason = $script:SyncBinaryUploadReason
-            }
-            else {
-                $applicable = $true
-            }
+            $applicable = $true
         }
         $script:SyncStatusDownload {
             $applicable = $true

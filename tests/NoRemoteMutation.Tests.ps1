@@ -121,6 +121,26 @@ Assert-Equal 0 $violations.Count "product PowerShell must expose only the docume
 $deleteLibPath = Join-Path $repoRoot $allowedDeleteRelative
 Assert-True (Test-Path $deleteLibPath) "lib/RemoteDelete.ps1 must exist"
 
+$binaryPlaceLibPath = Join-Path $repoRoot 'lib/RemoteBinaryPlace.ps1'
+Assert-True (Test-Path $binaryPlaceLibPath) 'lib/RemoteBinaryPlace.ps1 must exist'
+
+if (Test-Path $binaryPlaceLibPath) {
+    $binaryPlaceLibText = [System.IO.File]::ReadAllText($binaryPlaceLibPath)
+
+    Assert-True `
+        ($binaryPlaceLibText -notmatch $uploadPattern) `
+        'lib/RemoteBinaryPlace.ps1 must not reference a Studio upload endpoint'
+    Assert-True `
+        ($binaryPlaceLibText -notmatch $httpPutPattern) `
+        'lib/RemoteBinaryPlace.ps1 must not issue HTTP PUT'
+    Assert-True `
+        ($binaryPlaceLibText -notmatch $httpDeletePattern) `
+        'lib/RemoteBinaryPlace.ps1 must not issue HTTP DELETE directly'
+    Assert-True `
+        ($binaryPlaceLibText -notmatch $httpMovePattern) `
+        'lib/RemoteBinaryPlace.ps1 must not reference the Studio move endpoint'
+}
+
 if (Test-Path $deleteLibPath) {
     $deleteLibText = [System.IO.File]::ReadAllText($deleteLibPath)
 

@@ -65,7 +65,7 @@ $ErrorActionPreference = "Stop"
 # via documented DELETE /file. Push asks for confirmation before overwriting
 # and before deleting; -ForcePush or -ConfirmPush skips both prompts but never
 # a backup, and never bypasses conflict refusal or the concurrent-edit guard.
-# Push never creates files and never uploads binaries.
+# Push publishes text and binary changes only through documented sequences.
 # ============================================================================
 
 
@@ -101,6 +101,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\RemoteUpload.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteMove.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteTextCreate.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteBinaryPlace.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
@@ -580,6 +581,39 @@ function Read-RundotSyncPushCreateConfirmation {
     )
 }
 
+function Read-RundotSyncPushBinaryConfirmation {
+    param(
+        [int]$BinaryCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will CREATE or REPLACE $BinaryCount remote binary file(s) on Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each replacement copies the remote original into .rundot-sync/backups before the old bytes are removed."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "PLACE $BinaryCount remote binary file(s)?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Read-RundotSyncPushDeleteConfirmation {
     # A delete is not recoverable from Studio, so it gets its own deliberate
     # confirmation even when overwrites were already confirmed. The user must
@@ -695,6 +729,11 @@ function Invoke-SyncPushCommand {
         return (Read-RundotSyncPushDeleteConfirmation -DeleteCount $DeleteCount -Paths $Paths)
     }
 
+    $ConfirmBinary = {
+        param($BinaryCount, $Paths)
+        return (Read-RundotSyncPushBinaryConfirmation -BinaryCount $BinaryCount -Paths $Paths)
+    }
+
     try {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
@@ -723,6 +762,7 @@ function Invoke-SyncPushCommand {
             -Headers $Headers `
             -ConfirmOverwrite $ConfirmOverwrite `
             -ConfirmCreate $ConfirmCreate `
+            -ConfirmBinary $ConfirmBinary `
             -ConfirmDelete $ConfirmDelete `
             -Force:$Force
 

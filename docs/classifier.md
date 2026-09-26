@@ -82,7 +82,7 @@ constants so `Plan` renders one source of truth.
 `Applicable` is about **what a confirmed command may apply**, not about
 correctness: this version can publish a utf8 text overwrite, create a utf8 text
 file, and apply a route-allowed remote delete via `Push` ([text-create.md](text-create.md),
-[delete.md](delete.md)). It never uploads binaries or deletes a local file, so a
+[delete.md](delete.md), [binary-place.md](binary-place.md)). It never deletes a local file, so a
 `deleteLocalCandidate` is classified but never actionable. A reserved or
 directory-shaped delete candidate is classified but refused by the route rules.
 
@@ -164,34 +164,10 @@ the row becomes `conflict` with `KindChange = $true`. When the hashes are
 equal, the kind disagreement is only metadata: equal bytes win, so the row
 stays a no-op plus a `Warning`.
 
-**Binary upload candidates.** A binary upload keeps `Status = 'upload'` — it is
-never relabelled as a skip — but is marked `Applicable = $false`:
-
-```text
-Status   : upload
-Applicable: False
-Reason   : Binary placement needs upload-then-move: the upload flow ignores the
-           requested path and a repeated name creates a sibling instead of
-           replacing, and a replacement is delete-then-place rather than an
-           in-place overwrite.
-```
-
-Binary placement was investigated twice. [#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15)
-verified that the upload flow itself cannot choose a path (a file always lands
-at `/uploads/{basename}`) and cannot replace a file — a repeated name creates a
-numeric-suffixed sibling
-([binary-upload-protocol.md](binary-upload-protocol.md)). [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
-then proved that the capability still exists through a composed sequence:
-upload-then-`POST /move` lands one binary at a chosen path, and a replacement is
-`DELETE`-then-place rather than an in-place overwrite
-([binary-place-protocol.md](binary-place-protocol.md)). The row stays
-`Applicable = $false` because the product emits none of those routes;
-[#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41) owns
-wiring them.
-Every binary upload candidate is therefore conservative, including a brand-new
-`— / A / —` file, because publishing it through the upload flow alone would
-create a different path than the plan promised. Text uploads, by contrast, are
-`Applicable = $true`.
+**Binary upload candidates.** A binary upload keeps `Status = 'upload'` and is
+marked `Applicable = $true` at the classifier layer, same as text. Reserved
+paths, directory-shaped paths, empty files, and kind mismatches are refused in
+`Plan` and again in `Push` ([binary-place.md](binary-place.md)).
 
 ## Determinism and purity
 

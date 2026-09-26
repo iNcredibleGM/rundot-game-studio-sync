@@ -1,6 +1,6 @@
 # Documented Studio move: POST /api/projects/{id}/move
 #
-# Used only for utf8 text create placement (#40). Rename publish stays out of
+# Used for utf8 text create (#40) and binary place (#41). Rename publish stays out of
 # scope. Do not add DELETE or upload routes here.
 #
 # Callers must load Paths.ps1, Hashing.ps1, RemoteApi.ps1, and RemoteWrite.ps1

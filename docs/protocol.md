@@ -101,7 +101,7 @@ so the file is always recorded at `/uploads/{basename}`; a repeated filename
 (`name-1.png`); and the flow **can create a text file** at that path, which
 `PUT /file` cannot. Replacement was not achievable by any attempt. The upload
 and adopt routes are called only from `lib/RemoteUpload.ps1` for utf8 text
-create (#40); binary placement (#41) remains refused.
+create (#40); binary place (#41) via [binary-place.md](binary-place.md).
 
 ## Place a binary at a chosen project path
 

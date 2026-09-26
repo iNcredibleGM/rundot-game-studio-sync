@@ -490,6 +490,7 @@ foreach ($requiredPushLibrary in @(
     'RemoteUpload.ps1'
     'RemoteMove.ps1'
     'RemoteTextCreate.ps1'
+    'RemoteBinaryPlace.ps1'
 )) {
     Assert-True `
         ($syncCliSource -match [regex]::Escape($requiredPushLibrary)) `
@@ -497,8 +498,14 @@ foreach ($requiredPushLibrary in @(
 }
 
 Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushBinaryConfirmation')) `
+    "the CLI should define Read-RundotSyncPushBinaryConfirmation for Push"
+Assert-True `
     ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushCreateConfirmation')) `
     "the CLI should define Read-RundotSyncPushCreateConfirmation for Push creates"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmBinary')) `
+    "Push wiring should pass ConfirmBinary into Invoke-RundotSyncPush"
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('-ConfirmCreate')) `
     "the CLI should hand the create prompt to the engine"
