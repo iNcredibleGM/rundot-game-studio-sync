@@ -294,6 +294,55 @@ finally {
 
 
 # --------------------------------------------------------------------------
+# Studio read limit and the oversized-payload refusal (#51)
+# --------------------------------------------------------------------------
+
+# GET /file refuses a payload over the observed limit with 413, so a binary
+# over it can be placed but never read back or verified. The size helpers must
+# agree on the boundary and read both map shapes.
+$hashingLimit = Get-SyncStudioMaxReadableFileSize
+Assert-True ($hashingLimit -gt 0) "the Studio read limit must be a positive byte count"
+Assert-True (-not (Test-SyncOversizeSize -Size ($hashingLimit - 1))) "one byte under the limit must not be oversize"
+Assert-True (-not (Test-SyncOversizeSize -Size $hashingLimit)) "exactly the limit must not be oversize"
+Assert-True (Test-SyncOversizeSize -Size ($hashingLimit + 1)) "one byte over the limit must be oversize"
+
+Assert-Equal `
+    ([int64]5) `
+    (Get-SyncEntrySizeValue -Entry ([pscustomobject]@{ Size = 5 })) `
+    "a PascalCase size must be read"
+Assert-Equal `
+    ([int64]7) `
+    (Get-SyncEntrySizeValue -Entry @{ size = 7 }) `
+    "a lowercase size in a hashtable must be read"
+Assert-Equal `
+    ([int64]0) `
+    (Get-SyncEntrySizeValue -Entry $null) `
+    "a missing entry must report zero size"
+Assert-Equal `
+    ([int64]0) `
+    (Get-SyncEntrySizeValue -Entry ([pscustomobject]@{ Sha256 = 'x' })) `
+    "an entry without a size must report zero"
+
+Assert-True `
+    (Test-SyncOversizeEntry -Entry ([pscustomobject]@{ Size = ($hashingLimit + 1) })) `
+    "an oversized entry must be detected"
+Assert-True `
+    (-not (Test-SyncOversizeEntry -Entry ([pscustomobject]@{ Size = 1 }))) `
+    "a small entry must not be oversize"
+
+$hashingReason = Get-SyncOversizeRefusalReason -Size ($hashingLimit + 1)
+Assert-True `
+    ($hashingReason -match [regex]::Escape([string]($hashingLimit + 1))) `
+    "the refusal reason must name the payload size"
+Assert-True `
+    ($hashingReason -match [regex]::Escape([string]$hashingLimit)) `
+    "the refusal reason must name the read limit"
+Assert-True `
+    ($hashingReason -match '413') `
+    "the refusal reason must name the 413 the user would otherwise see"
+
+
+# --------------------------------------------------------------------------
 # Production hasher must not load whole files into strings or byte[]
 # --------------------------------------------------------------------------
 

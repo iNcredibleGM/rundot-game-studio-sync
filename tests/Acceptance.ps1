@@ -9,7 +9,9 @@
 # Offline gates need no network and no account. Live Pull gates pause for a
 # Studio-side edit. Live Push gates reuse the Gate 2 local edit after Pull and
 # publish utf8 text with documented PUT /file. Gates 14-15 script-write a
-# binary under sync-acceptance/ and exercise the place sequence.
+# binary under sync-acceptance/ and exercise the place sequence; gate 15 uses
+# Push -LocalWins for the replace, so the local-wins binary replace path is a
+# live gate (#51).
 #
 # This script never prints or persists tokens, auth files, or file contents.
 # It is named Acceptance.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
@@ -114,7 +116,7 @@ function Write-AcceptanceGateMap {
     Write-Host "  12   Push -ForcePush applies with remote backup + BASE           [live]"
     Write-Host "  13   Push journals success and push-backup without secrets       [live]"
     Write-Host "  14   Binary create via place sequence (-ForcePush)                 [live]"
-    Write-Host "  15   Binary replace with remote backup                             [live]"
+    Write-Host "  15   Binary replace via Push -LocalWins with remote backup          [live]"
     Write-Host "  16   Host-visible progress (hashing, download, publish)            [live]"
     Write-Host ""
     Write-Host "Init is setup inside gate 2 when BASE is missing; it is not a numbered gate."
@@ -688,7 +690,7 @@ if ($SkipLive) {
     Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "SKIP" -Detail "-SkipLive"
-    Add-GateResult -Gate "15. Binary replace with remote backup" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "15. Binary replace via Push -LocalWins with remote backup" -Status "SKIP" -Detail "-SkipLive"
 }
 elseif ([string]::IsNullOrEmpty($ProjectId)) {
     Add-GateResult -Gate "2-4, 6, 9, 11-15 live gates" -Status "SKIP" -Detail "no -ProjectId supplied; rerun with -ProjectId <id>"
@@ -1392,8 +1394,9 @@ else {
                                 $baseCapturedBeforeReplace = [string]$baseBeforeReplace.capturedAt
                             }
 
+                            Write-Host "Gate 15: Push -LocalWins -ForcePush (binary replace)"
                             $binaryReplacePush = Invoke-SyncCli -CliArgs @(
-                                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-ForcePush'
+                                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-LocalWins', '-ForcePush'
                             )
 
                             $replaceRows = @(Get-PushBinaryRows -Output $binaryReplacePush.Output)

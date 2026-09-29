@@ -65,8 +65,8 @@ The plan layer marks three remote-mutating rows as applicable:
 | --- | --- | --- |
 | `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
 | `upload` (text create) | yes, unless refused | `BASE=— LOCAL=A REMOTE=—` with utf8 kind when the path is not reserved and not directory-shaped. `Push` may publish via the documented place sequence ([text-create.md](text-create.md)). |
-| `upload` (binary create) | yes, unless refused | `BASE=— LOCAL=A REMOTE=—` with binary kind, positive size, path not reserved or directory-shaped ([binary-place.md](binary-place.md)). |
-| `upload` (binary replace) | yes, unless refused | `BASE=A LOCAL=B REMOTE=A` with binary kind on both sides, positive size, path not reserved or directory-shaped. |
+| `upload` (binary create) | yes, unless refused | `BASE=— LOCAL=A REMOTE=—` with binary kind, positive size, path not reserved or directory-shaped, and size at or under Studio's 2,000,000-byte read limit ([binary-place.md](binary-place.md)). |
+| `upload` (binary replace) | yes, unless refused | `BASE=A LOCAL=B REMOTE=A` with binary kind on both sides, positive size, path not reserved or directory-shaped, and size at or under Studio's 2,000,000-byte read limit. |
 | `deleteRemoteCandidate` | yes, unless refused | `BASE=A LOCAL=— REMOTE=A` with a present `expectedRemoteHash`, when the path is neither a reserved root nor directory-shaped. `Push` may apply it via `DELETE /file` ([delete.md](delete.md)). |
 | `deleteRemoteCandidate` (reserved or directory-shaped) | no | The route rules refuse the path, so it can never reach a `DELETE`. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
@@ -75,6 +75,11 @@ Every blocked remote-mutating row carries an explicit reason. The
 [classifier](classifier.md) still marks text uploads as applicable; the plan
 layer refuses binaries, reserved or directory-shaped creates, and every refused
 delete path.
+
+A binary over Studio's 2,000,000-byte read limit is marked `applicable: false`
+with a reason naming the size and the limit, because `GET /file` returns 413
+above it and the place could never be verified
+([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
 
 ## Console layout
 

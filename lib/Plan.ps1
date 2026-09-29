@@ -17,7 +17,6 @@ $script:SyncPlanDefaultTtlMinutes = 20
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
 $script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
 $script:SyncPlanBinaryEmptyReason = 'An empty binary cannot be placed: the upload route requires a positive declared size, and there is no later write that restores exact empty bytes.'
-
 function Get-SyncTextCreatePathRefusalReason {
     param(
         [Parameter(Mandatory)]
@@ -215,7 +214,11 @@ function Get-SyncPlanOperationRows {
                         -CanonicalPath $path `
                         -RemotePaths $remotePathsList
 
-                    if ($localSizeValue -le 0) {
+                    if (Test-SyncOversizeSize -Size $localSizeValue) {
+                        $applicable = $false
+                        $reason = Get-SyncOversizeRefusalReason -Size $localSizeValue
+                    }
+                    elseif ($localSizeValue -le 0) {
                         $applicable = $false
                         $reason = $script:SyncPlanBinaryEmptyReason
                     }

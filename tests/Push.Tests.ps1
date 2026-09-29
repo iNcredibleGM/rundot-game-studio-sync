@@ -1647,6 +1647,54 @@ try {
         -Remote $lwRemote
     Assert-Equal 0 $defaultStill.Actions.Count 'default Push must still refuse conflict overwrites'
 
+    # --------------------------------------------------------------------------
+    # An oversized binary is refused by Push even when a plan marked it (#51)
+    # --------------------------------------------------------------------------
+
+    # Defense in depth: a plan artifact is not permission to write. Even if a
+    # stale or hand-edited artifact marked an oversized binary applicable, Push
+    # must refuse it before the place sequence, because GET /file could never
+    # read the destination back to verify it.
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeLocal = @{
+        'public/huge.png' = (New-PushTestLocalEntry -Sha256 $pushTestShaB -Kind 'binary' -Size ($oversizeLimit + 1))
+    }
+    $oversizeArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $gateWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $oversizeLocal) `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path 'public/huge.png' `
+                -LocalSha256 $pushTestShaB `
+                -RemoteSha256 $null `
+                -ExpectedRemoteHash $null `
+                -Kind 'binary' `
+                -Applicable $true)
+        )
+
+    Assert-PushTestThrowsLike {
+        Get-SyncPushSelection `
+            -Artifact $oversizeArtifact `
+            -Base @{} `
+            -Local $oversizeLocal `
+            -Remote @{} | Out-Null
+    } 'read limit' 'default Push must refuse an oversized binary create before placing it'
+
+    # Local-wins excludes the path with a reason instead of aborting the whole
+    # run, so one oversized file cannot block a large push. It must still not be
+    # selected as a binary action.
+    $oversizeLocalWins = Get-SyncPushLocalWinsSelection `
+        -Artifact $oversizeArtifact `
+        -Base @{} `
+        -Local $oversizeLocal `
+        -Remote @{}
+    Assert-Equal 0 $oversizeLocalWins.BinaryActions.Count 'local-wins must not select an oversized binary'
+    $oversizeExcluded = @($oversizeLocalWins.Excluded | Where-Object { [string]$_.Path -eq 'public/huge.png' })
+    Assert-Equal 1 $oversizeExcluded.Count 'local-wins must report the oversized path as excluded'
+    Assert-True `
+        (([string]$oversizeExcluded[0].Reason) -match 'read limit') `
+        'local-wins must explain the read limit for an oversized binary'
+
     $lwDeclineWorkspace = New-PushTestWorkspace -Root $pushTestRoot
     $lwDecline = New-PushTestTextOverwriteScenario -Root $pushTestRoot -Path 'src/lw-decline.ts' -Workspace $lwDeclineWorkspace
     $lwDeclineArtifact = New-PushTestArtifact `

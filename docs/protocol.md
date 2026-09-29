@@ -16,6 +16,23 @@ rather than treating a single `/files` response as truth.
 
 GET /api/projects/{projectId}/file?path={encodedPath}
 
+Status: observed, with a hard server-side limit. A payload of **2,000,000 bytes
+or fewer** returns `200` with the encoded content; **2,000,001 bytes or more**
+returns HTTP `413` `file too large to view`. No alternate large-file read route
+was found (every guessed shape — `raw=1`, `download`, `asset`, `blob`, a signed
+URL — returned `404`), so a binary over the limit can be placed but never read
+back or verified. The tool refuses such a file before any destructive step
+([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
+
+The limit is a property of the **route**, not of the response body. That was
+tested, not assumed (#51): a `Range` request (`bytes=0-1023`, a suffix range,
+a window straddling 2,000,000, and a window **entirely above** it) returned
+`413` for every shape, and `HEAD` returned `405`. The threshold counts **raw
+bytes**, not the base64 payload — 2,000,000 raw bytes read back `200` even
+though they encode to 2,666,668 base64 characters. `GET /files` still *lists* a
+path over the limit, so an oversize file is visible and its size is reported; it
+is only the bytes that cannot be read.
+
 ## Write text file
 
 PUT /api/projects/{projectId}/file?path={encodedPath}

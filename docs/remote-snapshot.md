@@ -27,6 +27,27 @@ leading `/`). Staging keys and on-disk relative paths use canonical `/`
 NFC identity from `ConvertTo-CanonicalSyncPath`. Default ignores do not
 apply: every listed file is downloaded.
 
+### Oversized remote files abort before download
+
+`GET /file` refuses a payload over **2,000,000 bytes** with HTTP 413
+`file too large to view` ([protocol.md](protocol.md)). A remote manifest
+that lists such a path can never be read, so the snapshot **fails closed
+before any download** rather than surfacing a bare `HTTP 413` mid-loop.
+The abort names the count and each oversized path with its size:
+
+```text
+Refusing to read REMOTE: 3 file(s) are over Studio's 2000000-byte read
+limit, so GET /file returns 413 for them.
+  dev/audio/theme.wav  (3120444 bytes)
+  ...
+Delete these paths on Studio, or exclude them from the sync folder, and re-run.
+```
+
+This is a refusal, not a partial snapshot: `Init`, `Plan`, `Pull`, and
+`Push` all fail the same way, so the tree is never silently half-read.
+Delete the named paths on Studio (or exclude them from the sync folder) and
+re-run ([binary-place.md](binary-place.md)).
+
 Decoded bytes are written, then hashed with `Get-LocalFileIdentity`.
 Identity is SHA-256 of those exact bytes, not of the JSON string. API
 `encoding` `utf8` maps to `remoteKind` `utf8`; `base64` maps to
@@ -95,6 +116,7 @@ Returned file entries are hashes and diagnostics only (`Sha256`, `Size`,
 | HTTP 401 / 403 | Abort immediately |
 | ManifestBefore fingerprint ≠ ManifestAfter | Discard, retry; after 3: idle message |
 | Listed path, `GET /file` returns 404 | Discard, retry; after 3: idle message. Not a remote deletion |
+| Listed path over Studio's 2,000,000-byte read limit | Abort before download, naming every oversized path |
 | Malformed base64 | Discard, retry; after 3: idle message |
 
 A 404 while capturing a path that ManifestBefore listed means the project

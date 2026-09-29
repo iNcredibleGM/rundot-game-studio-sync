@@ -35,7 +35,17 @@ param(
     [switch]$KeepWorkspace,
 
     # Do not DELETE the probe files from Studio at the end.
-    [switch]$SkipRemoteCleanup
+    [switch]$SkipRemoteCleanup,
+
+    # Optional real binary asset (PNG/JPG) for the binary create + replace
+    # phase. The gate-15 asset is a 10-byte fake PNG, which does not exercise
+    # a real image; a real asset does (#51). When omitted, the binary phase is
+    # SKIPPED so the text round-trip still runs.
+    [string]$BinaryAssetPath,
+
+    # Optional second real binary asset for the replace step. When omitted, a
+    # distinct variant of the create asset is used so the replace has new bytes.
+    [string]$BinaryReplaceAssetPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,6 +107,8 @@ if ([string]::IsNullOrEmpty($ProjectId)) {
 . (Join-Path $repoRoot 'lib\RemoteApi.ps1')
 . (Join-Path $repoRoot 'lib\Auth.ps1')
 . (Join-Path $repoRoot 'lib\Snapshot.ps1')
+. (Join-Path $repoRoot 'lib\Classifier.ps1')
+. (Join-Path $repoRoot 'lib\Journal.ps1')
 . (Join-Path $repoRoot 'lib\RemoteWrite.ps1')
 . (Join-Path $repoRoot 'lib\RemoteDelete.ps1')
 
@@ -152,6 +164,95 @@ function Get-PlanCount {
     $match = [regex]::Match($Output, ('(?m)^\s*' + [regex]::Escape($StatusName) + ':\s+(\d+)'))
     if ($match.Success) { return [int]$match.Groups[1].Value }
     return -1
+}
+
+function Get-PushBinaryRows {
+    # Parse the BINARY section of a Push report into path + create/replace rows.
+    param([string]$Output)
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $inSection = $false
+
+    foreach ($line in ($Output -split "`n")) {
+        $trimmed = $line.TrimEnd("`r")
+
+        if ($trimmed -eq 'BINARY') {
+            $inSection = $true
+            continue
+        }
+
+        if (-not $inSection) { continue }
+
+        if ($trimmed -match '^\s+(.+?)\s+\(binary (create|replace)\)\s*$') {
+            $rows.Add([pscustomobject]@{
+                Path = $matches[1].Trim()
+                Mode = $matches[2]
+            })
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $trimmed -notmatch '^\s') { break }
+    }
+
+    return $rows.ToArray()
+}
+
+function Get-ShortHash {
+    param([string]$Hash)
+
+    if ([string]::IsNullOrEmpty($Hash)) { return '<none>' }
+    if ($Hash.Length -le 12) { return $Hash }
+    return $Hash.Substring(0, 12)
+}
+
+function Get-RemoteFileContentSize {
+    # Decoded byte length of a remote file payload, for failure evidence only.
+    # Never prints content.
+    param($Response)
+
+    try {
+        return (ConvertFrom-RemoteFileContent -Response $Response).Length
+    }
+    catch {
+        return '<unknown>'
+    }
+}
+
+function Write-LiveBinaryEvidence {
+    # One actionable evidence block after a binary place refusal (#51). It
+    # prints sizes, an encoding, and a truncated hash, never file contents.
+    param(
+        [string]$Output,
+        [string]$StudioOrigin,
+        [string]$ProjectId,
+        [hashtable]$Headers,
+        [string]$CanonicalPath,
+        [string]$LocalSha256
+    )
+
+    $refusedLine = [regex]::Match($Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
+    $reason = '<no REFUSED row>'
+    if ($refusedLine.Success) { $reason = $refusedLine.Groups[2].Value }
+
+    $remoteEncoding = '<unreadable>'
+    $remoteSize = '<unreadable>'
+    $remoteSha = '<unreadable>'
+    try {
+        $remote = Get-RemoteProjectFile `
+            -StudioOrigin $StudioOrigin -ProjectId $ProjectId `
+            -Path ('/' + $CanonicalPath) -Headers $Headers
+        $remoteEncoding = [string](Get-SyncEntryProperty -Entry $remote -Names @('encoding', 'Encoding'))
+        $remoteSize = Get-RemoteFileContentSize -Response $remote
+        $remoteSha = Get-RemoteFileContentSha256 -Response $remote
+    }
+    catch {
+        $remoteEncoding = '<absent>'
+    }
+
+    $bytesEqual = [string]::Equals($remoteSha, $LocalSha256, [System.StringComparison]::Ordinal)
+    Add-Step -Name 'Binary failure evidence' -Status 'FAIL' `
+        -Detail ("reason={0} | remote encoding={1} size={2} sha={3} | local sha={4} | bytesEqual={5}" -f `
+            $reason, $remoteEncoding, $remoteSize, (Get-ShortHash $remoteSha), (Get-ShortHash $LocalSha256), $bytesEqual)
 }
 
 function Get-ReportBackupSetPath {
@@ -555,6 +656,179 @@ if (-not $script:Aborted) {
     Add-Step -Name 'A locked local file still aborts Plan (progress does not soften it)' `
         -Status $(if ($failClosedOk) { 'PASS' } else { 'FAIL' }) `
         -Detail ("exit={0}" -f $lockedPlan.ExitCode)
+
+    # -----------------------------------------------------------------------
+    # Binary create + replace via Push -LocalWins (#51)
+    #
+    # The gate-15 asset is a 10-byte fake PNG, which never exercises a real
+    # image. A real asset does, and a binary replace is where a post-move
+    # verify can fail. The create proves the place sequence end to end; the
+    # replace proves the delete-then-place path, a backup of the pre-replace
+    # remote bytes, and a BASE update.
+    # -----------------------------------------------------------------------
+
+    Write-Phase 'Binary create + replace (Push -LocalWins)'
+
+    $binaryCanonical = $probeFolder + '/binary-probe.png'
+
+    if ([string]::IsNullOrEmpty($BinaryAssetPath) -or -not (Test-Path -LiteralPath $BinaryAssetPath -PathType Leaf)) {
+        Add-Step -Name 'Binary create + replace (Push -LocalWins)' -Status 'SKIP' `
+            -Detail '-BinaryAssetPath not supplied or not a file; the text round-trip still ran'
+    }
+    else {
+        $script:ProbePaths += $binaryCanonical
+
+        $binaryFull = ConvertTo-LocalFullPath -WorkspaceRoot $LocalDir -CanonicalPath $binaryCanonical
+        $binaryParent = Split-Path -Parent $binaryFull
+        if (-not (Test-Path -LiteralPath $binaryParent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $binaryParent | Out-Null
+        }
+
+        # Exact bytes of the real asset, so a read-back hash is a byte-identity
+        # claim about a real image rather than a synthetic one.
+        $createBytes = [System.IO.File]::ReadAllBytes($BinaryAssetPath)
+        [System.IO.File]::WriteAllBytes($binaryFull, $createBytes)
+        $createIdentity = Get-LocalFileIdentity -LiteralPath $binaryFull
+
+        if ($createIdentity.LocalDetectedKind -ne 'binary') {
+            Add-Step -Name 'Binary create + replace (Push -LocalWins)' -Status 'FAIL' `
+                -Detail ('-BinaryAssetPath is not a binary asset (detected {0})' -f $createIdentity.LocalDetectedKind)
+        }
+        else {
+            # Create: Plan, then Push -LocalWins -ForcePush.
+            $binaryPlanCreate = Invoke-SyncCli -CliArgs @(
+                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+            )
+            [void](Assert-ProgressLines -Output $binaryPlanCreate.Output -Label 'Plan (binary create)' -RequireHashing)
+
+            $binaryCreatePush = Invoke-SyncCli -CliArgs @(
+                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-LocalWins', '-ForcePush'
+            )
+            [void](Assert-ProgressLines -Output $binaryCreatePush.Output -Label 'Push (binary create)' -RequirePublish -RequireHashing)
+
+            $createBinaryRows = @(Get-PushBinaryRows -Output $binaryCreatePush.Output)
+            $createBaseUpdated = [regex]::IsMatch($binaryCreatePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+
+            $remoteCreate = Get-RemoteProjectFile `
+                -StudioOrigin $StudioOrigin -ProjectId $ProjectId `
+                -Path ('/' + $binaryCanonical) -Headers $headers
+            $remoteCreateSha = Get-RemoteFileContentSha256 -Response $remoteCreate
+            $remoteCreateEncoding = [string](Get-SyncEntryProperty `
+                -Entry $remoteCreate -Names @('encoding', 'Encoding'))
+
+            $createOk = ($binaryCreatePush.ExitCode -eq 0) `
+                -and ($createBinaryRows.Count -eq 1) `
+                -and ([string]$createBinaryRows[0].Mode -eq 'create') `
+                -and $createBaseUpdated `
+                -and [string]::Equals($remoteCreateSha, [string]$createIdentity.Sha256, [System.StringComparison]::Ordinal)
+
+            Add-Step -Name 'Push -LocalWins placed a real binary and BASE moved' `
+                -Status $(if ($createOk) { 'PASS' } else { 'FAIL' }) `
+                -Detail ("exit={0}, BINARY rows={1}, BASE updated={2}, remote sha={3}, local sha={4}" -f `
+                    $binaryCreatePush.ExitCode, $createBinaryRows.Count, $createBaseUpdated, `
+                    (Get-ShortHash $remoteCreateSha), (Get-ShortHash ([string]$createIdentity.Sha256)))
+
+            if (-not $createOk) {
+                # Surface why, not only that it failed: a REFUSED row carries
+                # the inner verify reason; a hash mismatch is the decisive
+                # re-encoding evidence.
+                Add-Step -Name 'Binary create failure evidence' -Status 'FAIL' `
+                    -Detail ("remote encoding={0}, remote size={1}, local size={2}" -f `
+                        $remoteCreateEncoding, (Get-RemoteFileContentSize -Response $remoteCreate), $createIdentity.Size)
+                Add-Step -Name 'Binary replace (Push -LocalWins)' -Status 'SKIP' -Detail 'binary create failed'
+            }
+            else {
+                # Replace: new bytes at the same path.
+                $replaceSource = $BinaryReplaceAssetPath
+                if ([string]::IsNullOrEmpty($replaceSource) -or -not (Test-Path -LiteralPath $replaceSource -PathType Leaf)) {
+                    # A deterministic variant: flip the last byte of the create
+                    # bytes so the replace has genuinely new content without
+                    # needing a second real asset.
+                    $replaceBytes = New-Object byte[] ($createBytes.Length)
+                    [Array]::Copy($createBytes, $replaceBytes, $createBytes.Length)
+                    $replaceBytes[$replaceBytes.Length - 1] = $replaceBytes[$replaceBytes.Length - 1] -bxor 0xFF
+                    [System.IO.File]::WriteAllBytes($binaryFull, $replaceBytes)
+                }
+                else {
+                    [System.IO.File]::Copy($replaceSource, $binaryFull, $true)
+                }
+
+                $replaceIdentity = Get-LocalFileIdentity -LiteralPath $binaryFull
+
+                $binaryPlanReplace = Invoke-SyncCli -CliArgs @(
+                    '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+                )
+                [void](Assert-ProgressLines -Output $binaryPlanReplace.Output -Label 'Plan (binary replace)' -RequireHashing)
+
+                $binaryReplacePush = Invoke-SyncCli -CliArgs @(
+                    '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-LocalWins', '-ForcePush'
+                )
+                [void](Assert-ProgressLines -Output $binaryReplacePush.Output -Label 'Push (binary replace)' -RequirePublish -RequireHashing)
+
+                $replaceBinaryRows = @(Get-PushBinaryRows -Output $binaryReplacePush.Output)
+                $replaceBaseUpdated = [regex]::IsMatch($binaryReplacePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+
+                $remoteReplace = Get-RemoteProjectFile `
+                    -StudioOrigin $StudioOrigin -ProjectId $ProjectId `
+                    -Path ('/' + $binaryCanonical) -Headers $headers
+                $remoteReplaceSha = Get-RemoteFileContentSha256 -Response $remoteReplace
+
+                $thisRunLine = [regex]::Match($binaryReplacePush.Output, '(?m)^\s*this run:\s+(.+?)\s*$')
+                $thisRunSet = $null
+                if ($thisRunLine.Success) { $thisRunSet = $thisRunLine.Groups[1].Value.Trim().TrimEnd('\') }
+
+                $replaceBackupOk = $false
+                $replaceBackupDetail = 'no backup set printed'
+                if (-not [string]::IsNullOrEmpty($thisRunSet) -and (Test-Path -LiteralPath $thisRunSet)) {
+                    $backupFile = Join-Path $thisRunSet ($binaryCanonical.Replace('/', '\'))
+                    if (Test-Path -LiteralPath $backupFile -PathType Leaf) {
+                        $backupSha = (Get-LocalFileIdentity -LiteralPath $backupFile).Sha256
+                        $replaceBackupOk = [string]::Equals($backupSha, [string]$createIdentity.Sha256, [System.StringComparison]::Ordinal)
+                        $replaceBackupDetail = "backup holds the pre-replace remote bytes ({0})" -f (Get-ShortHash $backupSha)
+                    }
+                    else {
+                        $replaceBackupDetail = "backup file missing: $backupFile"
+                    }
+                }
+
+                $replaceJournal = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                $replaceBackupRecords = @($replaceJournal | Where-Object {
+                    [string]$_.event -eq 'push-backup' -and [string]$_.path -eq $binaryCanonical
+                })
+                $replaceBinaryRecords = @($replaceJournal | Where-Object {
+                    [string]$_.event -eq 'push-binary' -and [string]$_.path -eq $binaryCanonical
+                })
+
+                $replaceOk = ($binaryReplacePush.ExitCode -eq 0) `
+                    -and ($replaceBinaryRows.Count -eq 1) `
+                    -and ([string]$replaceBinaryRows[0].Mode -eq 'replace') `
+                    -and $replaceBaseUpdated `
+                    -and [string]::Equals($remoteReplaceSha, [string]$replaceIdentity.Sha256, [System.StringComparison]::Ordinal) `
+                    -and $replaceBackupOk `
+                    -and ($replaceBackupRecords.Count -ge 1) `
+                    -and ($replaceBinaryRecords.Count -ge 1)
+
+                Add-Step -Name 'Push -LocalWins replaced a real binary, BASE moved, backup kept' `
+                    -Status $(if ($replaceOk) { 'PASS' } else { 'FAIL' }) `
+                    -Detail ("exit={0}, BINARY rows={1}, BASE updated={2}, remote sha={3}, local sha={4}; {5}" -f `
+                        $binaryReplacePush.ExitCode, $replaceBinaryRows.Count, $replaceBaseUpdated, `
+                        (Get-ShortHash $remoteReplaceSha), (Get-ShortHash ([string]$replaceIdentity.Sha256)), $replaceBackupDetail)
+
+                if (-not $replaceOk) {
+                    # The decisive post-move evidence: does Studio serve bytes
+                    # that differ from local (re-encoding), or the same bytes
+                    # with only the wrapper failing (timing/staging)?
+                    $refusedLine = [regex]::Match($binaryReplacePush.Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
+                    Add-Step -Name 'Binary replace failure evidence' -Status 'FAIL' `
+                        -Detail ("remote encoding={0}, remote size={1}, local size={2}, refused-reason={3}" -f `
+                            ([string](Get-SyncEntryProperty -Entry $remoteReplace -Names @('encoding', 'Encoding'))), `
+                            (Get-RemoteFileContentSize -Response $remoteReplace), `
+                            $replaceIdentity.Size, `
+                            $(if ($refusedLine.Success) { $refusedLine.Groups[2].Value } else { '<no REFUSED row>' }))
+                }
+            }
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------

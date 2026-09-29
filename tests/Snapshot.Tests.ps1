@@ -1077,3 +1077,59 @@ finally {
 }
 
 
+# --------------------------------------------------------------------------
+# A remote file over Studio's read limit fails the snapshot closed (#51)
+# --------------------------------------------------------------------------
+
+# GET /file returns 413 above the limit, so the snapshot must refuse before
+# downloading anything and name the path, rather than surfacing a bare 413
+# partway through the download loop.
+$oversizeRoot = Join-Path $env:TEMP ("rundot-snapshot-oversize-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $oversizeRoot | Out-Null
+try {
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeManifest = New-TestRemoteManifest -Files @(
+        (New-TestFileEntry @{
+            path     = 'src/a.ts'
+            type     = 'file'
+            size     = 2
+            encoding = 'utf8'
+        }),
+        (New-TestFileEntry @{
+            path     = 'public/huge.png'
+            type     = 'file'
+            size     = ($oversizeLimit + 1)
+            encoding = 'base64'
+            kind     = 'binary'
+        })
+    )
+    Reset-FakeRemote -Lists @($oversizeManifest) -Files @{
+        'src/a.ts' = $hiPayload
+    }
+
+    $oversizeThrew = $false
+    $oversizeText = $null
+    try {
+        Invoke-TestSnapshot -WorkspaceRoot $oversizeRoot | Out-Null
+    }
+    catch {
+        $oversizeThrew = $true
+        $oversizeText = [string]$_.Exception.Message
+    }
+
+    Assert-True $oversizeThrew "an oversized remote file must fail the snapshot closed"
+    Assert-True `
+        ($oversizeText -match [regex]::Escape('public/huge.png')) `
+        "the refusal must name the oversized remote path"
+    Assert-True `
+        ($oversizeText -match [regex]::Escape([string]$oversizeLimit)) `
+        "the refusal must name the read limit"
+    Assert-Equal 0 $script:FileCallCount "an oversized snapshot must fail before downloading any file"
+}
+finally {
+    if (Test-Path -LiteralPath $oversizeRoot) {
+        Remove-Item -LiteralPath $oversizeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+

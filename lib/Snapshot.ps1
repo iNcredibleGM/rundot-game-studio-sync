@@ -429,6 +429,37 @@ function Get-RemoteSnapshotFileMap {
         Write-RundotSyncProgressLine -Text ("Downloading {0} remote file(s)..." -f $total)
     }
 
+    # Fail closed before any download: GET /file refuses a payload over Studio's
+    # read limit with 413, and that would otherwise surface as a bare
+    # "Remote request failed with HTTP 413" after the download loop had already
+    # run. A named path plus the limit is actionable (#51). This is a refusal,
+    # not a partial snapshot: every command that needs REMOTE identity fails the
+    # same way, so the tree cannot be silently half-read.
+    $oversize = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in $rows) {
+        $entrySize = Get-SyncEntrySizeValue -Entry $row.Entry
+        if (Test-SyncOversizeSize -Size $entrySize) {
+            [void]$oversize.Add([pscustomobject]@{
+                Path = [string]$row.CanonicalPath
+                Size = $entrySize
+            })
+        }
+    }
+
+    if ($oversize.Count -gt 0) {
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        [void]$lines.Add((
+            "Refusing to read REMOTE: {0} file(s) are over Studio's {1}-byte read limit, so GET /file returns 413 for them." -f `
+                $oversize.Count, [string]$script:SyncStudioMaxReadableFileSize
+        ))
+        foreach ($item in $oversize) {
+            [void]$lines.Add(('  {0}  ({1} bytes)' -f [string]$item.Path, [string]$item.Size))
+        }
+        [void]$lines.Add('Delete these paths on Studio, or exclude them from the sync folder, and re-run.')
+
+        throw [System.InvalidOperationException]::new([string]::Join("`n", $lines.ToArray()))
+    }
+
     try {
         $index = 0
         foreach ($row in $rows) {

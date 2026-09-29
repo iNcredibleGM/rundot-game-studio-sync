@@ -257,11 +257,11 @@ function Invoke-RemoteTextCreate {
                 -Headers $Headers
         }
         elseif ($moveApplied) {
-            $wrapper = [System.InvalidOperationException]::new(
-                ("Text create failed after move for '{0}'. The remote path may hold staging bytes; BASE was not updated." -f $CanonicalPath),
-                $original
-            )
-            throw $wrapper
+            # The move succeeded, so name the check that actually failed after
+            # it; a wrapper alone is unactionable (#51).
+            throw (New-RemotePlaceAfterMoveFailure `
+                -Summary ("Text create failed after move for '{0}'. The remote path may hold staging bytes; BASE was not updated." -f $CanonicalPath) `
+                -Cause $original)
         }
 
         throw
