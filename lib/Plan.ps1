@@ -214,11 +214,7 @@ function Get-SyncPlanOperationRows {
                         -CanonicalPath $path `
                         -RemotePaths $remotePathsList
 
-                    if (Test-SyncOversizeSize -Size $localSizeValue) {
-                        $applicable = $false
-                        $reason = Get-SyncOversizeRefusalReason -Size $localSizeValue
-                    }
-                    elseif ($localSizeValue -le 0) {
+                    if ($localSizeValue -le 0) {
                         $applicable = $false
                         $reason = $script:SyncPlanBinaryEmptyReason
                     }
@@ -227,6 +223,9 @@ function Get-SyncPlanOperationRows {
                         $reason = $placeRefusal
                     }
                     elseif ([string]::IsNullOrEmpty($remoteSha)) {
+                        # A binary create. Over the read limit it is still
+                        # publishable: the place sequence verifies it from the
+                        # upload ETag instead of a GET /file read-back (#54).
                         if ($null -ne $remoteEntry) {
                             $applicable = $false
                             $reason = 'REMOTE is present, so this is not a binary create.'
@@ -235,6 +234,12 @@ function Get-SyncPlanOperationRows {
                             $applicable = $true
                             $reason = $null
                         }
+                    }
+                    elseif (Test-SyncOversizeSize -Size $localSizeValue) {
+                        # A binary REPLACE over the limit cannot be backed up
+                        # or hash-gated, so it stays refused (#54).
+                        $applicable = $false
+                        $reason = Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue
                     }
                     elseif ($remoteKind -ne 'binary') {
                         $applicable = $false

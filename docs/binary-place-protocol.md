@@ -293,6 +293,16 @@ local file's MD5 against the `ETag` the presigned `PUT` returned, with no
 `GET /file` involved — at any size. That is the route to publishing a binary
 over 2,000,000 bytes.
 
+**#54 implements it for creates.** `Invoke-RemotePresignedObjectPut` returns the
+`ETag`, and the place sequence verifies an oversize payload against
+`Get-SyncLocalFileMd5Hex` instead of a read-back. The ETag is accepted **only**
+alongside the checks that already passed: the adopt response's recorded path
+equalled the expected staging path, the move landed on the planned destination,
+and the recorded size equalled the uploaded byte count. A non-plain digest (a
+multipart `ETag`) is refused rather than compared. BASE still records the local
+**SHA-256**, which is the shared identity once the ETag has proven the stored
+bytes equal the local bytes.
+
 Two limits remain, and they are read-side:
 
 1. **Reading an existing oversize remote file is still impossible.** No route
@@ -300,7 +310,10 @@ Two limits remain, and they are read-side:
    `upload-adopt`, not `move`. Snapshot, Plan, and Pull cannot verify such a
    file, so a project that already *contains* one still refuses.
 2. **Replacing an oversize remote original still needs its bytes** for the
-   pre-overwrite backup and the `expectedRemoteHash` gate.
+   pre-overwrite backup and the `expectedRemoteHash` gate, so an oversize
+   **replace** stays refused. The refusal is now specific about which of the two
+   it is (`Get-SyncOversizeReplaceRefusalReason`), so a create is never turned
+   away for a replace-only reason.
 
 MD5 is weaker than the SHA-256 used everywhere else, so adopting it trades
 collision resistance for the ability to verify at all. That trade belongs in an
@@ -323,8 +336,10 @@ cause was invisible. The wrapper now appends the inner cause
 
 So the 2,000,000-byte limit is a **precondition** of a reliable place, not an
 edge case: a binary that cannot be read back cannot be verified, and an
-unverifiable replace must not run. The product refuses an oversized local
-binary before any `DELETE` or upload ([binary-place.md](binary-place.md)).
+unverifiable replace must not run. The product refuses an oversized local binary
+**replace** before any `DELETE` or upload, and refuses an oversized remote file
+in a snapshot; an oversized **create** is publishable through the ETag route
+above ([binary-place.md](binary-place.md)).
 
 ## Consequence for `Push` and [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
 

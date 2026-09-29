@@ -84,6 +84,9 @@ function Invoke-RemoteUploadUrl {
 }
 
 function Invoke-RemotePresignedObjectPut {
+    # Returns the object's ETag. Object storage returns it as the MD5 of the
+    # stored bytes, which is the only byte identity available for a file over
+    # Studio's read limit (#54).
     param(
         [Parameter(Mandatory)]
         [string]$UploadUrl,
@@ -110,6 +113,16 @@ function Invoke-RemotePresignedObjectPut {
     $httpResponse = $null
     try {
         $httpResponse = $request.GetResponse()
+
+        $etag = $null
+        try {
+            $etag = [string]$httpResponse.Headers['ETag']
+        }
+        catch {
+            $etag = $null
+        }
+
+        return $etag
     }
     catch [System.Net.WebException] {
         throw (Convert-WebExceptionToRemoteHttpException -Exception $_.Exception)

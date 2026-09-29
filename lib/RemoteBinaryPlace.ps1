@@ -504,10 +504,22 @@ function Invoke-RemoteBinaryPlaceSequence {
 
         $minted = Get-RemoteUploadUrlResponseFields -Response $uploadUrlResponse
 
-        Invoke-RemotePresignedObjectPut `
+        $storedEtag = Invoke-RemotePresignedObjectPut `
             -UploadUrl $minted.UploadUrl `
             -Bytes $bytes `
-            -ContentType 'application/octet-stream' | Out-Null
+            -ContentType 'application/octet-stream'
+
+        # For a file over Studio's read limit the SHA-256 read-back below is
+        # impossible, so the uploaded payload's MD5 is computed now and the
+        # ETag is the evidence that binds it to these exact bytes (#54). It
+        # hashes the same array that was uploaded, not a re-read, so a file
+        # change between the read and the upload cannot make the identity
+        # describe bytes that were never sent. Computed only when needed so the
+        # common path pays nothing.
+        $localMd5 = $null
+        if (Test-SyncOversizeSize -Size $bytes.Length) {
+            $localMd5 = Get-SyncMd5HexFromBytes -Bytes $bytes
+        }
 
         Assert-RemoteBinaryPlaceStepGate `
             -Artifact $Artifact `
@@ -595,21 +607,54 @@ function Invoke-RemoteBinaryPlaceSequence {
             }
         }
 
-        $destResponse = & $GetRemoteFile $StudioOrigin $ProjectId $destinationAbsolute $Headers
-        $destEncoding = [string](Get-SyncEntryProperty `
-            -Entry $destResponse `
-            -Names @('encoding', 'Encoding'))
-        if ($destEncoding -ne 'base64') {
-            throw [System.InvalidOperationException]::new(
-                ("Placed file at '{0}' is not binary (base64)." -f $CanonicalPath)
-            )
-        }
+        if (Test-SyncOversizeSize -Size $bytes.Length) {
+            # Over the read limit, so GET /file cannot return these bytes and a
+            # SHA-256 read-back is impossible. The identity evidence is the
+            # presigned PUT's ETag, which is the MD5 of the stored object, and
+            # it is accepted ONLY alongside the checks that already passed
+            # above: the adopt-recorded path equalled the expected staging path
+            # and the move landed on the planned destination (#54).
+            $storedSize = $null
+            $sizeProperty = $adoptResponse.PSObject.Properties['size']
+            if ($null -ne $sizeProperty -and $null -ne $sizeProperty.Value) {
+                $storedSize = [int64]$sizeProperty.Value
+            }
 
-        $destSha = Get-RemoteFileContentSha256 -Response $destResponse
-        if (-not (Test-SyncHashEqual -LeftSha256 $destSha -RightSha256 $LocalSha256)) {
-            throw [System.InvalidOperationException]::new(
-                ("Placed file at '{0}' does not match the local hash." -f $CanonicalPath)
-            )
+            if ($null -eq $storedSize -or $storedSize -ne [int64]$bytes.Length) {
+                throw [System.InvalidOperationException]::new(
+                    ("Placed file at '{0}' recorded size '{1}' instead of the uploaded '{2}' bytes." -f `
+                        $CanonicalPath, [string]$storedSize, [string]$bytes.Length)
+                )
+            }
+
+            if ([string]::IsNullOrEmpty($storedEtag)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Placed file at '{0}' returned no upload ETag, so its bytes cannot be verified without reading it back." -f $CanonicalPath)
+                )
+            }
+
+            $null = Assert-SyncEtagMatchesLocalMd5 `
+                -Etag $storedEtag `
+                -LocalMd5Hex $localMd5 `
+                -CanonicalPath $CanonicalPath
+        }
+        else {
+            $destResponse = & $GetRemoteFile $StudioOrigin $ProjectId $destinationAbsolute $Headers
+            $destEncoding = [string](Get-SyncEntryProperty `
+                -Entry $destResponse `
+                -Names @('encoding', 'Encoding'))
+            if ($destEncoding -ne 'base64') {
+                throw [System.InvalidOperationException]::new(
+                    ("Placed file at '{0}' is not binary (base64)." -f $CanonicalPath)
+                )
+            }
+
+            $destSha = Get-RemoteFileContentSha256 -Response $destResponse
+            if (-not (Test-SyncHashEqual -LeftSha256 $destSha -RightSha256 $LocalSha256)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Placed file at '{0}' does not match the local hash." -f $CanonicalPath)
+                )
+            }
         }
 
         Assert-RemoteBinaryPlaceStagingGone `

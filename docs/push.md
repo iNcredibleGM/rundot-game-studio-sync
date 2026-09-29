@@ -177,13 +177,17 @@ live hash checks.
 
 Paths that stay out of the list are never published: `download` where LOCAL
 still matches BASE (`A / A / B`), `deleteLocalCandidate`, `KindChange`, ignored
-paths, reserved or directory-shaped routes, empty binaries, binaries over
-Studio's 2,000,000-byte read limit, and any row whose live status no longer
+paths, reserved or directory-shaped routes, empty binaries, binaries **replaced**
+over Studio's 2,000,000-byte read limit, and any row whose live status no longer
 matches the plan artifact.
 
-A binary over the read limit can be placed but never read back, so it can never
-be verified; `-LocalWins` excludes it with the read-limit reason and continues
-with the rest, while default `Push` refuses the whole run ([binary-place.md](binary-place.md)).
+A binary **replace** over the read limit needs its existing remote bytes for the
+pre-overwrite backup and the `expectedRemoteHash` gate, and `GET /file` cannot
+return them, so it is never published; `-LocalWins` excludes it with the
+read-limit reason and continues with the rest, while default `Push` refuses the
+whole run. A binary **create** over the limit *is* published: the place sequence
+verifies it from the presigned upload `ETag` instead of a read-back (#54,
+[binary-place.md](binary-place.md)).
 
 A text file over Studio's 2,000,000-character editor limit is refused at the
 `PUT` itself. That refusal leaves the previous remote content intact, so
@@ -319,7 +323,8 @@ remains and that BASE was not updated.
 | Backup failure | Abort before any `PUT`; old BASE |
 | Local file changed since the scan | Refuse before that `PUT` |
 | Remote hash mismatch on `GET` | Refuse before that `PUT` |
-| Local binary over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Local binary **replace** over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Local binary **create** over the read limit | Published and verified from the upload `ETag` (#54) |
 | Text over Studio's 2,000,000-character editor limit | Refuse before that `PUT`; the previous remote content is intact ([text-write-protocol.md](text-write-protocol.md)); default `Push` aborts, `-LocalWins` records a `REFUSED` row and continues |
 | `PUT` or echo verify failure | Abort; BASE unchanged; backup set kept |
 | BASE update fails | Journaled as failed; old BASE remains authoritative |

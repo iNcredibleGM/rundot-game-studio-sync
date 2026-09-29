@@ -21,8 +21,9 @@ or fewer** returns `200` with the encoded content; **2,000,001 bytes or more**
 returns HTTP `413` `file too large to view`. No alternate large-file read route
 was found (every guessed shape — `raw=1`, `download`, `asset`, `blob`, a signed
 URL — returned `404`), so a binary over the limit can be placed but never read
-back or verified. The tool refuses such a file before any destructive step
-([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
+back. The tool refuses such a file **as a replace** before any destructive step,
+and publishes it **as a create** by verifying from the presigned upload `ETag`
+instead ([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
 
 The limit is a property of the **route**, not of the response body. That was
 tested, not assumed (#51): a `Range` request (`bytes=0-1023`, a suffix range,

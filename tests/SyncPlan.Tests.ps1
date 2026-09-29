@@ -1033,12 +1033,13 @@ try {
         "the DIAGNOSTIC section must name the affected path"
 
     # --------------------------------------------------------------------------
-    # A binary over Studio's read limit is refused at Plan, before any write (#51)
+    # A binary over Studio's read limit at Plan (#51, revised by #54)
     # --------------------------------------------------------------------------
 
-    # The bytes could be placed, but GET /file returns 413 above the limit, so
-    # the destination could never be read back or verified. Plan must refuse it
-    # with an actionable reason rather than let Push attempt the move.
+    # A CREATE over the limit is now PUBLISHABLE: the place sequence verifies it
+    # from the upload ETag instead of a GET /file read-back (#54). A REPLACE
+    # stays refused, because the pre-overwrite backup and the expectedRemoteHash
+    # gate both need the existing remote bytes.
     $oversizeLimit = Get-SyncStudioMaxReadableFileSize
     $oversizeCreateLocal = @{
         'public/huge.png' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary' -Size ($oversizeLimit + 1))
@@ -1060,20 +1061,15 @@ try {
     $oversizeCreateOps = @($oversizeCreateArtifact.operations)
 
     $hugeCreateRow = Get-SyncPlanTestRowForPath -Rows $oversizeCreateOps -Path 'public/huge.png'
-    Assert-Equal $false $hugeCreateRow.applicable "an oversized binary create must not be applicable"
-    Assert-True `
-        (([string]$hugeCreateRow.reason) -match 'read limit') `
-        "an oversized binary create must explain the read limit"
-    Assert-True `
-        (([string]$hugeCreateRow.reason) -match [regex]::Escape([string]$oversizeLimit)) `
-        "the oversized refusal must name the limit"
+    Assert-Equal $true $hugeCreateRow.applicable "an oversized binary create must stay applicable (#54)"
+    Assert-Null $hugeCreateRow.reason "an oversized binary create must not carry a block reason (#54)"
 
     $smallCreateRow = Get-SyncPlanTestRowForPath -Rows $oversizeCreateOps -Path 'public/small.png'
     Assert-Equal $true $smallCreateRow.applicable "a binary create under the limit must stay applicable"
     Assert-Null $smallCreateRow.reason "a publishable binary create must not carry a block reason"
 
-    # The same limit applies to a binary replace, which is the delete-then-place
-    # path #51 reported.
+    # A REPLACE over the limit stays refused: it is the delete-then-place path
+    # #51 reported, and its existing remote bytes cannot be read.
     $oversizeReplaceBase = @{
         'public/x.png' = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA -Kind 'binary')
     }
@@ -1105,6 +1101,9 @@ try {
     Assert-True `
         (([string]$hugeReplaceRow.reason) -match 'read limit') `
         "an oversized binary replace must explain the read limit"
+    Assert-True `
+        (([string]$hugeReplaceRow.reason) -match [regex]::Escape([string]$oversizeLimit)) `
+        "the oversized replace refusal must name the limit"
 }
 finally {
     if (Test-Path -LiteralPath $syncPlanTestRoot) {
