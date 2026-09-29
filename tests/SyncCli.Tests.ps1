@@ -550,3 +550,51 @@ Assert-True `
 Assert-True `
     ($pushFunctionText -notmatch "\.Method\s*=\s*['`"]DELETE['`"]") `
     "Invoke-SyncPushCommand must not send DELETE itself"
+
+
+# --------------------------------------------------------------------------
+# Progress wiring: the CLI loads the helper and asks every command for
+# host-visible hashing and download progress
+# --------------------------------------------------------------------------
+
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Progress.ps1')) `
+    "the CLI should load lib\Progress.ps1"
+
+foreach ($progressFunction in @(
+    'Invoke-SyncPlanCommand',
+    'Invoke-SyncPullCommand',
+    'Invoke-SyncPushCommand'
+)) {
+    $progressFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName $progressFunction
+    Assert-True `
+        (-not [string]::IsNullOrEmpty($progressFunctionText)) `
+        "the CLI must define $progressFunction"
+
+    Assert-True `
+        ($progressFunctionText -match [regex]::Escape('Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress')) `
+        "$progressFunction should request local hashing progress"
+
+    Assert-True `
+        ($progressFunctionText -match '(?s)Get-StableRemoteSnapshot.{0,240}-ShowProgress') `
+        "$progressFunction should request remote download progress"
+}
+
+$initProgressFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncInit'
+Assert-True `
+    (-not [string]::IsNullOrEmpty($initProgressFunctionText)) `
+    "the CLI must define Invoke-SyncInit"
+
+# Init Adopt hashes the existing tree; FromRemote downloads. The adopt
+# initializer must ask for hashing progress, and both snapshot calls in
+# lib/Init.ps1 already pass -ShowProgress.
+$initLibrarySource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\Init.ps1"))
+Assert-True `
+    ($initLibrarySource -match [regex]::Escape('Get-LocalManifest -WorkspaceRoot $LocalDir -ShowProgress')) `
+    "Init Adopt should request local hashing progress"
+
+$snapshotShowProgressCount = ([regex]::Matches($initLibrarySource, '-ShowProgress')).Count
+Assert-True `
+    ($snapshotShowProgressCount -ge 2) `
+    "both Init modes should request remote download progress"
+

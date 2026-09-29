@@ -4,6 +4,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 
 $nfcE = [string][char]0x00E9
@@ -61,6 +62,34 @@ try {
     }
     Assert-True (-not $hasAbsoluteKey) "manifest keys must be relative slash paths, never Windows absolute paths"
 
+    # -ShowProgress prints a start and final line and still inventories the
+    # same map. It must never change the result.
+    $script:ManifestTestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:ManifestTestProgressLines.Add($Text)
+    }
+    try {
+        $progressManifest = Get-LocalManifest -WorkspaceRoot $workspace -ShowProgress
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+
+    $progressLines = @($script:ManifestTestProgressLines.ToArray())
+    Assert-True ($progressLines.Count -ge 2) "hashing with -ShowProgress must print at least a start and final line"
+    Assert-True `
+        ($progressLines[0] -match 'Hashing local files') `
+        "the hashing start line must be plain text"
+    Assert-True `
+        ($progressLines[$progressLines.Count - 1] -match 'Hashed 3 local file') `
+        "the hashing final line must report the count"
+    Assert-Equal `
+        $(if ($null -eq $manifest) { 0 } else { $manifest.Count }) `
+        $(if ($null -eq $progressManifest) { 0 } else { $progressManifest.Count }) `
+        "progress must not change the inventory result"
+
     # A reparse point in a scanned directory is unsafe; it must abort rather
     # than silently follow or omit an unknown portion of the tree.
     $reparseWorkspace = Join-Path $testRoot "reparse-workspace"
@@ -71,6 +100,12 @@ try {
     Assert-Throws {
         Get-LocalManifest -WorkspaceRoot $reparseWorkspace
     } "a non-ignored junction must abort the whole local inventory"
+
+    # Progress must not soften fail-closed: a junction still aborts with
+    # -ShowProgress on.
+    Assert-Throws {
+        Get-LocalManifest -WorkspaceRoot $reparseWorkspace -ShowProgress
+    } "a non-ignored junction must still abort with -ShowProgress on"
 
     # An unreadable listed file must likewise abort; a partial map could later
     # be mistaken for deletion candidates.
@@ -88,6 +123,9 @@ try {
         Assert-Throws {
             Get-LocalManifest -WorkspaceRoot $lockedWorkspace
         } "an unreadable file must abort the whole local inventory"
+        Assert-Throws {
+            Get-LocalManifest -WorkspaceRoot $lockedWorkspace -ShowProgress
+        } "an unreadable file must still abort with -ShowProgress on"
     }
     finally {
         $lockStream.Dispose()
@@ -96,5 +134,79 @@ try {
 finally {
     if (Test-Path -LiteralPath $testRoot) {
         Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# --------------------------------------------------------------------------
+# Progress: hashing a local tree reports a start line, per-file lines, and a
+# final count, without changing fail-closed behavior.
+# --------------------------------------------------------------------------
+
+$manifestProgressRoot = Join-Path $env:TEMP ("rundot-manifest-progress-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $manifestProgressRoot | Out-Null
+
+try {
+    $progressWorkspace = Join-Path $manifestProgressRoot "workspace"
+    New-Item -ItemType Directory -Path $progressWorkspace | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $progressWorkspace "a.ts"), [byte[]](0x61))
+    [System.IO.File]::WriteAllBytes((Join-Path $progressWorkspace "b.ts"), [byte[]](0x62))
+
+    $manifestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $manifestProgressLines.Add($Text)
+    }
+
+    try {
+        $progressManifest = Get-LocalManifest -WorkspaceRoot $progressWorkspace -ShowProgress
+        $lines = @($manifestProgressLines.ToArray())
+
+        Assert-Equal 2 $progressManifest.Count "the manifest must still inventory every file with progress on"
+        Assert-True ($lines.Count -ge 2) "progress must emit at least a start and a final line"
+        Assert-True `
+            ($lines[0] -match '(?i)hashing local files') `
+            "the first progress line must announce that local hashing started"
+        Assert-True `
+            ($lines[$lines.Count - 1] -match '(?i)hashed 2 local file') `
+            "the final progress line must report the hashed count"
+        Assert-True `
+            (-not ($lines -match '(?i)token|authorization|bearer')) `
+            "progress lines must never contain credential text"
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $null
+    }
+
+    # Fail-closed with progress on: an unreadable file still aborts, and the
+    # final "hashed" line is not printed as if the inventory succeeded.
+    $progressLocked = Join-Path $manifestProgressRoot "locked"
+    New-Item -ItemType Directory -Path $progressLocked | Out-Null
+    $progressLockedPath = Join-Path $progressLocked "locked.ts"
+    [System.IO.File]::WriteAllBytes($progressLockedPath, [byte[]](0x61))
+    $progressLockStream = [System.IO.File]::Open(
+        $progressLockedPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+
+    $progressLockLines = New-Object 'System.Collections.Generic.List[string]'
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $progressLockLines.Add($Text)
+    }
+    try {
+        Assert-Throws {
+            Get-LocalManifest -WorkspaceRoot $progressLocked -ShowProgress
+        } "progress must not change the fail-closed hash behavior"
+    }
+    finally {
+        $progressLockStream.Dispose()
+        $script:RundotSyncProgressWriter = $null
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $manifestProgressRoot) {
+        Remove-Item -LiteralPath $manifestProgressRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

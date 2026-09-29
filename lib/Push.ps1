@@ -1817,7 +1817,24 @@ function Invoke-RundotSyncPushApply {
     try {
         # Back up every path first, writes and deletes alike. No DELETE runs
         # until every backup it depends on has verified.
+        #
+        # Progress counts are separate for the backup and write phases so each
+        # line reports applied versus remaining for the phase it belongs to.
+        $backupTotal = $actionRows.Count `
+            + @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' }).Count `
+            + $deleteRows.Count
+        $writeTotal = $actionRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+        $backupDone = 0
+        $writeDone = 0
+
         foreach ($action in $actionRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
             Save-RundotSyncPushRemoteBackup `
                 -WorkspaceRoot $WorkspaceRoot `
                 -BackupSetPath $BackupSetPath `
@@ -1827,9 +1844,17 @@ function Invoke-RundotSyncPushApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
         }
 
         foreach ($action in @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' })) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
             Save-RundotSyncPushRemoteBackup `
                 -WorkspaceRoot $WorkspaceRoot `
                 -BackupSetPath $BackupSetPath `
@@ -1839,9 +1864,17 @@ function Invoke-RundotSyncPushApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
         }
 
         foreach ($action in $deleteRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
             Save-RundotSyncPushRemoteBackup `
                 -WorkspaceRoot $WorkspaceRoot `
                 -BackupSetPath $BackupSetPath `
@@ -1851,9 +1884,17 @@ function Invoke-RundotSyncPushApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
         }
 
         foreach ($action in $actionRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
             $appliedLocal = Invoke-RundotSyncPushWriteAction `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Action $action `
@@ -1865,9 +1906,17 @@ function Invoke-RundotSyncPushApply {
 
             [void]$appliedActions.Add($action)
             [void]$appliedLocals.Add($appliedLocal)
+            $writeDone++
         }
 
         foreach ($action in $createRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
             $createdLocal = Invoke-RundotSyncPushCreateAction `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Action $action `
@@ -1880,9 +1929,17 @@ function Invoke-RundotSyncPushApply {
 
             [void]$createdActions.Add($action)
             [void]$createdLocals.Add($createdLocal)
+            $writeDone++
         }
 
         foreach ($action in $binaryRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
             $binaryLocal = Invoke-RundotSyncPushBinaryAction `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Action $action `
@@ -1897,9 +1954,17 @@ function Invoke-RundotSyncPushApply {
 
             [void]$binaryActionsDone.Add($action)
             [void]$binaryLocals.Add($binaryLocal)
+            $writeDone++
         }
 
         foreach ($action in $deleteRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
             $deleted = Invoke-RundotSyncDeleteAction `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Action $action `
@@ -1912,6 +1977,7 @@ function Invoke-RundotSyncPushApply {
                 -GetRemoteFileList $GetRemoteFileList
 
             [void]$deletedActions.Add($deleted)
+            $writeDone++
         }
     }
     catch {
@@ -2140,7 +2206,24 @@ function Invoke-RundotSyncLocalWinsApply {
     $binaryLocals = New-Object 'System.Collections.Generic.List[object]'
     $deletedActions = New-Object 'System.Collections.Generic.List[object]'
 
+    # Progress counts are separate per phase so each line reports applied
+    # versus remaining for the work it belongs to. LocalWins continues after a
+    # refusal, so the write counter advances on the attempt, not the success.
+    $backupTotal = $actionRows.Count `
+        + @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' }).Count `
+        + $deleteRows.Count
+    $writeTotal = $actionRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+    $backupDone = 0
+    $writeDone = 0
+
     foreach ($action in $actionRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
         Save-RundotSyncPushRemoteBackup `
             -WorkspaceRoot $WorkspaceRoot `
             -BackupSetPath $BackupSetPath `
@@ -2150,9 +2233,17 @@ function Invoke-RundotSyncLocalWinsApply {
             -Headers $Headers `
             -GetRemoteFile $GetRemoteFile `
             -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
     }
 
     foreach ($action in @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' })) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
         Save-RundotSyncPushRemoteBackup `
             -WorkspaceRoot $WorkspaceRoot `
             -BackupSetPath $BackupSetPath `
@@ -2162,9 +2253,17 @@ function Invoke-RundotSyncLocalWinsApply {
             -Headers $Headers `
             -GetRemoteFile $GetRemoteFile `
             -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
     }
 
     foreach ($action in $deleteRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
         Save-RundotSyncPushRemoteBackup `
             -WorkspaceRoot $WorkspaceRoot `
             -BackupSetPath $BackupSetPath `
@@ -2174,9 +2273,17 @@ function Invoke-RundotSyncLocalWinsApply {
             -Headers $Headers `
             -GetRemoteFile $GetRemoteFile `
             -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
     }
 
     foreach ($action in $actionRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
         try {
             $appliedLocal = Invoke-RundotSyncPushWriteAction `
                 -WorkspaceRoot $WorkspaceRoot `
@@ -2196,9 +2303,17 @@ function Invoke-RundotSyncLocalWinsApply {
                 -Action $action `
                 -Reason ([string]$_.Exception.Message)
         }
+        $writeDone++
     }
 
     foreach ($action in $createRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
         try {
             $createdLocal = Invoke-RundotSyncPushCreateAction `
                 -WorkspaceRoot $WorkspaceRoot `
@@ -2219,9 +2334,17 @@ function Invoke-RundotSyncLocalWinsApply {
                 -Action $action `
                 -Reason ([string]$_.Exception.Message)
         }
+        $writeDone++
     }
 
     foreach ($action in $binaryRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
         try {
             $binaryLocal = Invoke-RundotSyncPushBinaryAction `
                 -WorkspaceRoot $WorkspaceRoot `
@@ -2244,9 +2367,17 @@ function Invoke-RundotSyncLocalWinsApply {
                 -Action $action `
                 -Reason ([string]$_.Exception.Message)
         }
+        $writeDone++
     }
 
     foreach ($action in $deleteRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
         try {
             $deleted = Invoke-RundotSyncDeleteAction `
                 -WorkspaceRoot $WorkspaceRoot `
@@ -2267,6 +2398,7 @@ function Invoke-RundotSyncLocalWinsApply {
                 -Action $action `
                 -Reason ([string]$_.Exception.Message)
         }
+        $writeDone++
     }
 
     $binaryCreatedCount = 0

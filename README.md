@@ -193,6 +193,33 @@ refuses the whole run and asks you to plan again.
 - Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
   skipped; there is no automatic conflict resolution in this version
 
+## Progress on large trees
+
+Every command that hashes your tree, downloads the remote snapshot, or
+publishes files prints plain progress lines that do not depend on
+`Write-Progress` (which some hosts hide):
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+Backing up 1 of 3: src/game/level-12.ts (applied 0, remaining 2)
+Publishing 2 of 3: src/game/level-13.ts (applied 1, remaining 1)
+```
+
+- Hashing and download print a start line, a throttled `count: path` line (at
+  most about once per second), and a final count.
+- Pull and Push name each file they back up or write, with applied versus
+  remaining counts.
+- The `Write-Progress` bar is still shown where the host supports it.
+
+Progress lines carry a canonical path and integer counts only. They never
+include file contents, access tokens, refresh tokens, or `Authorization`
+headers. Printing progress is best effort and never changes fail-closed
+behavior: a failed hash, backup, or write still aborts the run.
+
 ## Your workspace metadata
 
 Sync state lives in `<LocalDir>\.rundot-sync\`:

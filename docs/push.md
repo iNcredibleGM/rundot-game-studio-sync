@@ -54,6 +54,36 @@ replace via the documented upload + move place sequence, and a
 12. **Journal and prune.** Metadata-only records are appended, then old backup
     sets are pruned best-effort.
 
+## Progress output
+
+Push hashes the local tree, downloads the remote snapshot, then backs up and
+writes each selected path. It prints plain progress lines that do not depend
+on `Write-Progress`:
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+Backing up 1 of 3: src/game/level-12.ts (applied 0, remaining 2)
+Publishing 2 of 3: src/game/level-13.ts (applied 1, remaining 1)
+```
+
+- Hashing and download are throttled (at most about once per second) with a
+  start line and a final count.
+- Each backed-up and published path is named, with applied versus remaining
+  counts. Publishing covers text overwrites, text creates, binary places, and
+  deletes; the phase is labelled `Backing up` before any mutation and
+  `Publishing` as each write is applied.
+- The `Write-Progress` bar is still updated where the host shows it.
+
+Progress output contains a canonical path and integer counts only. It never
+prints file contents, access tokens, refresh tokens, or `Authorization`
+headers. A progress write is best effort and never changes fail-closed
+behavior: a failed hash, backup, or write still aborts the mutating step, and
+`-LocalWins` still records a refused path and continues with the rest.
+
 ## Allowed automatic remote writes
 
 Three classifications may be published:

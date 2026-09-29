@@ -18,6 +18,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
@@ -695,6 +696,57 @@ try {
         $cleanLocalBytes `
         (Get-PullTestBytes -LiteralPath $cleanBackedUp) `
         "the overwritten original must be recoverable from the backup set"
+
+    # ----------------------------------------------------------------------
+    # Apply progress: names each backed-up and written path, and a write
+    # failure still rolls back with progress on
+    # ----------------------------------------------------------------------
+
+    $progressWorkspace = New-PullTestWorkspace -Root $pullApplyRoot
+    $progressPath = Join-Path $progressWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $progressPath -Bytes ($pullApplyUtf8.GetBytes('local progress content'))
+    $progressStagingSource = Join-Path $pullApplyRoot "progress-remote.ts"
+    Write-PullTestBytes -LiteralPath $progressStagingSource -Bytes ($pullApplyUtf8.GetBytes('remote progress content'))
+    $progressLocal = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $progressPath) }
+    $progressBase = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $progressPath) }
+    $progressRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry `
+            -StagingPath $progressStagingSource `
+            -WorkspaceStagingRoot $progressWorkspace `
+            -CanonicalPath 'src/a.ts')
+    }
+    $progressSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $progressWorkspace -RemoteEntries $progressRemoteMap
+    $progressSelection = Get-SyncPullSelection -Base $progressBase -Local $progressLocal -Remote $progressSnapshot.Files
+
+    $script:PullTestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:PullTestProgressLines.Add($Text)
+    }
+    try {
+        $progressResult = Invoke-RundotSyncPullApply `
+            -WorkspaceRoot $progressWorkspace `
+            -Actions $progressSelection.Actions `
+            -Local $progressLocal `
+            -Remote $progressSnapshot.Files `
+            -BackupRoot (Get-RundotSyncBackupRoot -WorkspaceRoot $progressWorkspace)
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+
+    $progressLines = @($script:PullTestProgressLines.ToArray())
+    Assert-Equal 1 $progressResult.Applied "the progress fixture must apply one overwrite"
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Backing up 1 of 1' -and $_ -match 'src/a\.ts' }).Count -eq 1) `
+        "pull progress must name the backed-up path"
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Writing 1 of 1' -and $_ -match 'src/a\.ts' }).Count -eq 1) `
+        "pull progress must name the written path"
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match '(?i)bearer|authoriz|access[_-]?token|refresh[_-]?token' }).Count -eq 0) `
+        "pull progress must never print tokens or headers"
 
     # ----------------------------------------------------------------------
     # Binary and zero-byte payloads are ordinary writes

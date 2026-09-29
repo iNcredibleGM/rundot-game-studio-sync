@@ -89,6 +89,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Paths.ps1")
 . (Join-Path $PSScriptRoot "lib\Ignore.ps1")
 . (Join-Path $PSScriptRoot "lib\Hashing.ps1")
+. (Join-Path $PSScriptRoot "lib\Progress.ps1")
 . (Join-Path $PSScriptRoot "lib\Workspace.ps1")
 . (Join-Path $PSScriptRoot "lib\Manifest.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
@@ -276,14 +277,15 @@ function Invoke-SyncPlanCommand {
         #    protected and staged under .rundot-sync/temp.
         Write-Section "$SyncCommand - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
         Write-Host "  before: $($snapshot.RemoteManifestHashBefore)"
@@ -444,14 +446,15 @@ function Invoke-SyncPullCommand {
         #    torn-read protected, and its staged bytes are what Pull writes.
         Write-Section "Pull - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
 
@@ -824,14 +827,15 @@ function Invoke-SyncPushCommand {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
 
