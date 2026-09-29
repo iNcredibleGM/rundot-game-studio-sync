@@ -23,7 +23,9 @@
 # contents.
 
 param(
-    [Parameter(Mandatory = $true)]
+    # Studio project to use. When omitted, a local-only config file is
+    # consulted: .rundot-test.local.json at the repo root, then the
+    # RUNDOT_TEST_PROJECT_ID environment variable.
     [string]$ProjectId,
 
     # Workspace. Defaults to a temp scratch dir, removed at the end.
@@ -41,6 +43,50 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $syncCli = Join-Path $repoRoot 'game-studio-sync.ps1'
 $StudioOrigin = 'https://venus-studio-prod.series-ai.workers.dev'
+
+function Resolve-LiveProjectId {
+    # The project id is an identifier, not a credential, but it is still not
+    # published. Read it from a git-ignored local config so it does not have to
+    # be pasted on every run.
+    param([string]$ExplicitProjectId)
+
+    if (-not [string]::IsNullOrEmpty($ExplicitProjectId)) {
+        return $ExplicitProjectId
+    }
+
+    $configPath = Join-Path $repoRoot '.rundot-test.local.json'
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        try {
+            $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $value = [string]$config.projectId
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value.Trim()
+            }
+        }
+        catch {
+            # Fall through to the environment variable.
+        }
+    }
+
+    $fromEnv = [string]$env:RUNDOT_TEST_PROJECT_ID
+    if (-not [string]::IsNullOrWhiteSpace($fromEnv)) {
+        return $fromEnv.Trim()
+    }
+
+    return $null
+}
+
+$ProjectId = Resolve-LiveProjectId -ExplicitProjectId $ProjectId
+if ([string]::IsNullOrEmpty($ProjectId)) {
+    Write-Host ''
+    Write-Host 'No project id. Pass -ProjectId <id>, or create .rundot-test.local.json:'
+    Write-Host ''
+    Write-Host '  { "projectId": "<id>" }'
+    Write-Host ''
+    Write-Host 'or set the RUNDOT_TEST_PROJECT_ID environment variable.'
+    Write-Host ''
+    exit 2
+}
 
 . (Join-Path $repoRoot 'lib\Paths.ps1')
 . (Join-Path $repoRoot 'lib\Ignore.ps1')

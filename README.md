@@ -450,6 +450,15 @@ makes its own Studio-side change, so it needs no manual step; it deletes the
 probe files it created from Studio on teardown. See
 [docs/acceptance.md](docs/acceptance.md).
 
+Set your disposable project id once instead of passing it every run:
+
+```powershell
+Copy-Item .rundot-test.local.example.json .rundot-test.local.json
+# edit .rundot-test.local.json and set "projectId"
+```
+
+`.rundot-test.local.json` is git-ignored and never committed.
+
 Run the whole test set in one shot:
 
 ```powershell

@@ -2,3 +2,8 @@
 # copies of files Pull overwrote. Bound to one project and one folder, so it
 # must not be shared or committed. See "Your workspace metadata" in README.md.
 .rundot-sync/
+
+# Local test configuration. Holds the disposable Studio project id used by
+# tests/Test-All.ps1 and tests/Live-RoundTrip.ps1. Not a credential, but still
+# not published. Copy .rundot-test.local.example.json to this name to set it.
+.rundot-test.local.json

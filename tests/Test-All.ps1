@@ -20,7 +20,8 @@
 # contents, and the per-phase logs are removed at the end.
 
 param(
-    # Enables the live phase. Without it, only offline phases run.
+    # Enables the live phase. Without it, only offline phases run. When omitted,
+    # a local-only config file is consulted (see Get-LocalTestProjectId).
     [string]$ProjectId,
 
     # Force offline only, even when -ProjectId was supplied.
@@ -42,6 +43,44 @@ $roundTrip = Join-Path $PSScriptRoot 'Live-RoundTrip.ps1'
 
 $script:Phases = New-Object 'System.Collections.Generic.List[object]'
 $script:LogFiles = New-Object 'System.Collections.Generic.List[string]'
+
+function Get-LocalTestProjectId {
+    # Read the disposable test project id from a local-only config so it does
+    # not have to be pasted on every run. The file is git-ignored (see
+    # .git/info/exclude and .gitignore) and holds no credential: a project id is
+    # an identifier, not a secret, but it is still not published.
+    #
+    # Order: -ProjectId parameter wins, then .rundot-test.local.json, then the
+    # RUNDOT_TEST_PROJECT_ID environment variable.
+    param([string]$ExplicitProjectId)
+
+    if (-not [string]::IsNullOrEmpty($ExplicitProjectId)) {
+        return $ExplicitProjectId
+    }
+
+    $configPath = Join-Path $repoRoot '.rundot-test.local.json'
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        try {
+            $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $value = [string]$config.projectId
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value.Trim()
+            }
+        }
+        catch {
+            Write-Host ''
+            Write-Host ('Ignoring malformed {0}: {1}' -f $configPath, $_.Exception.Message)
+            Write-Host ''
+        }
+    }
+
+    $fromEnv = [string]$env:RUNDOT_TEST_PROJECT_ID
+    if (-not [string]::IsNullOrWhiteSpace($fromEnv)) {
+        return $fromEnv.Trim()
+    }
+
+    return $null
+}
 
 function Write-PhaseHeader {
     param([string]$Text)
@@ -104,7 +143,6 @@ function Invoke-Phase {
 # ---------------------------------------------------------------------------
 # Phase 1: unit suite (offline)
 # ---------------------------------------------------------------------------
-
 Invoke-Phase -Name '1. Unit suite (Run-Tests.ps1)' -CliArgs @($unitRunner)
 
 # ---------------------------------------------------------------------------
@@ -118,6 +156,15 @@ Invoke-Phase -Name '2. Offline acceptance gates (Acceptance.ps1 -SkipLive)' `
 # Phase 3: live round-trip (unattended)
 # ---------------------------------------------------------------------------
 
+# -ProjectId wins; otherwise the local config or environment supplies it.
+if ([string]::IsNullOrEmpty($ProjectId)) {
+    $ProjectId = Get-LocalTestProjectId -ExplicitProjectId $ProjectId
+    if (-not [string]::IsNullOrEmpty($ProjectId)) {
+        Write-Host ("Using project id from local config: {0}" -f $ProjectId)
+        Write-Host ''
+    }
+}
+
 $runLive = (-not $SkipLive) -and (-not [string]::IsNullOrEmpty($ProjectId))
 
 if ($runLive) {
@@ -129,7 +176,7 @@ if ($runLive) {
 }
 else {
     $reason = '-SkipLive'
-    if (-not $SkipLive) { $reason = 'no -ProjectId supplied' }
+    if (-not $SkipLive) { $reason = 'no project id (pass -ProjectId, or set .rundot-test.local.json / RUNDOT_TEST_PROJECT_ID)' }
 
     $script:Phases.Add([pscustomobject]@{
         Name   = '3. Live round-trip (Live-RoundTrip.ps1)'

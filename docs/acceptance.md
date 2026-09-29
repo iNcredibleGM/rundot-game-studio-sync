@@ -51,6 +51,35 @@ is reported `SKIP`, never a silent pass. `-KeepWorkspace` and
 gates 2-4 pause on `Read-Host` for a human Studio edit, so they cannot be
 unattended. Phase 3 covers the same up/down/restore ground with no pause.
 
+### Supplying the project id once
+
+The live phase needs a disposable project id. Instead of passing `-ProjectId`
+on every run, put it in a local-only config file:
+
+```powershell
+Copy-Item .rundot-test.local.example.json .rundot-test.local.json
+# then edit .rundot-test.local.json and set your project id
+```
+
+```json
+{ "projectId": "<your disposable project id>" }
+```
+
+Resolution order:
+
+1. `-ProjectId` on the command line (wins)
+2. `.rundot-test.local.json` at the repo root
+3. the `RUNDOT_TEST_PROJECT_ID` environment variable
+
+`.rundot-test.local.json` is git-ignored (both `.gitignore` and
+`.git/info/exclude`), so it is never committed or published. A project id is an
+identifier rather than a credential, but it is still not published. The
+committed `.rundot-test.local.example.json` is the template, and it carries no
+real id.
+
+`tests/Live-RoundTrip.ps1` reads the same config, so it also runs without
+`-ProjectId`.
+
 ### Running the final acceptance harness
 
 `tests/Acceptance.ps1` executes the gates below and prints a PASS/FAIL table.
