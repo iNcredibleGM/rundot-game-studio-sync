@@ -115,6 +115,7 @@ function Write-AcceptanceGateMap {
     Write-Host "  13   Push journals success and push-backup without secrets       [live]"
     Write-Host "  14   Binary create via place sequence (-ForcePush)                 [live]"
     Write-Host "  15   Binary replace with remote backup                             [live]"
+    Write-Host "  16   Host-visible progress (hashing, download, publish)            [live]"
     Write-Host ""
     Write-Host "Init is setup inside gate 2 when BASE is missing; it is not a numbered gate."
     Write-Host "Numbers 5-10 were defined for the Pull milestone; 11-13 extend Push without"

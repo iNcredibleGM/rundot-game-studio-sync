@@ -45,6 +45,54 @@ reuse the Gate 2 local edit after Pull and publish it with documented
 for Pull, prints no tokens or file contents, and exits non-zero if any gate
 failed.
 
+### Fully automatic live round-trip
+
+`tests/Acceptance.ps1` pauses for a human Studio edit. When you want an
+end-to-end live run with **no manual step at all**, use
+`tests/Live-RoundTrip.ps1`. It makes its own Studio-side change, so it runs
+setup → up → down → restore → teardown unattended and asserts progress output
+at every step:
+
+```powershell
+powershell -NoProfile -File .\tests\Live-RoundTrip.ps1 -ProjectId <id>
+```
+
+What it does, in order:
+
+1. **Setup.** `Init -InitMode FromRemote` into an empty temp workspace.
+2. **Adopt hashing progress.** `Init -InitMode Adopt` on a throwaway tree, the
+   case #43 is about (it hashes before printing anything).
+3. **Up.** Writes two new utf8 text files, `Plan`, then `Push -ForcePush`
+   publishes them through the documented create sequence. A second edit plus
+   `Push -ForcePush` exercises the overwrite path, then re-reads Studio to
+   confirm the served bytes match.
+4. **Down.** Rewrites one probe file **on Studio** using the documented
+   `PUT /file` route (acting as a separate client), `Plan`, then
+   `Pull -ForcePull`, and confirms the local file now holds the Studio bytes.
+5. **Restore.** Confirms the Pull backup set reproduces the pre-pull local
+   bytes, and that a plain copy back restores the original hash. Also confirms
+   the Push backup set holds the **previous remote** bytes.
+6. **Fail-closed.** Locks a local file and confirms `Plan` still aborts with
+   non-zero exit *and* still printed the hashing line, so progress never
+   softens a failure.
+7. **Teardown.** Deletes the probe files from Studio via the documented
+   `DELETE /file` route and proves they are gone from `GET /files`, then
+   removes the temp workspace.
+
+Everything it creates lives under one GUID probe folder (`sync-live/<id>/`),
+so teardown removes exactly what setup made. It never creates a new Studio
+write route: it only calls the documented `PUT` / `DELETE` helpers the product
+already owns, and it never prints tokens, auth paths, or file contents.
+
+Cleanup behavior:
+
+- The temp workspace and scratch directory are removed at the end, including on
+  an early abort.
+- `-KeepWorkspace` leaves them in place for inspection.
+- `-SkipRemoteCleanup` leaves the probe files on Studio (for debugging a failed
+  teardown) instead of deleting them.
+
+
 **The run leaves sensitive state behind, so run it into a throwaway
 directory.** A live run creates a `.rundot-sync` workspace, which names every
 file in the project, and its `backups/` set holds the **full contents** of any
@@ -85,6 +133,7 @@ not a license to leave workspace state lying around.
 | 13 | Push journals success and `push-backup` without secrets | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` + live check | Both |
 | 14 | Binary create via documented place sequence | `tests/Acceptance.ps1` gate 14 + live check | Both |
 | 15 | Binary replace with remote backup | `tests/Acceptance.ps1` gate 15 + live check | Both |
+| 16 | Host-visible progress for hashing, download, and publish | `tests/Progress.Tests.ps1`, `tests/Manifest.Tests.ps1`, `tests/Snapshot.Tests.ps1` + `tests/Live-RoundTrip.ps1` | Both |
 
 ### 1. Test suite green
 
@@ -294,6 +343,27 @@ Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
 **Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
 and `Push -ForcePush`. Expect `(binary replace)`, backup SHA matching the
 pre-replace content (not the new local bytes), and both journal events.
+
+### 16. Host-visible progress for hashing, download, and publish
+
+| Property | Evidence |
+| --- | --- |
+| Plain start and final lines for local hashing | `tests/Progress.Tests.ps1`, `tests/Manifest.Tests.ps1` |
+| Plain start and final lines for remote download | `tests/Progress.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
+| Intermediate lines are throttled; `-Force` bypasses it | `tests/Progress.Tests.ps1` |
+| Each published path is named with applied/remaining counts | `tests/Progress.Tests.ps1`, `tests/Push.Tests.ps1`, `tests/Pull.Tests.ps1` |
+| Progress carries a path and integers only, never tokens or contents | `tests/Progress.Tests.ps1`, source scan |
+| A progress write never softens fail-closed behavior | `tests/Manifest.Tests.ps1`, `tests/Push.Tests.ps1`, live round-trip |
+| The CLI requests progress for Init, Plan/Status, Pull, and Push | `tests/SyncCli.Tests.ps1` |
+
+The plain lines are what make progress visible in hosts that hide
+`Write-Progress`; the bar is still updated where the host shows it. The output
+contract is asserted on captured CLI output by `tests/Live-RoundTrip.ps1`, so
+it holds end to end rather than only at the helper boundary.
+
+**Live check:** run `tests/Live-RoundTrip.ps1 -ProjectId <id>`. Expect every
+`progress lines: ...` step to pass, and the fail-closed step to pass with a
+non-zero exit for the locked file.
 
 ## What this record deliberately does not claim
 
