@@ -389,17 +389,29 @@ plans, declines a non-interactive push, then `-ForcePush` creates the file.
 Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
 `push-binary` journal line for that path.
 
-### 15. Binary replace with remote backup
+### 15. Binary replace with remote backup (via `Push -LocalWins`)
 
 | Property | Evidence |
 | --- | --- |
 | Replace plans with `expectedRemoteHash` | `tests/SyncPlan.Tests.ps1` |
+| `Push -LocalWins -ForcePush` applies the replace | gate 15 |
 | Backup holds pre-replace remote bytes | gate 15 |
+| BASE records the new local hash and moves | gate 15 |
 | Journal records `push-backup` and `push-binary` | gate 15 |
+| A binary over the 2,000,000-byte read limit is refused before mutation | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
 
 **Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
-and `Push -ForcePush`. Expect `(binary replace)`, backup SHA matching the
-pre-replace content (not the new local bytes), and both journal events.
+and runs `Push -LocalWins -ForcePush` (the mode a real publish of a diverged
+tree uses). Expect `(binary replace)` in the `BINARY` section, `BASE updated:
+true`, a backup whose SHA matches the pre-replace remote content (not the new
+local bytes), and both journal events. The fully automatic
+`tests/Live-RoundTrip.ps1 -BinaryAssetPath <real image>` covers the same ground
+with a real image and a direct remote read-back hash, including a
+post-move failure-evidence block.
+
+The read limit is the reason the replace must be verified rather than assumed:
+`GET /file` returns 413 above 2,000,000 bytes, so the place could succeed while
+the read-back cannot ([binary-place.md](binary-place.md)).
 
 ### 16. Host-visible progress for hashing, download, and publish
 

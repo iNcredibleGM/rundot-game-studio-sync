@@ -255,6 +255,77 @@ not offered on the Studio routes, and the landing path and its identity are
 decided by `POST /move` afterwards. A client that needs to verify remote content
 must still fetch the file and hash it itself.
 
+## The read-back limit: a placed binary over 2,000,000 bytes cannot be verified
+
+The place sequence ends by reading the destination back and hashing it. That
+read uses `GET /file`, and `GET /file` has a hard limit: **any payload over
+2,000,000 bytes returns HTTP 413 `file too large to view`**. This is a property
+of the read route, observed in the same disposable project, and no alternate
+large-file download route was found — `raw=1`, `download`, `asset`, `blob`, and
+`signed-url` shapes all returned `404` ([protocol.md](protocol.md)).
+
+**The limit is on the route, so it cannot be windowed away.** #51 tested
+`Range` requests, which no earlier run had done, and every shape returned `413`:
+`bytes=0-1023`, a suffix range, a window straddling the 2,000,000 mark, and a
+window *entirely above* it. `HEAD` returned `405`. The threshold counts **raw
+bytes**, not the base64 payload: 2,000,000 raw bytes read back `200` although
+they encode to 2,666,668 base64 characters, and 2,000,001 read back `413`. A
+`GET /files` listing still reports an oversize path and its size, so the file is
+visible — it is only the bytes that are unreadable.
+
+### The write path does not need a read-back at all
+
+The read limit blocks *reading* the landed bytes, not *identifying* them. The
+presigned object `PUT` returns an `ETag` that is the **MD5 of the exact uploaded
+bytes**, and #51 established this is usable as byte identity:
+
+| Property | Finding |
+| --- | --- |
+| `ETag` vs local MD5 | equal, at 2,000,001 bytes, 10 MB, and 50 MB |
+| Shape at 50 MB | still a plain 32-hex digest — no multipart `-<count>` suffix |
+| Survives `POST /move` | yes: the post-move read-back MD5 equals the pre-move `ETag` |
+| `upload-adopt` body | `path`, `name`, `size`, `mimeType` — **no hash** |
+| `move` body | `success`, `from`, `to` — **no hash** |
+| `GET /files` row | `path`, `type`, `size` — **no hash** |
+
+So a binary **place** (upload, adopt, move) can be verified by comparing the
+local file's MD5 against the `ETag` the presigned `PUT` returned, with no
+`GET /file` involved — at any size. That is the route to publishing a binary
+over 2,000,000 bytes.
+
+Two limits remain, and they are read-side:
+
+1. **Reading an existing oversize remote file is still impossible.** No route
+   returns its bytes, and no response exposes a hash for it — not `/files`, not
+   `upload-adopt`, not `move`. Snapshot, Plan, and Pull cannot verify such a
+   file, so a project that already *contains* one still refuses.
+2. **Replacing an oversize remote original still needs its bytes** for the
+   pre-overwrite backup and the `expectedRemoteHash` gate.
+
+MD5 is weaker than the SHA-256 used everywhere else, so adopting it trades
+collision resistance for the ability to verify at all. That trade belongs in an
+explicit decision, not in a silent fallback.
+
+The consequence is asymmetric and worth stating plainly:
+
+| Property | Value |
+| --- | --- |
+| `POST /move` of a >2 MB binary | **succeeds** (`200`); bytes are placed |
+| `GET /file` of a >2 MB binary | **fails** (`413`) |
+| Read-back SHA-256 of a >2 MB binary | **impossible** |
+| State after such a place | destination holds new bytes; client cannot verify or restore them by read |
+
+A 2,215,326-byte PNG (`concept_01.png`) placed through the documented sequence
+landed at the destination and then failed the post-move read-back with `413`.
+Before #51 the wrapper reported only `Binary place failed after move`, so the
+cause was invisible. The wrapper now appends the inner cause
+(`Verify failure: Remote request failed with HTTP 413`).
+
+So the 2,000,000-byte limit is a **precondition** of a reliable place, not an
+edge case: a binary that cannot be read back cannot be verified, and an
+unverifiable replace must not run. The product refuses an oversized local
+binary before any `DELETE` or upload ([binary-place.md](binary-place.md)).
+
 ## Consequence for `Push` and [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
 
 A binary `upload` row is publishable, but only through the proven shape:

@@ -23,6 +23,125 @@ function Get-InnermostException {
     return $current
 }
 
+# Studio's read route refuses a payload over this many bytes with HTTP 413
+# "file too large to view". It is a property of GET /file, not of the place
+# sequence, so a binary that is placed successfully still cannot be read back
+# or verified above it (#51). The limit is observed, not documented.
+$script:SyncStudioMaxReadableFileSize = 2000000
+
+function Get-SyncStudioMaxReadableFileSize {
+    return [int64]$script:SyncStudioMaxReadableFileSize
+}
+
+function Get-SyncEntrySizeValue {
+    # The size of a BASE / LOCAL / REMOTE entry, whichever map shape it is in
+    # (a Hashtable from BASE, or a PSCustomObject from a parsed manifest), and
+    # whichever spelling it uses. Zero when the entry or the size is absent.
+    param($Entry)
+
+    if ($null -eq $Entry) {
+        return [int64]0
+    }
+
+    if ($Entry -is [System.Collections.IDictionary]) {
+        foreach ($name in @('Size', 'size')) {
+            if ($Entry.Contains($name) -and $null -ne $Entry[$name]) {
+                return [int64]$Entry[$name]
+            }
+        }
+
+        return [int64]0
+    }
+
+    foreach ($name in @('Size', 'size')) {
+        $property = $Entry.PSObject.Properties[$name]
+        if ($null -ne $property -and $null -ne $property.Value) {
+            return [int64]$property.Value
+        }
+    }
+
+    return [int64]0
+}
+
+function Test-SyncOversizeSize {
+    # True when a payload is over Studio's read limit, so GET /file would
+    # refuse it with 413 and its bytes can never be verified.
+    param([int64]$Size)
+
+    return ($Size -gt [int64]$script:SyncStudioMaxReadableFileSize)
+}
+
+function Test-SyncOversizeEntry {
+    param($Entry)
+
+    return (Test-SyncOversizeSize -Size (Get-SyncEntrySizeValue -Entry $Entry))
+}
+
+function Get-SyncOversizeRefusalReason {
+    # One actionable line. A bare 413 told the user nothing, so name the size,
+    # the limit, why it cannot work, and what to do about it.
+    param([int64]$Size)
+
+    return (
+        "{0} bytes is over Studio's {1}-byte read limit: GET /file returns 413 'file too large to view' above it, so the bytes could be placed but never read back or verified. Exclude this file from the sync folder to sync the rest." -f `
+            [string]$Size, [string]$script:SyncStudioMaxReadableFileSize
+    )
+}
+
+function Get-SyncFailureReason {
+    # The single most specific cause of a failure, flattened to one line.
+    #
+    # A post-move failure is wrapped so its top-level message names the
+    # ambiguous remote state, which means the real cause lives in
+    # InnerException. The Push report reads only the outermost Message, so
+    # without this a REFUSED row says "Binary place failed after move" with no
+    # clue which check failed (#51). This returns the innermost message with
+    # runs of whitespace collapsed, so a report row or a wrapper message stays
+    # one line.
+    #
+    # It only surfaces text that was already on the exception. Callers must
+    # still keep file contents and tokens out of exception messages.
+    param($Exception)
+
+    if ($null -eq $Exception) {
+        return ''
+    }
+
+    $inner = Get-InnermostException -Exception $Exception
+    if ($null -eq $inner) {
+        return ''
+    }
+
+    $text = [string]$inner.Message
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ''
+    }
+
+    return (($text -replace '\s+', ' ').Trim())
+}
+
+function New-RemotePlaceAfterMoveFailure {
+    # Build the "move succeeded, a later verify failed" exception. The
+    # top-level message names the ambiguous remote state; the inner cause is
+    # appended so a REFUSED row says which check actually failed (#51). Both
+    # the binary-place and text-create sequences share this shape.
+    param(
+        [Parameter(Mandatory)]
+        [string]$Summary,
+
+        [Parameter(Mandatory)]
+        $Cause
+    )
+
+    $message = $Summary
+    $innerReason = Get-SyncFailureReason -Exception $Cause
+    if (-not [string]::IsNullOrEmpty($innerReason)) {
+        $message = '{0} Verify failure: {1}' -f $message, $innerReason
+    }
+
+    return [System.InvalidOperationException]::new($message, $Cause)
+}
+
 function Test-RetryableFileReadException {
     param($Exception)
 

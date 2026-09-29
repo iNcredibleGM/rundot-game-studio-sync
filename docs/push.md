@@ -177,8 +177,18 @@ live hash checks.
 
 Paths that stay out of the list are never published: `download` where LOCAL
 still matches BASE (`A / A / B`), `deleteLocalCandidate`, `KindChange`, ignored
-paths, reserved or directory-shaped routes, empty binaries, and any row whose
-live status no longer matches the plan artifact.
+paths, reserved or directory-shaped routes, empty binaries, binaries over
+Studio's 2,000,000-byte read limit, and any row whose live status no longer
+matches the plan artifact.
+
+A binary over the read limit can be placed but never read back, so it can never
+be verified; `-LocalWins` excludes it with the read-limit reason and continues
+with the rest, while default `Push` refuses the whole run ([binary-place.md](binary-place.md)).
+
+A text file over Studio's 2,000,000-character editor limit is refused at the
+`PUT` itself. That refusal leaves the previous remote content intact, so
+`-LocalWins` records a `REFUSED` row and continues rather than corrupting the
+path ([text-write-protocol.md](text-write-protocol.md)).
 
 Immediately before each write, Push re-checks the live remote hash against the
 plan row. On `-LocalWins`, a drift on one path refuses that path and continues
@@ -309,6 +319,8 @@ remains and that BASE was not updated.
 | Backup failure | Abort before any `PUT`; old BASE |
 | Local file changed since the scan | Refuse before that `PUT` |
 | Remote hash mismatch on `GET` | Refuse before that `PUT` |
+| Local binary over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Text over Studio's 2,000,000-character editor limit | Refuse before that `PUT`; the previous remote content is intact ([text-write-protocol.md](text-write-protocol.md)); default `Push` aborts, `-LocalWins` records a `REFUSED` row and continues |
 | `PUT` or echo verify failure | Abort; BASE unchanged; backup set kept |
 | BASE update fails | Journaled as failed; old BASE remains authoritative |
 | Retention failure | Ignored; a successful push is never failed by pruning |

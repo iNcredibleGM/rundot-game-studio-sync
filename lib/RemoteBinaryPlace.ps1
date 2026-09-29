@@ -631,11 +631,13 @@ function Invoke-RemoteBinaryPlaceSequence {
                 -Headers $Headers
         }
         elseif ($moveApplied) {
-            $wrapper = [System.InvalidOperationException]::new(
-                ("Binary place failed after move for '{0}'. The remote path may hold the new bytes; BASE was not updated." -f $CanonicalPath),
-                $original
-            )
-            throw $wrapper
+            # The move succeeded, so the wrapper's top-level message is the
+            # actionable part for a human. The inner cause is the check that
+            # actually failed, so name it too; otherwise the REFUSED row is
+            # unactionable (#51).
+            throw (New-RemotePlaceAfterMoveFailure `
+                -Summary ("Binary place failed after move for '{0}'. The remote path may hold the new bytes; BASE was not updated." -f $CanonicalPath) `
+                -Cause $original)
         }
 
         throw

@@ -367,6 +367,12 @@ function Get-SyncPushSelection {
                     )
                 }
 
+                if (Test-SyncOversizeSize -Size $localSizeValue) {
+                    throw [System.InvalidOperationException]::new(
+                        ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+                    )
+                }
+
                 $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                     -CanonicalPath $path `
                     -RemotePaths $remotePaths
@@ -436,6 +442,12 @@ function Get-SyncPushSelection {
             if ($localSizeValue -le 0) {
                 throw [System.InvalidOperationException]::new(
                     ("Refusing to push: '{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+                )
+            }
+
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
                 )
             }
 
@@ -684,6 +696,10 @@ function Get-SyncPushLocalWinsStandardRow {
                 return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
             }
 
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+            }
+
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                 -CanonicalPath $path `
                 -RemotePaths $RemotePaths
@@ -740,6 +756,10 @@ function Get-SyncPushLocalWinsStandardRow {
 
         if ($localSizeValue -le 0) {
             return ("'{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+        }
+
+        if (Test-SyncOversizeSize -Size $localSizeValue) {
+            return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
         }
 
         $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
@@ -859,6 +879,10 @@ function Get-SyncPushLocalWinsConflictRow {
                 return ("'{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
             }
 
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+            }
+
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                 -CanonicalPath $path `
                 -RemotePaths $RemotePaths
@@ -911,6 +935,10 @@ function Get-SyncPushLocalWinsConflictRow {
         if ($localKind -eq 'binary') {
             if ($localSizeValue -le 0) {
                 return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+            }
+
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
             }
 
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
