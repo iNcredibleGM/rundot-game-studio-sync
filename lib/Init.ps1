@@ -700,7 +700,7 @@ function Initialize-RundotSyncByAdopt {
 
     Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $LocalDir
 
-    $localManifest = Get-LocalManifest -WorkspaceRoot $LocalDir
+    $localManifest = Get-LocalManifest -WorkspaceRoot $LocalDir -ShowProgress
 
     $snapshot = Get-StableRemoteSnapshot `
         -WorkspaceRoot $LocalDir `

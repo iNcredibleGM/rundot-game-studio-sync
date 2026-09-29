@@ -463,6 +463,8 @@ function Invoke-RundotSyncPullApply {
         # Phase 2: back up every overwrite. If any backup fails, nothing has
         # been written yet, so abort with the tree untouched.
         if ($null -ne $backupSet) {
+            $backupTotal = @($overwrites).Count
+            $backupDone = 0
             foreach ($overwrite in $overwrites) {
                 $path = [string]$overwrite.Path
                 $localFullPath = ConvertTo-LocalFullPath `
@@ -473,20 +475,37 @@ function Invoke-RundotSyncPullApply {
                     continue
                 }
 
+                Write-RundotSyncPublishProgress `
+                    -Phase 'backup' `
+                    -Path $path `
+                    -Index ($backupDone + 1) `
+                    -Total $backupTotal `
+                    -Applied $backupDone
+
                 $backupPath = Join-Path $backupSet.Path ($path.Replace('/', '\'))
                 Copy-RundotSyncBackupFile `
                     -SourcePath $localFullPath `
                     -DestinationPath $backupPath | Out-Null
+                $backupDone++
             }
         }
 
         # Phase 3: write and verify. Record enough to undo each one exactly.
+        $writeTotal = $actionRows.Count
+        $writeDone = 0
         foreach ($action in $actionRows) {
             $path = [string]$action.Path
             $localFullPath = ConvertTo-LocalFullPath `
                 -WorkspaceRoot $WorkspaceRoot `
                 -CanonicalPath $path
             $isOverwrite = [bool]$action.IsOverwrite
+
+            Write-RundotSyncPublishProgress `
+                -Phase 'writing' `
+                -Path $path `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
 
             $createdDirectories = @()
             if (-not (Test-Path -LiteralPath $localFullPath)) {
@@ -530,6 +549,7 @@ function Invoke-RundotSyncPullApply {
             else {
                 $createdCount++
             }
+            $writeDone++
         }
     }
     catch {

@@ -30,6 +30,29 @@ runs the identical engine and persists nothing.
 6. **Report.** The plan report prints to the console. Only `Plan` writes the
    artifact. Snapshot staging is then cleared.
 
+## Progress output
+
+Plan and Status hash the whole local tree and download the remote snapshot, so
+a large workspace prints plain progress lines that do not depend on
+`Write-Progress`:
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+```
+
+Local hashing and remote download each print a start line, a throttled
+`count: path` line (at most about once per second), and a final count. The
+`Write-Progress` bar is still updated where the host shows it.
+
+Progress output contains a canonical path and integer counts only. It never
+prints file contents, access tokens, refresh tokens, or `Authorization`
+headers. A progress write is best effort and never changes fail-closed
+behavior: an unreadable local file or a failed download still aborts the run.
+
 ## No plan is permission to write
 
 `Push` consumes this artifact and re-verifies every fingerprint before

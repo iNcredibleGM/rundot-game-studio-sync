@@ -11,6 +11,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
@@ -908,6 +909,107 @@ try {
     Assert-True `
         ($pushJournalRaw -notmatch '(?i)bearer|authoriz|accesstoken|refreshtoken|"content"') `
         'the push journal must never record tokens or contents'
+
+
+    # --------------------------------------------------------------------------
+    # Publish progress: names each path with applied/remaining, and does not
+    # soften fail-closed behavior
+    # --------------------------------------------------------------------------
+
+    $progressScenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
+    $progressGet = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        return [pscustomobject]@{ encoding = 'utf8'; content = $progressScenario.RemoteText }
+    }
+    $progressPut = {
+        param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+        return [pscustomobject]@{ encoding = 'utf8'; content = $BodyText }
+    }
+
+    $script:PushTestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:PushTestProgressLines.Add($Text)
+    }
+    try {
+        $progressApplyResult = Invoke-RundotSyncPushApply `
+            -WorkspaceRoot $progressScenario.Workspace `
+            -Actions @(
+                [pscustomobject]@{
+                    Path               = $progressScenario.Path
+                    LocalSha256        = $progressScenario.LocalEntry.Sha256
+                    ExpectedRemoteHash = $progressScenario.RemoteSha
+                }
+            ) `
+            -StudioOrigin $pushTestOrigin `
+            -ProjectId $pushTestProjectId `
+            -Headers $headers `
+            -BackupSetPath (Join-Path (Get-RundotSyncBackupRoot -WorkspaceRoot $progressScenario.Workspace) 'progress-set') `
+            -GetRemoteFile $progressGet `
+            -PutRemoteFile $progressPut
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+
+    $progressLines = @($script:PushTestProgressLines.ToArray())
+    Assert-Equal 1 $progressApplyResult.Applied 'the progress fixture must apply one overwrite'
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Backing up 1 of 1' -and $_ -match [regex]::Escape($progressScenario.Path) -and $_ -match 'applied 0, remaining 0' }).Count -eq 1) `
+        'publish progress must name the backed-up path with applied and remaining counts'
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Publishing 1 of 1' -and $_ -match [regex]::Escape($progressScenario.Path) }).Count -eq 1) `
+        'publish progress must name the written path'
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match '(?i)bearer|authoriz|access[_-]?token|refresh[_-]?token' }).Count -eq 0) `
+        'publish progress must never print tokens or headers'
+
+    # Fail-closed with progress on: a backup failure still aborts before a PUT.
+    $progressFailScenario = New-PushTestTextOverwriteScenario -Root $pushTestRoot
+    $script:PushTestProgressFailPutCalls = 0
+    $script:PushTestProgressFailLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:PushTestProgressFailLines.Add($Text)
+    }
+    try {
+        Assert-PushTestThrowsLike {
+            Invoke-RundotSyncPushApply `
+                -WorkspaceRoot $progressFailScenario.Workspace `
+                -Actions @(
+                    [pscustomobject]@{
+                        Path               = $progressFailScenario.Path
+                        LocalSha256        = $progressFailScenario.LocalEntry.Sha256
+                        ExpectedRemoteHash = $progressFailScenario.RemoteSha
+                    }
+                ) `
+                -StudioOrigin $pushTestOrigin `
+                -ProjectId $pushTestProjectId `
+                -Headers $headers `
+                -BackupSetPath (Join-Path (Get-RundotSyncBackupRoot -WorkspaceRoot $progressFailScenario.Workspace) 'progress-fail-set') `
+                -GetRemoteFile {
+                    param($Origin, $Id, $ApiPath, $Hdr)
+                    return [pscustomobject]@{ encoding = 'utf8'; content = $progressFailScenario.RemoteText }
+                } `
+                -PutRemoteFile {
+                    param($Origin, $Id, $Canonical, $BodyText, $Hdr)
+                    $script:PushTestProgressFailPutCalls++
+                    return [pscustomobject]@{ encoding = 'utf8'; content = $BodyText }
+                } `
+                -CopyBackupFile {
+                    throw [System.InvalidOperationException]::new('Injected progress backup failure.')
+                } | Out-Null
+        } 'Injected progress backup failure' 'progress must not soften a backup failure abort'
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+    Assert-Equal 0 $script:PushTestProgressFailPutCalls 'a backup failure with progress on must not PUT'
+    Assert-True `
+        (@($script:PushTestProgressFailLines | Where-Object { $_ -match 'Backing up 1 of 1' }).Count -eq 1) `
+        'progress must still name the path that failed to back up'
 
 
     # --------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 # Torn-read remote snapshot helpers.
-# Callers must load Paths.ps1, Hashing.ps1, Workspace.ps1, and RemoteApi.ps1 first.
+# Callers must load Paths.ps1, Hashing.ps1, Workspace.ps1, RemoteApi.ps1, and
+# Progress.ps1 first.
 #
 # Fingerprint validated /files identity. Never hash a raw or malformed payload.
 
@@ -397,16 +398,6 @@ function Write-RemoteSnapshotStagingFile {
     return $full
 }
 
-function Clear-RemoteSnapshotDownloadProgress {
-    param([string]$Activity)
-
-    if ([string]::IsNullOrEmpty($Activity)) {
-        return
-    }
-
-    Write-Progress -Activity $Activity -Completed -ErrorAction SilentlyContinue
-}
-
 function Get-RemoteSnapshotFileMap {
     param(
         $Manifest,
@@ -432,8 +423,10 @@ function Get-RemoteSnapshotFileMap {
         }
     }
 
+    $progressState = $null
     if ($ShowProgress) {
-        Write-Host ("Downloading {0} remote file(s)..." -f $total)
+        $progressState = New-RundotSyncProgressState -Activity $ProgressActivity -Total $total
+        Write-RundotSyncProgressLine -Text ("Downloading {0} remote file(s)..." -f $total)
     }
 
     try {
@@ -441,19 +434,10 @@ function Get-RemoteSnapshotFileMap {
         foreach ($row in $rows) {
             $index++
             if ($ShowProgress) {
-                $percent = 0
-                if ($total -gt 0) {
-                    $percent = [int][Math]::Min(
-                        100,
-                        [Math]::Floor(($index * 100.0) / $total)
-                    )
-                }
-
-                Write-Progress `
-                    -Activity $ProgressActivity `
-                    -Status ([string]$row.CanonicalPath) `
-                    -PercentComplete $percent `
-                    -CurrentOperation ("{0} of {1}" -f $index, $total)
+                Write-RundotSyncProgress `
+                    -State $progressState `
+                    -Index $index `
+                    -Path ([string]$row.CanonicalPath)
             }
 
             Assert-SyncPathRepresentable `
@@ -489,7 +473,9 @@ function Get-RemoteSnapshotFileMap {
     }
     finally {
         if ($ShowProgress) {
-            Clear-RemoteSnapshotDownloadProgress -Activity $ProgressActivity
+            Complete-RundotSyncProgress `
+                -State $progressState `
+                -Text ("Downloaded {0} remote file(s)." -f $total)
         }
     }
 

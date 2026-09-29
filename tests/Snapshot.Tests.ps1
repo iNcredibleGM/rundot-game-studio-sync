@@ -4,6 +4,7 @@
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
@@ -1013,4 +1014,66 @@ $emptyBase64 = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
 })
 Assert-True ($emptyBase64 -is [byte[]]) "a decoded empty base64 payload must stay a byte array"
 Assert-Equal 0 $emptyBase64.Length "a decoded empty base64 payload must be zero bytes"
+
+# --------------------------------------------------------------------------
+# -ShowProgress prints plain download lines and still returns the same map
+# --------------------------------------------------------------------------
+
+$progressRoot = Join-Path $env:TEMP ("rundot-snapshot-progress-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $progressRoot | Out-Null
+
+try {
+    $progressManifest = New-TestRemoteManifest -Files @(
+        $hiEntry,
+        (New-TestFileEntry @{
+            path     = 'public/logo.png'
+            type     = 'file'
+            size     = 1
+            encoding = 'base64'
+        })
+    )
+    Reset-FakeRemote `
+        -Lists @($progressManifest, $progressManifest) `
+        -Files @{
+            'src/a.ts'        = [pscustomobject]@{ encoding = 'utf8'; content = 'hi' }
+            'public/logo.png' = [pscustomobject]@{ encoding = 'base64'; content = 'QQ==' }
+        }
+
+    $script:SnapshotTestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:SnapshotTestProgressLines.Add($Text)
+    }
+    try {
+        $progressSnapshot = Get-StableRemoteSnapshot `
+            -WorkspaceRoot $progressRoot `
+            -StudioOrigin 'https://example.test' `
+            -ProjectId 'proj-test-1' `
+            -Headers @{ Authorization = 'Bearer test-token'; Accept = '*/*' } `
+            -ShowProgress `
+            -ProgressActivity 'Downloading remote project'
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+
+    $progressLines = @($script:SnapshotTestProgressLines.ToArray())
+    Assert-True `
+        ($progressLines[0] -match 'Downloading 2 remote file') `
+        "a download run must start with a plain count line"
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Downloading remote project: 1 of 2' }).Count -eq 1) `
+        "a download run must print a plain per-file line with the index"
+    Assert-True `
+        ($progressLines[$progressLines.Count - 1] -match 'Downloaded 2 remote file') `
+        "a download run must end with a plain summary line"
+    Assert-Equal 2 $progressSnapshot.Files.Count "progress must not change the captured file count"
+}
+finally {
+    if (Test-Path -LiteralPath $progressRoot) {
+        Remove-Item -LiteralPath $progressRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 
