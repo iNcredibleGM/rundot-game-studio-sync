@@ -434,6 +434,71 @@ milestone is in [docs/acceptance.md](docs/acceptance.md).
 
 How to branch, open pull requests, and work on a milestone is in [CONTRIBUTING.md](CONTRIBUTING.md). Automated agents must also read [AGENTS.md](AGENTS.md).
 
+Run everything with one command:
+
+```powershell
+# Unit suite + offline acceptance gates (no network, no account)
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Also run the unattended live round-trip against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+`tests/Test-All.ps1` orchestrates `Run-Tests.ps1`, `Acceptance.ps1 -SkipLive`,
+and `Live-RoundTrip.ps1`, and prints one combined summary. The live round-trip
+makes its own Studio-side change, so it needs no manual step; it deletes the
+probe files it created from Studio on teardown. See
+[docs/acceptance.md](docs/acceptance.md).
+
+Run the whole test set in one shot:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project (live round-trip included)
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+Details and the gate map are in [docs/acceptance.md](docs/acceptance.md).
+
+To run every automated test at once (unit suite, offline acceptance gates, and an unattended live round-trip against a disposable project):
+
+```powershell
+# Offline only
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+See [docs/acceptance.md](docs/acceptance.md) for the gate map and what each phase covers.
+
+To run every check in one shot:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+The gate map and evidence for each gate are in [docs/acceptance.md](docs/acceptance.md).
+
+### Testing
+
+One command runs everything (unit suite, offline acceptance gates, and an
+unattended live round-trip when you pass a disposable project id):
+
+```powershell
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+See [docs/acceptance.md](docs/acceptance.md) for what each phase covers and the
+individual entry points.
+
 ## Development note
 
 The original exporter and protocol investigation were iterated with OpenAI GPT-5.6 Sol/Terra/Luna while manually observing Studio network behavior. Subsequent local refactoring and the CLI-auth integration were developed in Cursor using local Ollama tooling with DeepSeek V4 Flash, with live behavior verified manually.

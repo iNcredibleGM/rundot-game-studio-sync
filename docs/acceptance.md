@@ -23,6 +23,34 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 The runner dot-sources every `tests/*.Tests.ps1` into one scope and exits
 non-zero if any assertion failed. It prints the pass and fail counts.
 
+### Everything in one shot
+
+`tests/Test-All.ps1` is a thin orchestrator over the three entry points below.
+It runs each in a child process, streams the output, and prints one combined
+summary:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+| Phase | Script | Needs a project |
+| --- | --- | --- |
+| 1 | `tests/Run-Tests.ps1` (unit suite) | no |
+| 2 | `tests/Acceptance.ps1 -SkipLive` (offline gates) | no |
+| 3 | `tests/Live-RoundTrip.ps1` (live round-trip) | yes |
+
+Exit code is 0 only when every phase that ran passed. A phase that cannot run
+is reported `SKIP`, never a silent pass. `-KeepWorkspace` and
+`-SkipRemoteCleanup` pass through to phase 3.
+
+`Test-All.ps1` deliberately does **not** run `Acceptance.ps1`'s live gates:
+gates 2-4 pause on `Read-Host` for a human Studio edit, so they cannot be
+unattended. Phase 3 covers the same up/down/restore ground with no pause.
+
 ### Running the final acceptance harness
 
 `tests/Acceptance.ps1` executes the gates below and prints a PASS/FAIL table.
