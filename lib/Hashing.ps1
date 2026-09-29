@@ -88,6 +88,111 @@ function Get-SyncOversizeRefusalReason {
     )
 }
 
+# A plain content MD5: 32 lowercase hex characters. Object storage switches an
+# ETag to '<md5-of-parts>-<partcount>' for a multipart upload, which is NOT a
+# digest of the whole object, so that shape must be refused rather than
+# compared (#54).
+$script:SyncPlainMd5DigestPattern = '^[0-9a-f]{32}$'
+
+function Test-SyncPlainMd5Digest {
+    param([string]$Digest)
+
+    if ([string]::IsNullOrWhiteSpace($Digest)) {
+        return $false
+    }
+
+    return [bool]([regex]::IsMatch([string]$Digest, $script:SyncPlainMd5DigestPattern))
+}
+
+function Get-SyncMd5HexFromEtag {
+    # Normalize an ETag header to a bare lowercase digest, dropping the
+    # weak-validator prefix and the quoting the header may carry.
+    param([string]$Etag)
+
+    if ([string]::IsNullOrWhiteSpace($Etag)) {
+        return $null
+    }
+
+    $value = ([string]$Etag).Trim()
+    $value = $value -replace '^W/', ''
+    $value = $value.Trim([char]'"')
+
+    return $value.ToLowerInvariant()
+}
+
+function Get-SyncMd5HexFromBytes {
+    # MD5 of an in-memory payload. The place sequence hashes the exact byte
+    # array it uploaded, so the identity cannot drift if the local file changes
+    # between the read and the upload (#54). SHA-256 remains the identity
+    # everywhere else, and BASE still records SHA-256.
+    param([byte[]]$Bytes)
+
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        return Convert-HashBytesToHex -Hash $md5.ComputeHash($Bytes)
+    }
+    finally {
+        $md5.Dispose()
+    }
+}
+
+function Assert-SyncEtagMatchesLocalMd5 {
+    # Prove the object the presigned PUT stored is byte-identical to the local
+    # file, using the ETag as the only evidence.
+    #
+    # Why this exists: a binary over Studio's read limit can be placed but never
+    # read back, so the normal SHA-256 read-back verify is impossible (#51).
+    # The presigned PUT's ETag is the MD5 of the stored bytes, measured at
+    # 2,000,001 bytes, 10 MB, and 50 MB, still a plain digest at 50 MB, and
+    # unchanged by the rename route (#54).
+    #
+    # MD5 is weaker than the SHA-256 used everywhere else, so it is accepted
+    # ONLY here, and only as one of several checks: the caller must also have
+    # confirmed the adopt-recorded path and the recorded size. A non-plain
+    # digest (a multipart ETag) is refused, never compared.
+    param(
+        [Parameter(Mandatory)]
+        [string]$Etag,
+
+        [Parameter(Mandatory)]
+        [string]$LocalMd5Hex,
+
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath
+    )
+
+    $normalized = Get-SyncMd5HexFromEtag -Etag $Etag
+
+    if (-not (Test-SyncPlainMd5Digest -Digest $normalized)) {
+        throw [System.InvalidOperationException]::new(
+            ("Refusing to verify '{0}': the upload ETag '{1}' is not a plain content MD5, so it cannot be used as byte identity." -f `
+                $CanonicalPath, [string]$Etag)
+        )
+    }
+
+    if (-not [string]::Equals($normalized, [string]$LocalMd5Hex, [System.StringComparison]::Ordinal)) {
+        throw [System.InvalidOperationException]::new(
+            ("Refusing to verify '{0}': the stored object's MD5 '{1}' does not match the local file's MD5 '{2}'." -f `
+                $CanonicalPath, $normalized, [string]$LocalMd5Hex)
+        )
+    }
+
+    return $normalized
+}
+
+function Get-SyncOversizeReplaceRefusalReason {
+    # Oversize is fatal for a REPLACE specifically. A create can be verified
+    # from the upload ETag, but a replace needs the existing remote bytes for
+    # the pre-overwrite backup and the expectedRemoteHash gate, and GET /file
+    # cannot return them above the limit (#54).
+    param([int64]$Size)
+
+    return (
+        "{0} bytes is over Studio's {1}-byte read limit, and this is a replacement: GET /file returns 413 'file too large to view' above it, so the existing remote bytes cannot be read for the pre-overwrite backup or the expectedRemoteHash check. An oversize create is verifiable from the upload ETag, but a replacement is not. Delete the remote copy first, or exclude this file." -f `
+            [string]$Size, [string]$script:SyncStudioMaxReadableFileSize
+    )
+}
+
 function Get-SyncFailureReason {
     # The single most specific cause of a failure, flattened to one line.
     #

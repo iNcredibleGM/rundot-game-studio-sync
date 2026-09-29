@@ -818,7 +818,7 @@ if (-not $script:Aborted) {
                     # The decisive post-move evidence: does Studio serve bytes
                     # that differ from local (re-encoding), or the same bytes
                     # with only the wrapper failing (timing/staging)?
-                    $refusedLine = [regex]::Match($binaryReplacePush.Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
+                        $refusedLine = [regex]::Match($binaryReplacePush.Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
                     Add-Step -Name 'Binary replace failure evidence' -Status 'FAIL' `
                         -Detail ("remote encoding={0}, remote size={1}, local size={2}, refused-reason={3}" -f `
                             ([string](Get-SyncEntryProperty -Entry $remoteReplace -Names @('encoding', 'Encoding'))), `
@@ -828,6 +828,80 @@ if (-not $script:Aborted) {
                 }
             }
         }
+    }
+
+    # ---------------------------------------------------------------------
+    # Oversize binary create (#54). A file over Studio's read limit cannot be
+    # read back, so the place sequence verifies it from the presigned PUT's
+    # ETag. This gate proves the whole path live: Plan keeps it applicable,
+    # Push publishes it, BASE records it, and GET /files reports the size.
+    # ---------------------------------------------------------------------
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeCanonical = $probeFolder + '/oversize-probe.bin'
+    $oversizeSize = $oversizeLimit + 4096
+    $oversizeFull = ConvertTo-LocalFullPath -WorkspaceRoot $LocalDir -CanonicalPath $oversizeCanonical
+    $oversizeParent = Split-Path -Parent $oversizeFull
+    if (-not (Test-Path -LiteralPath $oversizeParent -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $oversizeParent | Out-Null
+    }
+
+    # Deterministic bytes, so the MD5 the ETag carries is reproducible.
+    $oversizeBytes = New-Object byte[] $oversizeSize
+    for ($i = 0; $i -lt $oversizeSize; $i++) { $oversizeBytes[$i] = [byte](($i * 31 + 7) % 251) }
+    [System.IO.File]::WriteAllBytes($oversizeFull, $oversizeBytes)
+    $script:ProbePaths += $oversizeCanonical
+
+    $oversizePlan = Invoke-SyncCli -CliArgs @(
+        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+    )
+    [void](Assert-ProgressLines -Output $oversizePlan.Output -Label 'Plan (oversize create)' -RequireHashing)
+
+    $oversizePush = Invoke-SyncCli -CliArgs @(
+        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-LocalWins', '-ForcePush'
+    )
+    [void](Assert-ProgressLines -Output $oversizePush.Output -Label 'Push (oversize create)' -RequirePublish -RequireHashing)
+
+    $oversizeRows = @(Get-PushBinaryRows -Output $oversizePush.Output | Where-Object {
+        [string]$_.Path -eq $oversizeCanonical
+    })
+    $oversizeBaseUpdated = [regex]::IsMatch($oversizePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+
+    # The remote cannot be read back, so prove presence and size from the list.
+    $oversizeListed = $false
+    $oversizeListedSize = 0
+    try {
+        $listedRows = @(Get-RemoteListedFilePaths `
+            -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers)
+        $oversizeListed = ($listedRows -contains $oversizeCanonical)
+        $filesPayload = Get-RemoteProjectFileList `
+            -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers
+        foreach ($row in @($filesPayload.files)) {
+            if ($null -eq $row) { continue }
+            $rowCanonical = ConvertTo-CanonicalSyncPath -Path ([string]$row.path -replace '^/', '')
+            if ($rowCanonical -eq $oversizeCanonical) {
+                $oversizeListedSize = [int64](Get-SyncEntrySizeValue -Entry $row)
+            }
+        }
+    }
+    catch { }
+
+    $oversizeOk = ($oversizePush.ExitCode -eq 0) `
+        -and ($oversizeRows.Count -eq 1) `
+        -and ([string]$oversizeRows[0].Mode -eq 'create') `
+        -and $oversizeBaseUpdated `
+        -and $oversizeListed `
+        -and ($oversizeListedSize -eq [int64]$oversizeSize)
+
+    Add-Step -Name 'Push -LocalWins published an oversize binary create via ETag verify (#54)' `
+        -Status $(if ($oversizeOk) { 'PASS' } else { 'FAIL' }) `
+        -Detail ("exit={0}, BINARY rows={1}, BASE updated={2}, listed={3}, listed size={4}, local size={5}" -f `
+            $oversizePush.ExitCode, $oversizeRows.Count, $oversizeBaseUpdated, $oversizeListed, $oversizeListedSize, $oversizeSize)
+
+    if (-not $oversizeOk) {
+        $oversizeRefused = [regex]::Match($oversizePush.Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
+        Add-Step -Name 'Oversize create failure evidence' -Status 'FAIL' `
+            -Detail ("refused-reason={0}" -f `
+                $(if ($oversizeRefused.Success) { $oversizeRefused.Groups[2].Value } else { '<no REFUSED row>' }))
     }
 }
 

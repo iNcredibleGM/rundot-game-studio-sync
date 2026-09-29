@@ -48,36 +48,69 @@ prompt changes nothing: no backup set, no journal record, BASE unchanged.
 ## Refused paths
 
 Reserved roots (`.git`, `.gitignore`, `.rundot-sync`, `.rundot`),
-directory-shaped destinations, **empty** local binaries, and binaries **over
-Studio's read limit** are not applicable in `Plan` and are refused again at
-`Push` selection.
+directory-shaped destinations, and **empty** local binaries are not applicable
+in `Plan` and are refused again at `Push` selection. Binaries **over Studio's
+read limit** are refused for **replaces** but allowed for **creates** — see
+below.
 
 ## Studio's read limit (2,000,000 bytes)
 
 `GET /file` refuses any payload over **2,000,000 bytes** with HTTP 413
 `file too large to view`. That is a property of the read route, not of the place
 sequence, and no alternate large-file route exists ([protocol.md](protocol.md)).
-A binary over the limit can therefore be **placed** but never **read back**, so
-its byte identity can never be verified — the post-move verify would fail and
-leave an ambiguous remote state.
+A binary over the limit can therefore be **placed** but never **read back** by
+`GET /file`.
 
-The tool refuses an oversized binary **before** any destructive step, at every
-layer:
+The write path does not need that read. The presigned object `PUT` returns an
+`ETag` that is the **MD5 of the exact stored bytes**, a plain digest even at
+50 MB, unchanged by the rename route ([binary-place-protocol.md](binary-place-protocol.md)).
+So a **create** is verifiable at any size by comparing the local file's MD5
+against that `ETag`.
 
-| Layer | Behavior |
-| --- | --- |
-| `Plan` | A binary create or replace over the limit is `applicable: false` with the read-limit reason |
-| `Push` (default) | Throws and refuses the whole run before any `DELETE` or upload |
-| `Push -LocalWins` | Excludes that path with the read-limit reason and continues with the rest |
-| REMOTE snapshot | Aborts before downloading when the remote manifest lists an oversized file |
+### Create: published and verified by ETag (#54)
 
-The reason names the file's size, the limit, why it cannot work, and what to do:
+An oversized binary **create** is publishable. The place sequence skips the
+read-back and verifies instead against the upload `ETag`, accepted **only**
+alongside the checks that already passed:
+
+- the adopt response's recorded path equalled the expected staging path,
+- the move landed on the planned destination,
+- the recorded size equalled the uploaded byte count,
+- the `ETag` is a plain 32-hex MD5 (a multipart `ETag` is refused, never compared),
+- and that MD5 equals the local file's MD5.
+
+BASE still records the local **SHA-256**: once the `ETag` has proven the stored
+bytes equal the local bytes, the local SHA-256 is the shared identity. MD5 is
+weaker than the SHA-256 used elsewhere, so it is used only here and only as one
+of those checks.
+
+### Replace: still refused
+
+A binary **replace** over the limit stays refused, because its existing remote
+bytes are needed for the pre-overwrite backup and the `expectedRemoteHash` gate,
+and `GET /file` cannot return them. The refusal says so specifically rather than
+reusing the create reason.
+
+The tool refuses an oversized binary **replace** before any destructive step, at
+every layer:
+
+| Layer | Oversize create | Oversize replace |
+| --- | --- | --- |
+| `Plan` | `applicable: true` (ETag verify) | `applicable: false` with the replace reason |
+| `Push` (default) | Selected and published | Throws before any `DELETE` or upload |
+| `Push -LocalWins` | Selected and published | Excluded with the reason; the rest continues |
+| REMOTE snapshot | Aborts before downloading when the remote manifest lists an oversized file | (same) |
+
+The replace reason names the file's size, the limit, why it cannot work, and what
+to do:
 
 ```text
 'dev/audio/theme.wav' is over Studio's read limit. 3120444 bytes is over Studio's
-2000000-byte read limit: GET /file returns 413 'file too large to view' above it,
-so the bytes could be placed but never read back or verified. Exclude this file
-from the sync folder to sync the rest.
+2000000-byte read limit, and this is a replacement: GET /file returns 413
+'file too large to view' above it, so the existing remote bytes cannot be read
+for the pre-overwrite backup or the expectedRemoteHash check. An oversize create
+is verifiable from the upload ETag, but a replacement is not. Delete the remote
+copy first, or exclude this file.
 ```
 
 ### Excluding oversized files
@@ -128,7 +161,9 @@ source of truth.
 
 | Failure | Result |
 | --- | --- |
-| Local binary over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Local binary **replace** over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Local binary **create** over the read limit | Published and verified from the upload `ETag` (#54) |
+| Upload `ETag` is not a plain MD5, or does not match the local MD5 | Refuse after move; BASE unchanged; remote may hold the uploaded bytes |
 | Adopt returns a suffixed sibling | Delete sibling when allowed; refuse; BASE unchanged |
 | `POST` move returns `409` | Refuse; destination bytes unchanged |
 | Move or hash verify fails after move | Abort; BASE unchanged; remote may hold new bytes; the wrapper names the failed check |

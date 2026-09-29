@@ -398,7 +398,8 @@ Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
 | Backup holds pre-replace remote bytes | gate 15 |
 | BASE records the new local hash and moves | gate 15 |
 | Journal records `push-backup` and `push-binary` | gate 15 |
-| A binary over the 2,000,000-byte read limit is refused before mutation | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
+| A binary **replace** over the 2,000,000-byte read limit is refused before mutation | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
+| A binary **create** over the 2,000,000-byte read limit is published and verified from the upload `ETag` (#54) | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Hashing.Tests.ps1`, `tests/Live-RoundTrip.ps1` |
 
 **Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
 and runs `Push -LocalWins -ForcePush` (the mode a real publish of a diverged
@@ -409,9 +410,17 @@ local bytes), and both journal events. The fully automatic
 with a real image and a direct remote read-back hash, including a
 post-move failure-evidence block.
 
-The read limit is the reason the replace must be verified rather than assumed:
+The same live run publishes an **oversize create** (`<read limit> + 4096` bytes)
+and asserts it is selected as a create, BASE moves, and `GET /files` lists it at
+the expected size. It cannot read the bytes back — that is the whole point — so
+the ETag verify inside the place sequence is what makes the gate pass
+([binary-place-protocol.md](binary-place-protocol.md)).
+
+The read limit is the reason a replace must be verified rather than assumed:
 `GET /file` returns 413 above 2,000,000 bytes, so the place could succeed while
-the read-back cannot ([binary-place.md](binary-place.md)).
+the read-back cannot. A create is different: the upload `ETag` carries the MD5
+of the stored bytes, so it is verifiable at any size (#54,
+[binary-place.md](binary-place.md)).
 
 ### 16. Host-visible progress for hashing, download, and publish
 

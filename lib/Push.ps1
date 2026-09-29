@@ -367,11 +367,9 @@ function Get-SyncPushSelection {
                     )
                 }
 
-                if (Test-SyncOversizeSize -Size $localSizeValue) {
-                    throw [System.InvalidOperationException]::new(
-                        ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
-                    )
-                }
+                # An oversize binary CREATE is publishable: the place sequence
+                # verifies it from the upload ETag rather than a read-back
+                # (#54). An oversize REPLACE is still refused below.
 
                 $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                     -CanonicalPath $path `
@@ -447,7 +445,7 @@ function Get-SyncPushSelection {
 
             if (Test-SyncOversizeSize -Size $localSizeValue) {
                 throw [System.InvalidOperationException]::new(
-                    ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+                    ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
                 )
             }
 
@@ -696,9 +694,8 @@ function Get-SyncPushLocalWinsStandardRow {
                 return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
             }
 
-            if (Test-SyncOversizeSize -Size $localSizeValue) {
-                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
-            }
+            # An oversize binary CREATE is publishable: the place sequence
+            # verifies it from the upload ETag rather than a read-back (#54).
 
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                 -CanonicalPath $path `
@@ -759,7 +756,7 @@ function Get-SyncPushLocalWinsStandardRow {
         }
 
         if (Test-SyncOversizeSize -Size $localSizeValue) {
-            return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+            return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
         }
 
         $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
@@ -880,7 +877,7 @@ function Get-SyncPushLocalWinsConflictRow {
             }
 
             if (Test-SyncOversizeSize -Size $localSizeValue) {
-                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
+                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
             }
 
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
@@ -937,9 +934,8 @@ function Get-SyncPushLocalWinsConflictRow {
                 return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
             }
 
-            if (Test-SyncOversizeSize -Size $localSizeValue) {
-                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeRefusalReason -Size $localSizeValue))
-            }
+            # An oversize binary CREATE is publishable: the place sequence
+            # verifies it from the upload ETag rather than a read-back (#54).
 
             $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                 -CanonicalPath $path `
