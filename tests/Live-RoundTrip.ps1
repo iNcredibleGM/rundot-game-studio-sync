@@ -867,19 +867,24 @@ if (-not $script:Aborted) {
     $oversizeBaseUpdated = [regex]::IsMatch($oversizePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
 
     # The remote cannot be read back, so prove presence and size from the list.
+    # Get-RemoteManifestFileRows handles the manifest shape (the files property
+    # name varies), so do not reach into $payload.files directly.
     $oversizeListed = $false
     $oversizeListedSize = 0
     try {
         $listedRows = @(Get-RemoteListedFilePaths `
             -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers)
         $oversizeListed = ($listedRows -contains $oversizeCanonical)
+
         $filesPayload = Get-RemoteProjectFileList `
             -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers
-        foreach ($row in @($filesPayload.files)) {
-            if ($null -eq $row) { continue }
-            $rowCanonical = ConvertTo-CanonicalSyncPath -Path ([string]$row.path -replace '^/', '')
-            if ($rowCanonical -eq $oversizeCanonical) {
-                $oversizeListedSize = [int64](Get-SyncEntrySizeValue -Entry $row)
+        # Get-RemoteManifestFileRows returns its list un-enumerated (return ,$rows),
+        # so iterate it directly. Wrapping it in @() would yield a one-element
+        # array holding the list, and every row read would come back null.
+        $manifestRows = Get-RemoteManifestFileRows -Manifest $filesPayload
+        foreach ($manifestRow in $manifestRows) {
+            if ([string]$manifestRow.CanonicalPath -eq $oversizeCanonical) {
+                $oversizeListedSize = [int64](Get-SyncEntrySizeValue -Entry $manifestRow.Entry)
             }
         }
     }
@@ -898,10 +903,19 @@ if (-not $script:Aborted) {
             $oversizePush.ExitCode, $oversizeRows.Count, $oversizeBaseUpdated, $oversizeListed, $oversizeListedSize, $oversizeSize)
 
     if (-not $oversizeOk) {
-        $oversizeRefused = [regex]::Match($oversizePush.Output, '(?m)^\s+(\S.*?)\s+\[[^\]]+\]\s+(.+?)\s*$')
-        Add-Step -Name 'Oversize create failure evidence' -Status 'FAIL' `
-            -Detail ("refused-reason={0}" -f `
-                $(if ($oversizeRefused.Success) { $oversizeRefused.Groups[2].Value } else { '<no REFUSED row>' }))
+        # Only claim a refusal when the report actually carries one; a bare
+        # "nothing to push" line is not the reason and would mislead.
+        $refusedRows = @([regex]::Matches($oversizePush.Output, '(?m)^\s+(\S.*?)\s+\[REFUSED\]\s+(.+?)\s*$'))
+        if ($refusedRows.Count -gt 0) {
+            Add-Step -Name 'Oversize create failure evidence' -Status 'FAIL' `
+                -Detail ("REFUSED rows={0}; first reason={1}" -f `
+                    $refusedRows.Count, $refusedRows[0].Groups[2].Value)
+        }
+        else {
+            Add-Step -Name 'Oversize create failure evidence' -Status 'FAIL' `
+                -Detail ("no REFUSED row in the report; exit={0}, binary rows={1}, listed={2}, listed size={3}" -f `
+                    $oversizePush.ExitCode, $oversizeRows.Count, $oversizeListed, $oversizeListedSize)
+        }
     }
 }
 
