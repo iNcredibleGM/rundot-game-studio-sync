@@ -75,16 +75,23 @@ exporter does **not** consult this matcher when checking its destination: every
 ignore exception would widen the set of existing files it could overwrite
 ([export.md](export.md)).
 
-### Oversized files are refused, not ignored
+### Oversized files are never silently skipped
 
 The ignore set is name-based only; it has no size rule. A binary **replace** over
 Studio's 2,000,000-byte read limit is a separate, per-file refusal that `Plan`
 marks `applicable: false` and `Push` refuses or excludes with an explicit reason
 ([binary-place.md](binary-place.md)). It is not an `ignored` row and it is not a
 silent skip. An oversize **create** is publishable and verified from the upload
-`ETag` (#54). Keep an oversized file you do not want to publish out of the sync
-folder by moving it outside the workspace; a path absent from LOCAL never becomes
-an upload candidate.
+`ETag` (#54).
+
+A pre-existing oversize path **on Studio** is captured by the snapshot as
+`unverifiable` (path and size, no hash) rather than failing the whole project, so
+one oversize remote file no longer blocks every command
+([remote-snapshot.md](remote-snapshot.md)). It is reported under `UNVERIFIABLE`,
+never as `unchanged`, and is never downloaded or rewritten — a refusal per path,
+never a silent skip. Keep an oversized file you do not want to publish out of the
+sync folder by moving it outside the workspace; a path absent from LOCAL never
+becomes an upload candidate.
 
 ## Classifier contracts
 

@@ -114,6 +114,7 @@ route and its own client-side guard; see [delete.md](delete.md).
 | A | B | B | `synchronized-change` | skipped: both sides already agree |
 | A | — | A | `deleteRemoteCandidate` (reserved or directory-shaped path) | skipped: route refuses it |
 | any | any | any | `ignored` | skipped: out of sync scope |
+| any | any | oversize REMOTE | `unverifiable` | skipped: remote bytes cannot be read (#57) |
 | text ↔ binary | | | `conflict` | skipped: `KindChange` |
 
 Every skipped path is printed with its status and a reason. A skipped path is

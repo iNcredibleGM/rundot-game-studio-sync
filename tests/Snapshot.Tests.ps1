@@ -1078,12 +1078,14 @@ finally {
 
 
 # --------------------------------------------------------------------------
-# A remote file over Studio's read limit fails the snapshot closed (#51)
+# A remote file over Studio's read limit is captured as unverifiable (#57)
 # --------------------------------------------------------------------------
 
-# GET /file returns 413 above the limit, so the snapshot must refuse before
-# downloading anything and name the path, rather than surfacing a bare 413
-# partway through the download loop.
+# GET /file returns 413 above the limit, so such a file's bytes can never be
+# read or hashed. That must not fail the whole project: the path is captured by
+# its list identity (path + size, no hash, no staged bytes) and the rest of the
+# snapshot proceeds. Nothing is ever hashed or compared for it, so it can never
+# be reported as a clean match.
 $oversizeRoot = Join-Path $env:TEMP ("rundot-snapshot-oversize-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $oversizeRoot | Out-Null
 try {
@@ -1107,24 +1109,21 @@ try {
         'src/a.ts' = $hiPayload
     }
 
-    $oversizeThrew = $false
-    $oversizeText = $null
-    try {
-        Invoke-TestSnapshot -WorkspaceRoot $oversizeRoot | Out-Null
-    }
-    catch {
-        $oversizeThrew = $true
-        $oversizeText = [string]$_.Exception.Message
-    }
+    $oversizeSnapshot = Invoke-TestSnapshot -WorkspaceRoot $oversizeRoot
 
-    Assert-True $oversizeThrew "an oversized remote file must fail the snapshot closed"
-    Assert-True `
-        ($oversizeText -match [regex]::Escape('public/huge.png')) `
-        "the refusal must name the oversized remote path"
-    Assert-True `
-        ($oversizeText -match [regex]::Escape([string]$oversizeLimit)) `
-        "the refusal must name the read limit"
-    Assert-Equal 0 $script:FileCallCount "an oversized snapshot must fail before downloading any file"
+    Assert-Equal 2 $oversizeSnapshot.Files.Count "an oversize remote file must not fail the snapshot"
+    Assert-Equal 1 $script:FileCallCount "the oversize path must never be read; only the readable file is downloaded"
+
+    $oversizeEntry = $oversizeSnapshot.Files['public/huge.png']
+    Assert-True ($null -ne $oversizeEntry) "the oversize path must still be captured"
+    Assert-True ([bool]$oversizeEntry.Unverifiable) "the oversize path must be marked unverifiable"
+    Assert-Equal ($oversizeLimit + 1) ([int64]$oversizeEntry.Size) "the unverifiable entry must carry the listed size"
+    Assert-True ([string]::IsNullOrEmpty([string]$oversizeEntry.Sha256)) "an unverifiable entry must carry no hash"
+    Assert-True ([string]::IsNullOrEmpty([string]$oversizeEntry.StagingPath)) "an unverifiable entry must have no staged bytes"
+
+    $readableEntry = $oversizeSnapshot.Files['src/a.ts']
+    Assert-True (-not [bool]$readableEntry.Unverifiable) "a readable file must not be marked unverifiable"
+    Assert-True (-not [string]::IsNullOrEmpty([string]$readableEntry.Sha256)) "a readable file must carry a hash"
 }
 finally {
     if (Test-Path -LiteralPath $oversizeRoot) {

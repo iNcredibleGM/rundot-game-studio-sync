@@ -88,6 +88,38 @@ function Get-SyncOversizeRefusalReason {
     )
 }
 
+function Test-SyncUnverifiableRemoteEntry {
+    # True when REMOTE exists but is over Studio's read limit, so its bytes can
+    # never be read or hashed (#57). Such a path is reported as unverifiable
+    # rather than as a clean match, a conflict, or a download.
+    #
+    # The size alone decides this, never a declared hash: a hash for an
+    # oversize remote can only come from the listing or a previous BASE, and
+    # neither proves the bytes on the server right now. Size-only means a path
+    # is never claimed in sync.
+    #
+    # A path with no remote entry is NOT unverifiable: an oversize binary
+    # CREATE has no remote bytes to read and still publishes through the
+    # presigned-PUT ETag route (#54).
+    param($Remote)
+
+    if ($null -eq $Remote) {
+        return $false
+    }
+
+    return (Test-SyncOversizeSize -Size (Get-SyncEntrySizeValue -Entry $Remote))
+}
+
+function Get-SyncUnverifiableRemoteReason {
+    # One actionable line for a path whose remote bytes cannot be read back.
+    param([int64]$Size)
+
+    return (
+        "{0} bytes is over Studio's {1}-byte read limit, so its remote bytes cannot be read or hashed. This path is unverifiable: Plan never reports it as in sync, Pull never downloads it, and Push never rewrites it." -f `
+            [string]$Size, [string]$script:SyncStudioMaxReadableFileSize
+    )
+}
+
 # A plain content MD5: 32 lowercase hex characters. Object storage switches an
 # ETag to '<md5-of-parts>-<partcount>' for a multipart upload, which is NOT a
 # digest of the whole object, so that shape must be refused rather than

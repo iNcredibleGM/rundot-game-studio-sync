@@ -99,7 +99,13 @@ every layer:
 | `Plan` | `applicable: true` (ETag verify) | `applicable: false` with the replace reason |
 | `Push` (default) | Selected and published | Throws before any `DELETE` or upload |
 | `Push -LocalWins` | Selected and published | Excluded with the reason; the rest continues |
-| REMOTE snapshot | Aborts before downloading when the remote manifest lists an oversized file | (same) |
+| REMOTE snapshot | Captured as `unverifiable` (path + size, no hash); the rest of the tree still snapshots | (same) |
+
+A pre-existing oversize path on Studio no longer fails the whole snapshot: it is
+captured as `unverifiable`, reported under `UNVERIFIABLE`, and never downloaded or
+rewritten (#57, [remote-snapshot.md](remote-snapshot.md)). An oversize **replace**
+whose path is already oversize on REMOTE is `unverifiable` rather than an
+applicable replace, so it is never attempted.
 
 The replace reason names the file's size, the limit, why it cannot work, and what
 to do:
@@ -119,8 +125,9 @@ There is no `.rundotignore` parser. Keep an oversized file out of the sync
 folder: move it outside the workspace, or leave it out when you build the folder
 you point `-LocalDir` at. A path absent from LOCAL is never an upload candidate,
 so the rest of the tree syncs normally. A pre-existing oversized path already on
-Studio blocks every REMOTE read ([remote-snapshot.md](remote-snapshot.md)); the
-snapshot abort names the paths so you can delete them on Studio first.
+Studio is captured as `unverifiable` and does not block the rest of the project
+([remote-snapshot.md](remote-snapshot.md)); it is reported under `UNVERIFIABLE`
+so you can delete it on Studio when you choose to.
 
 ## Recovery when a place fails after move
 

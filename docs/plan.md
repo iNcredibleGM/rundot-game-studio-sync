@@ -83,6 +83,12 @@ the backup or the `expectedRemoteHash` gate. An oversize binary **create** stays
 applicable and is verified from the upload `ETag` (#54)
 ([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
 
+A path whose REMOTE is over the read limit is reported as `unverifiable`, never
+`unchanged` and never applicable: the remote bytes were never read, so Plan will
+not claim the path is in sync ([classifier.md](classifier.md),
+[remote-snapshot.md](remote-snapshot.md)). It appears under `UNVERIFIABLE` and is
+counted in the `SUMMARY`.
+
 ## Console layout
 
 Sections appear only when they have rows:
@@ -94,6 +100,8 @@ Sections appear only when they have rows:
   `deleteRemoteCandidate` may be applied by a confirmed `Push`, a
   `deleteLocalCandidate` is reported only
 - `IGNORED` — out of sync scope by the default ignore set
+- `UNVERIFIABLE` — REMOTE is over Studio's read limit, so its bytes cannot be
+  read or hashed; never in sync, never downloaded, never rewritten
 - `UNSUPPORTED` — text ↔ binary kind changes
 - `DIAGNOSTIC` — see below
 - `SUMMARY` — a count per status, the union total, and the applicable total

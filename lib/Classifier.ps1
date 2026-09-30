@@ -21,6 +21,7 @@ $script:SyncStatusConflict              = 'conflict'
 $script:SyncStatusIgnored               = 'ignored'
 $script:SyncStatusDeleteRemoteCandidate = 'deleteRemoteCandidate'
 $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
+$script:SyncStatusUnverifiable          = 'unverifiable'
 
 # Binary uploads display as UPLOAD. Path, size, and publish policy live in
 # Plan.ps1 (docs/binary-place-protocol.md, #41).
@@ -256,7 +257,8 @@ function Test-SyncNoOpStatus {
         $script:SyncStatusUnchanged,
         $script:SyncStatusSynchronizedChange,
         $script:SyncStatusSynchronizedAddition,
-        $script:SyncStatusSettledAbsent
+        $script:SyncStatusSettledAbsent,
+        $script:SyncStatusUnverifiable
     ) -contains $Status
 }
 
@@ -276,6 +278,14 @@ function Get-SyncPathChangeStatus {
 
     if (Test-IgnoredSyncPath -CanonicalPath $Path) {
         return $script:SyncStatusIgnored
+    }
+
+    # An oversize REMOTE file is unverifiable (#57): its bytes cannot be read
+    # or hashed, so it can never be a clean match, a download, or a safe
+    # direction. This is checked before the three-way table because it holds
+    # whatever BASE and LOCAL say.
+    if (Test-SyncUnverifiableRemoteEntry -Remote $Remote) {
+        return $script:SyncStatusUnverifiable
     }
 
     $baseSha = Get-SyncEntrySha256 -Entry $Base
@@ -372,13 +382,18 @@ function Get-SyncPlanChange {
     $applicable = $false
 
     if (-not $ignored) {
-        $kindChange = Test-UnsupportedSyncKindChange -Base $Base -Local $Local -Remote $Remote
-        if ($kindChange) {
-            $status = $script:SyncStatusConflict
+        # An unverifiable path is settled before the kind-change check: the
+        # remote kind for such a path is a guess (binary), never observed, so
+        # it must not be turned into an unsupported kind-change conflict (#57).
+        if ($status -ne $script:SyncStatusUnverifiable) {
+            $kindChange = Test-UnsupportedSyncKindChange -Base $Base -Local $Local -Remote $Remote
+            if ($kindChange) {
+                $status = $script:SyncStatusConflict
+            }
         }
     }
 
-    if (Test-SyncNoOpStatus -Status $status) {
+    if ((Test-SyncNoOpStatus -Status $status) -and $status -ne $script:SyncStatusUnverifiable) {
         $disagreements = @(Get-SyncPlanMetadataDisagreements -Base $Base -Local $Local -Remote $Remote)
         if ($disagreements.Count -gt 0) {
             $warning = (
@@ -394,6 +409,9 @@ function Get-SyncPlanChange {
         }
         $script:SyncStatusDownload {
             $applicable = $true
+        }
+        $script:SyncStatusUnverifiable {
+            $reason = Get-SyncUnverifiableRemoteReason -Size (Get-SyncEntrySizeValue -Entry $Remote)
         }
         $script:SyncStatusConflict {
             if ($kindChange) {

@@ -127,6 +127,9 @@ function Get-SyncPullExclusionReason {
         $script:SyncStatusUnchanged {
             return 'BASE, LOCAL, and REMOTE all agree, so there is nothing to pull.'
         }
+        $script:SyncStatusUnverifiable {
+            return 'REMOTE is over Studio''s read limit, so its bytes cannot be read. Pull cannot download this path; it is left untouched.'
+        }
         $script:SyncStatusSynchronizedChange {
             return 'LOCAL and REMOTE already agree on the new content, so there is nothing to pull.'
         }
