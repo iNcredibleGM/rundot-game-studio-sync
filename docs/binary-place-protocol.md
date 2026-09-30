@@ -308,7 +308,9 @@ Two limits remain, and they are read-side:
 1. **Reading an existing oversize remote file is still impossible.** No route
    returns its bytes, and no response exposes a hash for it — not `/files`, not
    `upload-adopt`, not `move`. Snapshot, Plan, and Pull cannot verify such a
-   file, so a project that already *contains* one still refuses.
+   file. Rather than fail the whole project, #57 captures it as `unverifiable`
+   (path + size, no hash) and reports it as `unverifiable` — never as in sync,
+   never downloaded, never rewritten ([remote-snapshot.md](remote-snapshot.md)).
 2. **Replacing an oversize remote original still needs its bytes** for the
    pre-overwrite backup and the `expectedRemoteHash` gate, so an oversize
    **replace** stays refused. The refusal is now specific about which of the two
@@ -337,9 +339,10 @@ cause was invisible. The wrapper now appends the inner cause
 So the 2,000,000-byte limit is a **precondition** of a reliable place, not an
 edge case: a binary that cannot be read back cannot be verified, and an
 unverifiable replace must not run. The product refuses an oversized local binary
-**replace** before any `DELETE` or upload, and refuses an oversized remote file
-in a snapshot; an oversized **create** is publishable through the ETag route
-above ([binary-place.md](binary-place.md)).
+**replace** before any `DELETE` or upload; an oversized remote file in a snapshot
+is captured as `unverifiable` rather than failing the whole project (#57); an
+oversized **create** is publishable through the ETag route above
+([binary-place.md](binary-place.md)).
 
 ## Consequence for `Push` and [#41](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/41)
 

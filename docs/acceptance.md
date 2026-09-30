@@ -400,6 +400,7 @@ Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
 | Journal records `push-backup` and `push-binary` | gate 15 |
 | A binary **replace** over the 2,000,000-byte read limit is refused before mutation | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
 | A binary **create** over the 2,000,000-byte read limit is published and verified from the upload `ETag` (#54) | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Hashing.Tests.ps1`, `tests/Live-RoundTrip.ps1` |
+| An oversize **REMOTE** file no longer fails the snapshot; it is captured as `unverifiable` (path + size, no hash), reported under `UNVERIFIABLE`, and never treated as in sync (#57) | `tests/Snapshot.Tests.ps1`, `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
 
 **Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
 and runs `Push -LocalWins -ForcePush` (the mode a real publish of a diverged
@@ -442,6 +443,28 @@ it holds end to end rather than only at the helper boundary.
 **Live check:** run `tests/Live-RoundTrip.ps1 -ProjectId <id>`. Expect every
 `progress lines: ...` step to pass, and the fail-closed step to pass with a
 non-zero exit for the locked file.
+
+### 17. An oversize remote file is unverifiable, not a project-wide abort (#57)
+
+| Property | Evidence |
+| --- | --- |
+| The snapshot captures an oversize remote path without calling `GET /file` | `tests/Snapshot.Tests.ps1` |
+| The captured entry carries the listed size, no hash, and no staged bytes | `tests/Snapshot.Tests.ps1` |
+| The rest of the snapshot still downloads and hashes readable files | `tests/Snapshot.Tests.ps1` |
+| An oversize remote path classifies as `unverifiable`, never `unchanged` | `tests/SyncEngine.Tests.ps1` |
+| A declared hash on an oversize remote is not treated as agreement | `tests/SyncEngine.Tests.ps1` |
+| A guessed remote kind never escalates an unverifiable path to `conflict` | `tests/SyncEngine.Tests.ps1` |
+| An unverifiable path is never applicable: Pull never downloads it, Push never rewrites it | `tests/SyncEngine.Tests.ps1`, `tests/Pull.Tests.ps1`, `tests/Push.Tests.ps1` |
+| Plan reports it under `UNVERIFIABLE` and counts it in the summary, never as `UNCHANGED` | `tests/SyncPlan.Tests.ps1` |
+| An oversize binary **create** (remote absent) still publishes via the `ETag` route | `tests/SyncEngine.Tests.ps1`, `tests/Push.Tests.ps1` |
+| An oversize binary **replace** stays refused with its own reason | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+
+**Live check:** on a project that already contains an oversize file, `Plan`
+completes and lists the path under `UNVERIFIABLE` with its size, `Pull` leaves it
+untouched, and a `Push` of other paths in the same run still applies. The
+[#57](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/57) bug was
+observed exactly here: two 2,254,917-byte PNGs placed by an earlier `Push` made
+every later `Plan`/`Push` fail until they were captured as unverifiable.
 
 ## What this record deliberately does not claim
 

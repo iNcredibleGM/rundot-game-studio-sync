@@ -488,6 +488,77 @@ Assert-Null $textUploadRow.Reason "an applicable text upload carries no reason"
 
 
 # --------------------------------------------------------------------------
+# Oversize REMOTE files: unverifiable, never in sync, never an action (#57)
+#
+# Studio's GET /file returns 413 above the read limit, so an oversize remote
+# file's bytes can never be read or hashed. The classifier must not guess a
+# direction: the path is reported as unverifiable whatever BASE and LOCAL say.
+# --------------------------------------------------------------------------
+
+$oversizeRemoteSize = [int64]$SyncStudioMaxReadableFileSize + 1
+
+Assert-Equal 'unverifiable' $SyncStatusUnverifiable "the unverifiable status should be the literal 'unverifiable'"
+
+# REMOTE oversize with no readable hash and no LOCAL: unverifiable, not a
+# download, even though a small remote-only path would download.
+$oversizeRemote = New-SyncEngineTestRemoteEntry -Sha256 $null -Size $oversizeRemoteSize -Kind 'binary' -Encoding 'base64'
+Assert-Equal `
+    'unverifiable' `
+    ([string](Get-SyncPathChangeStatus -Path 'public/huge.png' -Base $null -Local $null -Remote $oversizeRemote)) `
+    "an oversize remote-only path must be unverifiable, not a download"
+
+$oversizeRemoteRow = Get-SyncPlanChange -Path 'public/huge.png' -Base $null -Local $null -Remote $oversizeRemote
+Assert-Equal 'unverifiable' ([string]$oversizeRemoteRow.Status) "the plan row keeps the unverifiable status"
+Assert-Equal $false $oversizeRemoteRow.Applicable "an unverifiable path is never actionable"
+Assert-True ($null -ne $oversizeRemoteRow.Reason) "an unverifiable path must explain itself"
+Assert-True `
+    ([string]$oversizeRemoteRow.Reason -match '(?i)read limit') `
+    "an unverifiable reason should name the read limit"
+Assert-True `
+    ([string]$oversizeRemoteRow.Reason -notmatch '(?i)bearer|token') `
+    "an unverifiable reason must never contain credentials"
+
+# A LOCAL file that differs from an oversize REMOTE is unverifiable, not a
+# conflict: the remote bytes cannot be read, so no direction can be proven.
+Assert-Equal `
+    'unverifiable' `
+    ([string](Get-SyncPathChangeStatus -Path 'public/huge.png' -Base $null -Local $localB -Remote $oversizeRemote)) `
+    "a local change against an oversize remote must be unverifiable, not a conflict"
+
+# An oversize remote's kind is a guess (binary), never observed. A text LOCAL
+# must not be escalated into an unsupported kind-change conflict against it.
+$textLocalRow = Get-SyncPlanChange -Path 'public/huge.txt' -Base $null -Local $localA -Remote $oversizeRemote
+Assert-Equal 'unverifiable' ([string]$textLocalRow.Status) "a text local against an oversize remote must stay unverifiable"
+Assert-Equal $false $textLocalRow.KindChange "a guessed remote kind must not set the kind-change flag"
+Assert-Equal $false $textLocalRow.Applicable "an unverifiable path is never actionable"
+Assert-True `
+    ([string]$textLocalRow.Reason -match '(?i)read limit') `
+    "an unverifiable text-vs-oversize reason should name the read limit"
+
+# Even a matching declared hash must not turn an oversize remote into a clean
+# match: the bytes were never read, so it is never claimed in sync.
+$oversizeSameShaRemote = New-SyncEngineTestRemoteEntry -Sha256 $syncEngineShaA -Size $oversizeRemoteSize -Kind 'binary' -Encoding 'base64'
+Assert-Equal `
+    'unverifiable' `
+    ([string](Get-SyncPathChangeStatus -Path 'public/huge.png' -Base $null -Local $localA -Remote $oversizeSameShaRemote)) `
+    "an oversize remote with a matching declared hash must still be unverifiable"
+
+# A small remote file is unaffected: the guard is exactly the read limit.
+$atLimitRemote = New-SyncEngineTestRemoteEntry -Sha256 $null -Size $SyncStudioMaxReadableFileSize -Kind 'binary' -Encoding 'base64'
+Assert-Equal `
+    'download' `
+    ([string](Get-SyncPathChangeStatus -Path 'public/small.png' -Base $null -Local $null -Remote $atLimitRemote)) `
+    "a remote file exactly at the read limit must still classify as download"
+
+# An oversize LOCAL file with no REMOTE is an ordinary binary create (#54):
+# there are no remote bytes to read, so it is not unverifiable.
+$oversizeLocal = New-SyncEngineTestLocalEntry -Sha256 $syncEngineShaB -Size $oversizeRemoteSize -Kind 'binary'
+$oversizeLocalRow = Get-SyncPlanChange -Path 'public/new.png' -Base $null -Local $oversizeLocal -Remote $null
+Assert-Equal 'upload' ([string]$oversizeLocalRow.Status) "an oversize local create must still be an upload"
+Assert-Equal $true $oversizeLocalRow.Applicable "an oversize local create is applicable"
+
+
+# --------------------------------------------------------------------------
 # Zero-byte and large binary files: ordinary classification, real hashes
 # --------------------------------------------------------------------------
 
@@ -543,8 +614,9 @@ try {
     Assert-Equal 'upload' ([string]$largeRow.Status) "a large binary local-only file must classify as upload"
     Assert-Equal $true $largeRow.Applicable "a large binary upload candidate is applicable at the classifier layer"
 
-    # A large binary already identical on both sides is a synchronized
-    # addition, proving size does not change the decision.
+    # A large binary identical on both sides is NOT claimed in sync when the
+    # remote is over Studio's read limit (#57): the remote bytes were never
+    # read, so the path is unverifiable, not a synchronized addition.
     $largeRemote = New-SyncEngineTestRemoteEntry `
         -Sha256 $largeLocal.Sha256 `
         -Size $largeLocal.Size `
@@ -552,9 +624,23 @@ try {
         -Encoding 'base64'
     $largeSameRow = Get-SyncPlanChange -Path 'public/large-binary.bin' -Base $null -Local $largeLocal -Remote $largeRemote
     Assert-Equal `
-        'synchronized-addition' `
+        'unverifiable' `
         ([string]$largeSameRow.Status) `
-        "a large binary identical on both sides must classify as a synchronized addition"
+        "an oversize remote must be unverifiable even with a matching declared hash"
+    Assert-Equal $false $largeSameRow.Applicable "an unverifiable oversize remote is never actionable"
+
+    # A remote file under the read limit still uses the ordinary decision
+    # table, so the guard is the read limit and not size in general.
+    $mediumRemote = New-SyncEngineTestRemoteEntry `
+        -Sha256 $largeLocal.Sha256 `
+        -Size ([int64]$SyncStudioMaxReadableFileSize - 1) `
+        -Kind 'binary' `
+        -Encoding 'base64'
+    $mediumSameRow = Get-SyncPlanChange -Path 'public/medium.bin' -Base $null -Local $largeLocal -Remote $mediumRemote
+    Assert-Equal `
+        'synchronized-addition' `
+        ([string]$mediumSameRow.Status) `
+        "an under-limit remote with a matching hash must stay a synchronized addition"
 }
 finally {
     if (Test-Path -LiteralPath $syncEngineTestRoot) {

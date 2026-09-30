@@ -871,6 +871,56 @@ try {
         (($ignoredReport -split "`n" | Where-Object { $_ -match '^IGNORED$' }).Count -eq 1) `
         "ignored paths must produce an IGNORED section"
 
+    # An oversize remote path is unverifiable (#57): its own section, a
+    # summary count, and never folded into UNCHANGED even with
+    # -IncludeUnchanged.
+    $unverifiableRemote = New-SyncPlanTestRemoteEntry `
+        -Sha256 $null `
+        -Size ([int64]$SyncStudioMaxReadableFileSize + 1) `
+        -Kind 'binary' `
+        -Encoding 'base64'
+    $unverifiableRemoteMap = @{ 'public/huge.png' = $unverifiableRemote }
+    $unverifiableAnalysis = New-RundotSyncPlanAnalysis `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $resolution `
+        -Local @{} `
+        -Remote $unverifiableRemoteMap `
+        -Snapshot $snapshot `
+        -Command 'Plan' `
+        -PersistArtifact:$false
+    $unverifiableReport = [string]$unverifiableAnalysis.Report
+    Assert-True `
+        (($unverifiableReport -split "`n" | Where-Object { $_ -match '^UNVERIFIABLE$' }).Count -eq 1) `
+        "an oversize remote path must produce exactly one UNVERIFIABLE section"
+    Assert-True `
+        ($unverifiableReport -match '(?m)^\s*unverifiable:\s*1\s*$') `
+        "the SUMMARY must count the unverifiable path"
+    Assert-True `
+        ($unverifiableReport -match [regex]::Escape('public/huge.png')) `
+        "the UNVERIFIABLE section must name the path"
+    Assert-True `
+        (($unverifiableReport -split "`n" | Where-Object { $_ -match '^DOWNLOAD$' }).Count -eq 0) `
+        "an oversize remote path must not appear as a download"
+
+    $unverifiableVerbose = New-RundotSyncPlanAnalysis `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $resolution `
+        -Local @{} `
+        -Remote $unverifiableRemoteMap `
+        -Snapshot $snapshot `
+        -Command 'Plan' `
+        -IncludeUnchanged `
+        -PersistArtifact:$false
+    $unverifiableVerboseReport = [string]$unverifiableVerbose.Report
+    Assert-True `
+        (($unverifiableVerboseReport -split "`n" | Where-Object { $_ -match '^UNCHANGED$' }).Count -eq 0) `
+        "an unverifiable path must never be folded into UNCHANGED"
+    Assert-True `
+        (($unverifiableVerboseReport -split "`n" | Where-Object { $_ -match '^UNVERIFIABLE$' }).Count -eq 1) `
+        "the unverifiable section must stand on its own"
+
     # Summary counts must equal the row counts.
     $summaryUploadLine = @($reportLines | Where-Object { $_ -match '^\s*upload:\s*(\d+)\s*$' })
     Assert-True ($summaryUploadLine.Count -eq 1) "the SUMMARY must report the upload count once"

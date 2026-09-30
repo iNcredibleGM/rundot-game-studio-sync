@@ -198,6 +198,9 @@ function Get-SyncPushExclusionReason {
         $script:SyncStatusUnchanged {
             return 'BASE, LOCAL, and REMOTE all agree, so there is nothing to push.'
         }
+        $script:SyncStatusUnverifiable {
+            return 'REMOTE is over Studio''s read limit, so its bytes cannot be read or hashed. Push never rewrites an unverifiable path.'
+        }
         $script:SyncStatusSynchronizedChange {
             return 'LOCAL and REMOTE already agree on the new content, so there is nothing to push.'
         }

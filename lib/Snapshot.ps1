@@ -429,35 +429,20 @@ function Get-RemoteSnapshotFileMap {
         Write-RundotSyncProgressLine -Text ("Downloading {0} remote file(s)..." -f $total)
     }
 
-    # Fail closed before any download: GET /file refuses a payload over Studio's
-    # read limit with 413, and that would otherwise surface as a bare
-    # "Remote request failed with HTTP 413" after the download loop had already
-    # run. A named path plus the limit is actionable (#51). This is a refusal,
-    # not a partial snapshot: every command that needs REMOTE identity fails the
-    # same way, so the tree cannot be silently half-read.
-    $oversize = New-Object 'System.Collections.Generic.List[object]'
+    # A remote file over Studio's read limit cannot be read back: GET /file
+    # returns 413 for its bytes. That is not a reason to fail the whole project
+    # — the path is still visible in /files with its size — so it is
+    # represented as unverifiable (path and size, no hash, no staged bytes)
+    # and the rest of the snapshot proceeds (#57). Plan reports it as
+    # `unverifiable`; Pull never downloads it; Push never rewrites it. Nothing
+    # is ever hashed or compared for it, so it can never be read as a clean
+    # match.
+    $oversizePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($row in $rows) {
         $entrySize = Get-SyncEntrySizeValue -Entry $row.Entry
         if (Test-SyncOversizeSize -Size $entrySize) {
-            [void]$oversize.Add([pscustomobject]@{
-                Path = [string]$row.CanonicalPath
-                Size = $entrySize
-            })
+            [void]$oversizePaths.Add([string]$row.CanonicalPath)
         }
-    }
-
-    if ($oversize.Count -gt 0) {
-        $lines = New-Object 'System.Collections.Generic.List[string]'
-        [void]$lines.Add((
-            "Refusing to read REMOTE: {0} file(s) are over Studio's {1}-byte read limit, so GET /file returns 413 for them." -f `
-                $oversize.Count, [string]$script:SyncStudioMaxReadableFileSize
-        ))
-        foreach ($item in $oversize) {
-            [void]$lines.Add(('  {0}  ({1} bytes)' -f [string]$item.Path, [string]$item.Size))
-        }
-        [void]$lines.Add('Delete these paths on Studio, or exclude them from the sync folder, and re-run.')
-
-        throw [System.InvalidOperationException]::new([string]::Join("`n", $lines.ToArray()))
     }
 
     try {
@@ -474,6 +459,26 @@ function Get-RemoteSnapshotFileMap {
             Assert-SyncPathRepresentable `
                 -WorkspaceRoot $StagingRoot `
                 -CanonicalPath $row.CanonicalPath
+
+            if ($oversizePaths.Contains([string]$row.CanonicalPath)) {
+                # Unverifiable: no read, no staged bytes, no hash. Size comes
+                # from the listing, which is the only identity the server
+                # exposes for such a file. The kind is a placeholder, not an
+                # observation: the classifier settles these paths before any
+                # kind comparison (#57).
+                $files[$row.CanonicalPath] = [pscustomobject]@{
+                    Sha256            = $null
+                    Size              = [int64](Get-SyncEntrySizeValue -Entry $row.Entry)
+                    LocalDetectedKind = 'binary'
+                    LineEnding        = $null
+                    HasBom            = $null
+                    RemoteKind        = 'binary'
+                    Encoding          = $null
+                    StagingPath       = $null
+                    Unverifiable      = $true
+                }
+                continue
+            }
 
             $originalPath = [string](Get-RemoteEntryProperty -Entry $row.Entry -Names @('path', 'Path'))
             $response = Get-RemoteProjectFile `
@@ -499,6 +504,7 @@ function Get-RemoteSnapshotFileMap {
                 RemoteKind        = ConvertTo-RemoteKind -Encoding $encoding
                 Encoding          = $encoding
                 StagingPath       = $stagingPath
+                Unverifiable      = $false
             }
         }
     }

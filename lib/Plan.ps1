@@ -761,6 +761,10 @@ function Format-SyncPlanReport {
             })
         }
         [pscustomobject]@{
+            Header = 'UNVERIFIABLE'
+            Rows   = @($operations | Where-Object { $_.status -eq $script:SyncStatusUnverifiable })
+        }
+        [pscustomobject]@{
             Header = 'IGNORED'
             Rows   = @($operations | Where-Object { $_.status -eq $script:SyncStatusIgnored })
         }
@@ -774,7 +778,8 @@ function Format-SyncPlanReport {
         $sections += [pscustomobject]@{
             Header = 'UNCHANGED'
             Rows   = @($operations | Where-Object {
-                Test-SyncNoOpStatus -Status ([string]$_.status)
+                (Test-SyncNoOpStatus -Status ([string]$_.status)) -and
+                $_.status -ne $script:SyncStatusUnverifiable
             })
         }
     }
@@ -819,7 +824,8 @@ function Format-SyncPlanReport {
         $script:SyncStatusUnchanged,
         $script:SyncStatusSynchronizedChange,
         $script:SyncStatusSynchronizedAddition,
-        $script:SyncStatusSettledAbsent
+        $script:SyncStatusSettledAbsent,
+        $script:SyncStatusUnverifiable
     )) {
         $count = @($operations | Where-Object { $_.status -eq $status }).Count
         $lines.Add(('  {0}: {1}' -f $status, $count))

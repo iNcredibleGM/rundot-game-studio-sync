@@ -87,6 +87,7 @@ confirmation because there is no existing file to preserve.
 | A | — | — | `settledAbsent` | reported only |
 | — | A | — | `upload` | skipped: future push work |
 | any | any | any | `ignored` | skipped: out of sync scope |
+| any | any | oversize REMOTE | `unverifiable` | skipped: remote bytes cannot be read (#57) |
 | text ↔ binary | | | `conflict` | skipped: `KindChange` |
 
 Every skipped path is printed with its status and a reason. A skipped path is
