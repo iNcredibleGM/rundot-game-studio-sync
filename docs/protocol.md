@@ -16,6 +16,24 @@ rather than treating a single `/files` response as truth.
 
 GET /api/projects/{projectId}/file?path={encodedPath}
 
+Status: observed, with a hard server-side limit. A payload of **2,000,000 bytes
+or fewer** returns `200` with the encoded content; **2,000,001 bytes or more**
+returns HTTP `413` `file too large to view`. No alternate large-file read route
+was found (every guessed shape — `raw=1`, `download`, `asset`, `blob`, a signed
+URL — returned `404`), so a binary over the limit can be placed but never read
+back. The tool refuses such a file **as a replace** before any destructive step,
+and publishes it **as a create** by verifying from the presigned upload `ETag`
+instead ([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
+
+The limit is a property of the **route**, not of the response body. That was
+tested, not assumed (#51): a `Range` request (`bytes=0-1023`, a suffix range,
+a window straddling 2,000,000, and a window **entirely above** it) returned
+`413` for every shape, and `HEAD` returned `405`. The threshold counts **raw
+bytes**, not the base64 payload — 2,000,000 raw bytes read back `200` even
+though they encode to 2,666,668 base64 characters. `GET /files` still *lists* a
+path over the limit, so an oversize file is visible and its size is reported; it
+is only the bytes that cannot be read.
+
 ## Write text file
 
 PUT /api/projects/{projectId}/file?path={encodedPath}
@@ -32,21 +50,33 @@ tool. It is **overwrite-only**: a path that is not already in the project
 returns 404, and there is no ETag, version field, or honoured `If-Match`. Nothing
 in the product calls this route.
 
+## Create text file
+
+Status: investigated in [#37](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/37)
+([text-create-protocol.md](text-create-protocol.md)). **No single-request create
+route** was found among guessed API shapes; `PUT /file` remains overwrite-only
+(#14). Studio’s UI does not expose a new text-file create (and does not offer
+text upload; binary upload is separate). New source text at a chosen path was
+observed only through the **API**: unique **upload adopt**, **`POST /move`**, then
+**`PUT /file`** for exact bytes. A confirmed `Push` applies this for applicable
+utf8 text creates in `lib/RemoteTextCreate.ps1` ([text-create.md](text-create.md)).
+
 ## Delete file
 
 DELETE /api/projects/{projectId}/file?path={encodedPath}
 
-Status: observed and characterized in
-[delete-rename-protocol.md](delete-rename-protocol.md), but not part of the
-supported tool. It removes exactly the named file and returns
+Status: implemented by a confirmed `Push` in `lib/RemoteDelete.ps1` for a
+route-allowed `deleteRemoteCandidate` row, and characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md). It removes exactly the
+named file and returns
 `{"success":true,"data":{"deleted":"<path>"}}`. A repeated delete returns 404
 rather than an error, a directory-shaped path is 404 rather than recursive, and
 `If-Match` / `If-None-Match` are ignored exactly as they are on the write
-route. A rename or move is `POST /api/projects/{id}/move` with `{from,to}`,
-characterized in [delete-rename-protocol.md](delete-rename-protocol.md). It
-honors an arbitrary destination path, preserves bytes, and refuses to overwrite
-an existing destination with `409 ALREADY_EXISTS`. Nothing in the product calls
-these routes, and `deleteRemoteCandidate` remains classification-only.
+route, so the guard is client-side ([delete.md](delete.md)). A rename or move is
+`POST /api/projects/{id}/move` with `{from,to}`, characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md). It honors an arbitrary
+destination path, preserves bytes, and refuses to overwrite an existing
+destination with `409 ALREADY_EXISTS`. `POST /move` is emitted only for utf8 text create placement (#40), not for renames.
 
 ## Move / rename file
 
@@ -87,5 +117,22 @@ supported tool. Three findings dominate: the requested `path` is **ignored**,
 so the file is always recorded at `/uploads/{basename}`; a repeated filename
 **never replaces** the existing file, it creates a numeric-suffixed sibling
 (`name-1.png`); and the flow **can create a text file** at that path, which
-`PUT /file` cannot. Replacement was not achievable by any attempt. Nothing in
-the product calls these routes.
+`PUT /file` cannot. Replacement was not achievable by any attempt. The upload
+and adopt routes are called only from `lib/RemoteUpload.ps1` for utf8 text
+create (#40); binary place (#41) via [binary-place.md](binary-place.md).
+
+## Place a binary at a chosen project path
+
+Status: investigated in [#38](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/38)
+([binary-place-protocol.md](binary-place-protocol.md)). The upload flow cannot
+choose a path, but a composed sequence can: upload a unique name, `POST /move`
+to the chosen path, and the staging copy is gone — one binary at the requested
+path, with bytes preserved. A repeated upload name still collides, and the
+adopt response names the suffixed path it actually recorded, so the sibling is
+visible and can be deleted. Replacement is **delete-then-place**, not an
+in-place overwrite: a move onto an occupied destination is refused with `409`
+and changes nothing. A move honors a leading-dot destination (which the upload
+flow strips) and any nested path, but the server does not uniformly guard
+reserved paths (`/.rundot-sync/…` and `/.rundot/…` returned `200` while
+`/.git/…` returned `404`), so the client-side rule stays load-bearing. Nothing
+in the product calls these routes.

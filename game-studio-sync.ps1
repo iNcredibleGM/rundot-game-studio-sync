@@ -25,7 +25,10 @@ param(
     [switch]$ForcePush,
 
     # Push only: skip-prompt alias for -ForcePush.
-    [switch]$ConfirmPush
+    [switch]$ConfirmPush,
+
+    # Push only: publish local bytes over conflicts and remote-only paths.
+    [switch]$LocalWins
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,11 +63,12 @@ $ErrorActionPreference = "Stop"
 # Pull never deletes anything, locally or remotely.
 #
 # Push is the only command that writes REMOTE. It consumes the last Plan
-# artifact, re-verifies every fingerprint, and publishes only clean utf8 text
-# overwrites via documented PUT /file. Push asks for confirmation before
-# overwriting; -ForcePush or -ConfirmPush skips the prompt but never a backup,
-# and never bypasses conflict refusal or the concurrent-edit guard. Push never
-# creates files, never uploads binaries, and never deletes anything.
+# artifact, re-verifies every fingerprint, and publishes clean utf8 text
+# overwrites via documented PUT /file plus confirmed deleteRemoteCandidate rows
+# via documented DELETE /file. Push asks for confirmation before overwriting
+# and before deleting; -ForcePush or -ConfirmPush skips both prompts but never
+# a backup, and never bypasses conflict refusal or the concurrent-edit guard.
+# Push publishes text and binary changes only through documented sequences.
 # ============================================================================
 
 
@@ -85,6 +89,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Paths.ps1")
 . (Join-Path $PSScriptRoot "lib\Ignore.ps1")
 . (Join-Path $PSScriptRoot "lib\Hashing.ps1")
+. (Join-Path $PSScriptRoot "lib\Progress.ps1")
 . (Join-Path $PSScriptRoot "lib\Workspace.ps1")
 . (Join-Path $PSScriptRoot "lib\Manifest.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
@@ -96,6 +101,11 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteDelete.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteUpload.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteMove.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteTextCreate.ps1")
+. (Join-Path $PSScriptRoot "lib\RemoteBinaryPlace.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
 
@@ -139,6 +149,8 @@ function Stop-WithUsageError {
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ForcePush"
     Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -ConfirmPush"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins"
+    Write-Host "  .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins -ForcePush"
     Write-Host ""
 
     Clear-SensitiveVariables
@@ -265,14 +277,15 @@ function Invoke-SyncPlanCommand {
         #    protected and staged under .rundot-sync/temp.
         Write-Section "$SyncCommand - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
         Write-Host "  before: $($snapshot.RemoteManifestHashBefore)"
@@ -433,14 +446,15 @@ function Invoke-SyncPullCommand {
         #    torn-read protected, and its staged bytes are what Pull writes.
         Write-Section "Pull - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
 
@@ -500,9 +514,10 @@ function Invoke-SyncPullCommand {
 # Push
 #
 # Push is the only command that writes REMOTE. It consumes last-plan.json,
-# re-verifies every fingerprint against the live tree, and publishes only clean
-# utf8 text overwrites. -ForcePush or -ConfirmPush skips the prompt; a console
-# run otherwise requires typing yes before any PUT runs.
+# re-verifies every fingerprint against the live tree, and publishes clean utf8
+# text overwrites plus confirmed deleteRemoteCandidate rows. -ForcePush or
+# -ConfirmPush skips the prompts; a console run otherwise requires typing yes
+# before any PUT or DELETE runs.
 # ============================================================================
 
 function Read-RundotSyncPushConfirmation {
@@ -541,11 +556,186 @@ function Read-RundotSyncPushConfirmation {
     )
 }
 
+function Read-RundotSyncPushCreateConfirmation {
+    param(
+        [int]$CreateCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will CREATE $CreateCount remote text file(s) on Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each path is checked absent immediately before create. There is no remote backup for a new file."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "CREATE $CreateCount remote file(s)?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Read-RundotSyncPushBinaryConfirmation {
+    param(
+        [int]$BinaryCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will CREATE or REPLACE $BinaryCount remote binary file(s) on Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each replacement copies the remote original into .rundot-sync/backups before the old bytes are removed."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "PLACE $BinaryCount remote binary file(s)?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Read-RundotSyncLocalWinsConfirmation {
+    param(
+        [object[]]$OverwriteActions,
+        [object[]]$CreateActions,
+        [object[]]$BinaryActions,
+        [object[]]$DeleteActions
+    )
+
+    $overwriteRows = @($OverwriteActions)
+    $createRows = @($CreateActions)
+    $binaryRows = @($BinaryActions)
+    $deleteRows = @($DeleteActions)
+    $total = $overwriteRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+
+    Write-Host ""
+    Write-Host "Local-wins confirmation required"
+    Write-Host "================================"
+    Write-Host "Push will publish $total path(s) so Studio matches LOCAL."
+    Write-Host "Local bytes replace remote bytes. This is not a content merge."
+    Write-Host ""
+
+    if ($overwriteRows.Count -gt 0) {
+        Write-Host "TEXT OVERWRITES ($($overwriteRows.Count)):"
+        foreach ($action in $overwriteRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    if ($createRows.Count -gt 0) {
+        Write-Host "TEXT CREATES ($($createRows.Count)):"
+        foreach ($action in $createRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    if ($binaryRows.Count -gt 0) {
+        Write-Host "BINARY CREATE OR REPLACE ($($binaryRows.Count)):"
+        foreach ($action in $binaryRows) {
+            Write-Host "  $([string]$action.Path) ($([string]$action.Mode))"
+        }
+        Write-Host ""
+    }
+
+    if ($deleteRows.Count -gt 0) {
+        Write-Host "REMOTE DELETES ($($deleteRows.Count)):"
+        foreach ($action in $deleteRows) {
+            Write-Host "  $([string]$action.Path)"
+        }
+        Write-Host ""
+    }
+
+    Write-Host "Each remote original is copied into .rundot-sync/backups before overwrite or delete."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "Publish $total path(s) with local-wins?"
+    }
+    catch {
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Read-RundotSyncPushDeleteConfirmation {
+    # A delete is not recoverable from Studio, so it gets its own deliberate
+    # confirmation even when overwrites were already confirmed. The user must
+    # type the whole word; anything else declines.
+    param(
+        [int]$DeleteCount,
+
+        [string[]]$Paths
+    )
+
+    Write-Host ""
+    Write-Host "Confirmation required"
+    Write-Host "====================="
+    Write-Host "Push will DELETE $DeleteCount remote file(s) from Studio:"
+    foreach ($path in @($Paths)) {
+        Write-Host "  $path"
+    }
+    Write-Host ""
+    Write-Host "Each one is copied into .rundot-sync/backups before it is removed."
+    Write-Host "Type 'yes' to continue. Anything else cancels the push."
+
+    $answer = $null
+    try {
+        $answer = Read-Host "DELETE $DeleteCount remote file(s)?"
+    }
+    catch {
+        # No console to prompt on. Fail closed.
+        return $false
+    }
+
+    return [string]::Equals(
+        ([string]$answer).Trim(),
+        'yes',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Invoke-SyncPushCommand {
     param(
         [string]$WorkspaceRoot,
         [string]$StudioProjectId,
         [bool]$Force,
+        [bool]$LocalWins,
         [string]$Origin,
         [string]$SyncAuthDir,
         [string]$SyncAuthPath,
@@ -607,18 +797,45 @@ function Invoke-SyncPushCommand {
         return (Read-RundotSyncPushConfirmation -OverwriteCount $OverwriteCount -Paths $Paths)
     }
 
+    # A delete gets its own confirmation so declining it changes nothing even
+    # when the overwrite half was accepted.
+    $ConfirmCreate = {
+        param($CreateCount, $Paths)
+        return (Read-RundotSyncPushCreateConfirmation -CreateCount $CreateCount -Paths $Paths)
+    }
+
+    $ConfirmDelete = {
+        param($DeleteCount, $Paths)
+        return (Read-RundotSyncPushDeleteConfirmation -DeleteCount $DeleteCount -Paths $Paths)
+    }
+
+    $ConfirmBinary = {
+        param($BinaryCount, $Paths)
+        return (Read-RundotSyncPushBinaryConfirmation -BinaryCount $BinaryCount -Paths $Paths)
+    }
+
+    $ConfirmLocalWins = {
+        param($OverwriteActions, $CreateActions, $BinaryActions, $DeleteActions)
+        return (Read-RundotSyncLocalWinsConfirmation `
+            -OverwriteActions $OverwriteActions `
+            -CreateActions $CreateActions `
+            -BinaryActions $BinaryActions `
+            -DeleteActions $DeleteActions)
+    }
+
     try {
         # 3. LOCAL tree, then a stable REMOTE snapshot for live verification.
         Write-Section "Push - LOCAL and REMOTE"
 
-        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+        $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
             -StudioOrigin $Origin `
             -ProjectId $StudioProjectId `
-            -Headers $Headers
+            -Headers $Headers `
+            -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
 
@@ -634,6 +851,11 @@ function Invoke-SyncPushCommand {
             -StudioOrigin $Origin `
             -Headers $Headers `
             -ConfirmOverwrite $ConfirmOverwrite `
+            -ConfirmCreate $ConfirmCreate `
+            -ConfirmBinary $ConfirmBinary `
+            -ConfirmDelete $ConfirmDelete `
+            -ConfirmLocalWins $ConfirmLocalWins `
+            -LocalWins:$LocalWins `
             -Force:$Force
 
         Write-Host ""
@@ -650,6 +872,10 @@ function Invoke-SyncPushCommand {
         Clear-SensitiveVariables
 
         if ($result.Cancelled) {
+            exit 1
+        }
+
+        if ($result.HadRefusals) {
             exit 1
         }
     }
@@ -798,6 +1024,10 @@ if ($Command -eq 'Init') {
         Stop-WithUsageError "-ConfirmPush applies to Push only."
     }
 
+    if ($LocalWins) {
+        Stop-WithUsageError "-LocalWins applies to Push only."
+    }
+
     $resolvedInitMode = Get-ResolvedInitMode `
         -RequestedInitMode $InitMode `
         -FromRemoteAlias ([bool]$FromRemote) `
@@ -847,6 +1077,7 @@ if ($Command -eq 'Push') {
         -WorkspaceRoot $LocalDir `
         -StudioProjectId $ProjectId `
         -Force ([bool]$ForcePush -or [bool]$ConfirmPush) `
+        -LocalWins ([bool]$LocalWins) `
         -Origin $StudioOrigin `
         -SyncAuthDir $AuthDir `
         -SyncAuthPath $AuthPath `
@@ -863,6 +1094,10 @@ if ($ForcePush) {
 
 if ($ConfirmPush) {
     Stop-WithUsageError "-ConfirmPush applies to Push only."
+}
+
+if ($LocalWins) {
+    Stop-WithUsageError "-LocalWins applies to Push only."
 }
 
 Invoke-SyncPlanCommand `

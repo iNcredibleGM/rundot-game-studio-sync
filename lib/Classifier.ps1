@@ -21,27 +21,23 @@ $script:SyncStatusConflict              = 'conflict'
 $script:SyncStatusIgnored               = 'ignored'
 $script:SyncStatusDeleteRemoteCandidate = 'deleteRemoteCandidate'
 $script:SyncStatusDeleteLocalCandidate  = 'deleteLocalCandidate'
+$script:SyncStatusUnverifiable          = 'unverifiable'
 
-# Binary uploads are displayed as UPLOAD but never marked applicable: the
-# upload flow cannot choose a project path and cannot replace a file. #15
-# verified this — the requested path is ignored (the file always lands at
-# /uploads/{basename}) and a repeated name creates a numeric-suffixed sibling
-# rather than replacing the existing file. So a binary upload cannot satisfy a
-# plan row whose path differs from what the server records.
-$script:SyncBinaryUploadReason = 'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.'
+# Binary uploads display as UPLOAD. Path, size, and publish policy live in
+# Plan.ps1 (docs/binary-place-protocol.md, #41).
 
-# The delete verb is now characterized (docs/delete-rename-protocol.md): it
+# The delete verb is characterized in docs/delete-rename-protocol.md: it
 # removes exactly the named path, a repeated delete returns 404 rather than an
 # error, and a stale write against a deleted path is refused rather than
 # resurrecting it. What it cannot do is refuse a stale delete: there is no
 # ETag, no version field, and If-Match is ignored, so nothing server-side can
-# reject a delete computed against content that has since changed. That is why
-# a delete candidate stays classification-only — the client would have to
-# re-verify on its own, immediately before the request, and this milestone
-# emits no remote mutation at all.
+# reject a delete computed against content that has since changed. The guard
+# therefore lives in the client, immediately before the request: a confirmed
+# Push re-reads the remote bytes, backs them up, and proves the path is absent
+# afterwards (docs/delete.md). Pull never deletes anything.
 $script:SyncDeletionCandidateReason = @(
-    'Deletion is classification-only in this milestone.',
-    'No local or remote file is deleted.',
+    'Pull never deletes anything, locally or remotely.',
+    'A deletion candidate is reported here and applied only by a confirmed Push.',
     'Studio cannot make a delete conditional: there is no ETag or version field and If-Match is ignored, so a stale delete cannot be refused server-side.'
 ) -join "`n"
 
@@ -261,7 +257,8 @@ function Test-SyncNoOpStatus {
         $script:SyncStatusUnchanged,
         $script:SyncStatusSynchronizedChange,
         $script:SyncStatusSynchronizedAddition,
-        $script:SyncStatusSettledAbsent
+        $script:SyncStatusSettledAbsent,
+        $script:SyncStatusUnverifiable
     ) -contains $Status
 }
 
@@ -281,6 +278,14 @@ function Get-SyncPathChangeStatus {
 
     if (Test-IgnoredSyncPath -CanonicalPath $Path) {
         return $script:SyncStatusIgnored
+    }
+
+    # An oversize REMOTE file is unverifiable (#57): its bytes cannot be read
+    # or hashed, so it can never be a clean match, a download, or a safe
+    # direction. This is checked before the three-way table because it holds
+    # whatever BASE and LOCAL say.
+    if (Test-SyncUnverifiableRemoteEntry -Remote $Remote) {
+        return $script:SyncStatusUnverifiable
     }
 
     $baseSha = Get-SyncEntrySha256 -Entry $Base
@@ -377,13 +382,18 @@ function Get-SyncPlanChange {
     $applicable = $false
 
     if (-not $ignored) {
-        $kindChange = Test-UnsupportedSyncKindChange -Base $Base -Local $Local -Remote $Remote
-        if ($kindChange) {
-            $status = $script:SyncStatusConflict
+        # An unverifiable path is settled before the kind-change check: the
+        # remote kind for such a path is a guess (binary), never observed, so
+        # it must not be turned into an unsupported kind-change conflict (#57).
+        if ($status -ne $script:SyncStatusUnverifiable) {
+            $kindChange = Test-UnsupportedSyncKindChange -Base $Base -Local $Local -Remote $Remote
+            if ($kindChange) {
+                $status = $script:SyncStatusConflict
+            }
         }
     }
 
-    if (Test-SyncNoOpStatus -Status $status) {
+    if ((Test-SyncNoOpStatus -Status $status) -and $status -ne $script:SyncStatusUnverifiable) {
         $disagreements = @(Get-SyncPlanMetadataDisagreements -Base $Base -Local $Local -Remote $Remote)
         if ($disagreements.Count -gt 0) {
             $warning = (
@@ -395,16 +405,13 @@ function Get-SyncPlanChange {
 
     switch ($status) {
         $script:SyncStatusUpload {
-            if ((Get-SyncEntryKind -Entry $Local) -eq 'binary') {
-                $applicable = $false
-                $reason = $script:SyncBinaryUploadReason
-            }
-            else {
-                $applicable = $true
-            }
+            $applicable = $true
         }
         $script:SyncStatusDownload {
             $applicable = $true
+        }
+        $script:SyncStatusUnverifiable {
+            $reason = Get-SyncUnverifiableRemoteReason -Size (Get-SyncEntrySizeValue -Entry $Remote)
         }
         $script:SyncStatusConflict {
             if ($kindChange) {
@@ -437,6 +444,60 @@ function Get-SyncPlanChange {
         LocalSha256  = Get-SyncEntrySha256 -Entry $Local
         RemoteSha256 = Get-SyncEntrySha256 -Entry $Remote
     }
+}
+
+function Get-SyncMapKeys {
+    # The keys of a file map, whichever shape it arrived in: a Hashtable from
+    # BASE or a PSCustomObject from a parsed manifest. Emitted as one array so
+    # an empty map still returns an empty array rather than $null.
+    param($Map)
+
+    if ($null -eq $Map) {
+        return ,([string[]]@())
+    }
+
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($key in $Map.Keys) {
+            [void]$keys.Add([string]$key)
+        }
+
+        return ,$keys.ToArray()
+    }
+
+    foreach ($property in $Map.PSObject.Properties) {
+        [void]$keys.Add([string]$property.Name)
+    }
+
+    return ,$keys.ToArray()
+}
+
+function Copy-SyncMapToHashtable {
+    # A fresh ordinal Hashtable copy of a file map, whichever shape it arrived
+    # in. Values are copied by reference; a caller that needs to replace an
+    # entry does so on the returned map. A missing map copies to an empty map.
+    param($Map)
+
+    $copy = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+
+    if ($null -eq $Map) {
+        return $copy
+    }
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($key in $Map.Keys) {
+            $copy[[string]$key] = $Map[$key]
+        }
+
+        return $copy
+    }
+
+    foreach ($property in $Map.PSObject.Properties) {
+        $copy[[string]$property.Name] = $property.Value
+    }
+
+    return $copy
 }
 
 function Get-SyncMapEntry {

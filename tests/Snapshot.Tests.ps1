@@ -4,6 +4,7 @@
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
@@ -951,3 +952,183 @@ finally {
         Remove-Item -LiteralPath $tornRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# --------------------------------------------------------------------------
+# Payload decode keeps byte[] for empty and single-byte content
+#
+# PowerShell unrolls a one-element array on return, so a zero-byte or one-byte
+# payload would otherwise arrive as $null or a bare Byte. Hashing that raises
+# "Multiple ambiguous overloads found for ComputeHash", which aborted a real
+# delete of a 0-byte remote file. The decoded value must always be a byte[].
+# --------------------------------------------------------------------------
+
+foreach ($payloadCase in @(
+    @{ Name = 'empty';   Content = '' },
+    @{ Name = 'oneByte'; Content = 'A' },
+    @{ Name = 'many';    Content = 'hello world' }
+)) {
+    $decoded = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+        encoding = 'utf8'
+        content  = $payloadCase.Content
+    })
+
+    Assert-True `
+        ($decoded -is [byte[]]) `
+        "a decoded $($payloadCase.Name) utf8 payload must stay a byte array"
+    Assert-Equal `
+        $payloadCase.Content.Length `
+        $decoded.Length `
+        "a decoded $($payloadCase.Name) payload must have the expected length"
+
+    # The real failure mode: hashing the decoded bytes must not be ambiguous.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($decoded)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    Assert-Equal 32 $hash.Length "a $($payloadCase.Name) payload must hash to 32 bytes"
+}
+
+$emptyDecoded = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+    encoding = 'utf8'
+    content  = ''
+})
+$emptySha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $emptyHash = $emptySha.ComputeHash($emptyDecoded)
+}
+finally {
+    $emptySha.Dispose()
+}
+Assert-Equal `
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' `
+    ([System.BitConverter]::ToString($emptyHash).Replace('-', '').ToLowerInvariant()) `
+    "empty remote content must hash to the empty-string SHA-256"
+
+$emptyBase64 = ConvertFrom-RemoteFileContent -Response ([pscustomobject]@{
+    encoding = 'base64'
+    content  = ''
+})
+Assert-True ($emptyBase64 -is [byte[]]) "a decoded empty base64 payload must stay a byte array"
+Assert-Equal 0 $emptyBase64.Length "a decoded empty base64 payload must be zero bytes"
+
+# --------------------------------------------------------------------------
+# -ShowProgress prints plain download lines and still returns the same map
+# --------------------------------------------------------------------------
+
+$progressRoot = Join-Path $env:TEMP ("rundot-snapshot-progress-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $progressRoot | Out-Null
+
+try {
+    $progressManifest = New-TestRemoteManifest -Files @(
+        $hiEntry,
+        (New-TestFileEntry @{
+            path     = 'public/logo.png'
+            type     = 'file'
+            size     = 1
+            encoding = 'base64'
+        })
+    )
+    Reset-FakeRemote `
+        -Lists @($progressManifest, $progressManifest) `
+        -Files @{
+            'src/a.ts'        = [pscustomobject]@{ encoding = 'utf8'; content = 'hi' }
+            'public/logo.png' = [pscustomobject]@{ encoding = 'base64'; content = 'QQ==' }
+        }
+
+    $script:SnapshotTestProgressLines = New-Object 'System.Collections.Generic.List[string]'
+    $previousWriter = $script:RundotSyncProgressWriter
+    $script:RundotSyncProgressWriter = {
+        param([string]$Text)
+        $script:SnapshotTestProgressLines.Add($Text)
+    }
+    try {
+        $progressSnapshot = Get-StableRemoteSnapshot `
+            -WorkspaceRoot $progressRoot `
+            -StudioOrigin 'https://example.test' `
+            -ProjectId 'proj-test-1' `
+            -Headers @{ Authorization = 'Bearer test-token'; Accept = '*/*' } `
+            -ShowProgress `
+            -ProgressActivity 'Downloading remote project'
+    }
+    finally {
+        $script:RundotSyncProgressWriter = $previousWriter
+    }
+
+    $progressLines = @($script:SnapshotTestProgressLines.ToArray())
+    Assert-True `
+        ($progressLines[0] -match 'Downloading 2 remote file') `
+        "a download run must start with a plain count line"
+    Assert-True `
+        (@($progressLines | Where-Object { $_ -match 'Downloading remote project: 1 of 2' }).Count -eq 1) `
+        "a download run must print a plain per-file line with the index"
+    Assert-True `
+        ($progressLines[$progressLines.Count - 1] -match 'Downloaded 2 remote file') `
+        "a download run must end with a plain summary line"
+    Assert-Equal 2 $progressSnapshot.Files.Count "progress must not change the captured file count"
+}
+finally {
+    if (Test-Path -LiteralPath $progressRoot) {
+        Remove-Item -LiteralPath $progressRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# --------------------------------------------------------------------------
+# A remote file over Studio's read limit is captured as unverifiable (#57)
+# --------------------------------------------------------------------------
+
+# GET /file returns 413 above the limit, so such a file's bytes can never be
+# read or hashed. That must not fail the whole project: the path is captured by
+# its list identity (path + size, no hash, no staged bytes) and the rest of the
+# snapshot proceeds. Nothing is ever hashed or compared for it, so it can never
+# be reported as a clean match.
+$oversizeRoot = Join-Path $env:TEMP ("rundot-snapshot-oversize-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $oversizeRoot | Out-Null
+try {
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeManifest = New-TestRemoteManifest -Files @(
+        (New-TestFileEntry @{
+            path     = 'src/a.ts'
+            type     = 'file'
+            size     = 2
+            encoding = 'utf8'
+        }),
+        (New-TestFileEntry @{
+            path     = 'public/huge.png'
+            type     = 'file'
+            size     = ($oversizeLimit + 1)
+            encoding = 'base64'
+            kind     = 'binary'
+        })
+    )
+    Reset-FakeRemote -Lists @($oversizeManifest) -Files @{
+        'src/a.ts' = $hiPayload
+    }
+
+    $oversizeSnapshot = Invoke-TestSnapshot -WorkspaceRoot $oversizeRoot
+
+    Assert-Equal 2 $oversizeSnapshot.Files.Count "an oversize remote file must not fail the snapshot"
+    Assert-Equal 1 $script:FileCallCount "the oversize path must never be read; only the readable file is downloaded"
+
+    $oversizeEntry = $oversizeSnapshot.Files['public/huge.png']
+    Assert-True ($null -ne $oversizeEntry) "the oversize path must still be captured"
+    Assert-True ([bool]$oversizeEntry.Unverifiable) "the oversize path must be marked unverifiable"
+    Assert-Equal ($oversizeLimit + 1) ([int64]$oversizeEntry.Size) "the unverifiable entry must carry the listed size"
+    Assert-True ([string]::IsNullOrEmpty([string]$oversizeEntry.Sha256)) "an unverifiable entry must carry no hash"
+    Assert-True ([string]::IsNullOrEmpty([string]$oversizeEntry.StagingPath)) "an unverifiable entry must have no staged bytes"
+
+    $readableEntry = $oversizeSnapshot.Files['src/a.ts']
+    Assert-True (-not [bool]$readableEntry.Unverifiable) "a readable file must not be marked unverifiable"
+    Assert-True (-not [string]::IsNullOrEmpty([string]$readableEntry.Sha256)) "a readable file must carry a hash"
+}
+finally {
+    if (Test-Path -LiteralPath $oversizeRoot) {
+        Remove-Item -LiteralPath $oversizeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+

@@ -27,6 +27,33 @@ leading `/`). Staging keys and on-disk relative paths use canonical `/`
 NFC identity from `ConvertTo-CanonicalSyncPath`. Default ignores do not
 apply: every listed file is downloaded.
 
+### Oversized remote files are captured as unverifiable
+
+`GET /file` refuses a payload over **2,000,000 bytes** with HTTP 413
+`file too large to view` ([protocol.md](protocol.md)). Such a path can never be
+read back, but it is still visible in the listing with its `size`. The snapshot
+does **not** fail the whole project for it (#57): the path is captured by its
+list identity and marked `Unverifiable = $true` — path, `size`, and
+`kind=binary`, with **no hash and no staged bytes**, and `GET /file` is never
+called for it. The rest of the snapshot proceeds.
+
+```text
+Sha256            : (none)
+Size              : 3120444
+LocalDetectedKind : binary
+RemoteKind        : binary
+StagingPath       : (none)
+Unverifiable      : True
+```
+
+`Plan` reports every such path under `UNVERIFIABLE` and never as `unchanged`, so
+the tool never claims "in sync" for bytes it cannot verify
+([classifier.md](classifier.md)). `Pull` never downloads one and `Push` never
+rewrites one ([pull.md](pull.md), [push.md](push.md)). An oversize binary
+**create** (remote path absent) is unaffected and still publishes through the
+ETag route; an oversize **replace** stays refused
+([binary-place.md](binary-place.md)).
+
 Decoded bytes are written, then hashed with `Get-LocalFileIdentity`.
 Identity is SHA-256 of those exact bytes, not of the JSON string. API
 `encoding` `utf8` maps to `remoteKind` `utf8`; `base64` maps to
@@ -95,6 +122,7 @@ Returned file entries are hashes and diagnostics only (`Sha256`, `Size`,
 | HTTP 401 / 403 | Abort immediately |
 | ManifestBefore fingerprint ≠ ManifestAfter | Discard, retry; after 3: idle message |
 | Listed path, `GET /file` returns 404 | Discard, retry; after 3: idle message. Not a remote deletion |
+| Listed path over Studio's 2,000,000-byte read limit | Capture as `Unverifiable = $true` (path + size, no hash); never call `GET /file` for it; continue |
 | Malformed base64 | Discard, retry; after 3: idle message |
 
 A 404 while capturing a path that ManifestBefore listed means the project

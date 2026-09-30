@@ -58,6 +58,14 @@
 #   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-delete-rename-all `
 #       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
 #
+#   # The #37 text-file create investigation:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-text-create-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
+#   # The #38 place-a-binary-at-a-project-path investigation:
+#   .\tools\StudioProbe.ps1 -ProjectId <id> -Scenario run-binary-place-all `
+#       -AccessTokenPath "$env:TEMP\rundot-token.txt" -ConfirmRemoteWrite
+#
 #   # The rename route has no documented shape, so the guessed candidates are
 #   # backed by a human capture. Prepare a target, rename it by hand in Studio
 #   # with DevTools open, save the request, then record it:
@@ -122,7 +130,28 @@ param(
         # command per issue instead of seven.
         'run-text-all',
         'run-binary-all',
-        'run-delete-rename-all'
+        'run-delete-rename-all',
+        # New in the #37 text-file create investigation.
+        'text-create-discover',
+        'text-create-compose',
+        'text-create-idempotency',
+        'text-create-bytes',
+        'text-create-race',
+        'text-create-conditional',
+        'text-create-reserved',
+        'text-create-route-survey',
+        'text-create-devtools-prepare',
+        'text-create-devtools-apply',
+        'text-place-exact',
+        'run-text-create-all',
+        # New in the #38 place-a-binary-at-a-project-path investigation.
+        'binary-place-sequence',
+        'binary-place-collision-cleanup',
+        'binary-place-replace',
+        'binary-place-failure',
+        'binary-place-edge-names',
+        'binary-place-survey',
+        'run-binary-place-all'
     )]
     [string]$Scenario,
 
@@ -200,6 +229,8 @@ $script:Token = $null
 $script:Headers = $null
 $script:WriteEnabled = $false
 $script:ProbeAllowAllRuns = $false
+# Set by text-create-discover when a guessed route returns 2xx and lists the path.
+$script:TextCreateRouteFound = $null
 
 . (Join-Path $RepoRoot 'lib\Paths.ps1')
 . (Join-Path $RepoRoot 'lib\Hashing.ps1')
@@ -326,13 +357,18 @@ function Save-ProbeEvidence {
 # ---------------------------------------------------------------------------
 
 function Get-Sha256Hex {
-    param([byte[]]$Bytes)
+    param($Bytes)
 
-    if ($null -eq $Bytes) { return $null }
+    # An empty [byte[]] binds as $null on a typed parameter, so this stays
+    # untyped and hashes a zero-length buffer as the empty-file digest.
+    $buffer = New-Object byte[] 0
+    if ($null -ne $Bytes) {
+        $buffer = [byte[]]$Bytes
+    }
 
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return [System.BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant()
+        return [System.BitConverter]::ToString($sha.ComputeHash($buffer)).Replace('-', '').ToLowerInvariant()
     }
     finally { $sha.Dispose() }
 }
@@ -1429,6 +1465,24 @@ function Get-ProbeScenarioPlan {
         'run-text-all'             = @('The full #14 text investigation: create, overwrite, version, conditional, idempotency, failure, survey')
         'run-binary-all'           = @('The full #15 binary investigation: discover, create, collision, overwrite, idempotency, failure, survey')
         'run-delete-rename-all'    = @('The full #16 investigation: delete semantics, rename discovery, concurrency, revision identity, ETag, conditional delete, survey')
+        'text-create-discover'     = @('POST/PUT candidate create routes against absent /sync-probe paths')
+        'text-create-compose'      = @('POST /upload-url + PUT + adopt, then POST /move to a chosen /sync-probe path')
+        'text-create-idempotency'  = @('repeat upload + move onto an occupied destination')
+        'text-create-bytes'        = @('compose with CRLF, BOM, and empty bytes')
+        'text-create-race'         = @('occupy a destination, then move onto it while occupied')
+        'text-create-conditional'  = @('POST /move with If-Match / If-None-Match')
+        'text-create-reserved'     = @('POST /move onto reserved-shaped and traversal spellings')
+        'text-create-route-survey' = @()
+        'text-create-devtools-prepare' = @('create a probe-owned target and print UI capture instructions')
+        'text-create-devtools-apply'   = @('record the UI capture route shape without replaying it')
+        'text-place-exact'         = @('upload a unique name, POST /move to a source path, then PUT /file the exact text')
+        'run-text-create-all'      = @('The full #37 text create investigation: discover, compose, idempotency, bytes, race, conditional, reserved, survey')
+        'binary-place-sequence'    = @('POST /upload-url + PUT + adopt, then POST /move to a chosen path; read back and hash')
+        'binary-place-collision-cleanup' = @('upload the same basename twice (collision), DELETE the sibling, POST /move the original to the chosen path')
+        'binary-place-replace'     = @('place bytes, move onto the occupied path (expect 409), DELETE, then place new bytes at the same path')
+        'binary-place-failure'     = @('move from an absent source, move onto an occupied path, adopt a fabricated id, PUT a malformed URL; then clean up what is left')
+        'binary-place-edge-names'  = @('leading-dot destination, nested destination outside /uploads, reserved-shaped destinations, and a traversal spelling')
+        'run-binary-place-all'     = @('The full #38 place-a-binary-at-a-path investigation: sequence, collision cleanup, replace, failure, edge names, survey')
     }
 
     if ($plans.ContainsKey($Name)) { return @($plans[$Name]) }
@@ -2621,7 +2675,11 @@ function Assert-ProbeDeleteTarget {
     }
 
     $inUploads = $Path -like "$($script:ProbeUploadDir)/*"
-    $reservedShaped = ($Path -like '/.git/*' -or $Path -like '/.rundot/*')
+    $reservedShaped = (
+        $Path -like '/.git/*' -or
+        $Path -like '/.rundot/*' -or
+        $Path -like '/.rundot-sync/*'
+    )
 
     if ($stamped -and ($inUploads -or $reservedShaped)) { return }
 
@@ -2725,6 +2783,21 @@ function Get-ProbeListFingerprint {
     }
 }
 
+function Test-ProbeCleanupScope {
+    # Which listed paths a cleanup may even consider. Binary uploads land in
+    # /uploads and text/rename work lands in /sync-probe, but a /move can also
+    # place a file at a reserved-shaped path: #38 showed both /.rundot-sync/ and
+    # /.rundot/ accept a move with 200. Those are only ever probe files when the
+    # leaf carries a probe stamp, so the stamp check in the caller still applies
+    # and Assert-ProbeDeleteTarget independently refuses an unstamped one.
+    param([string]$Path)
+
+    if ($Path -like "$($script:ProbeUploadDir)/*") { return $true }
+    if ($Path -like "$($script:ProbeDir)/*") { return $true }
+    if ($Path -like '/.git/*' -or $Path -like '/.rundot/*' -or $Path -like '/.rundot-sync/*') { return $true }
+    return $false
+}
+
 function Invoke-ScenarioBinaryCleanup {
     # Delete everything this run created, so the project is left as found and
     # the next run starts from a known state. Only paths carrying this run's
@@ -2736,7 +2809,7 @@ function Invoke-ScenarioBinaryCleanup {
     # regardless of the requested path. The stamp narrows to this run by
     # default; -AllRuns widens to every probe file.
     $candidates = @(Get-ProbeListedPaths | Where-Object {
-        $inScope = ($_ -like "$($script:ProbeUploadDir)/*" -or $_ -like "$($script:ProbeDir)/*")
+        $inScope = Test-ProbeCleanupScope -Path $_
         if (-not $inScope) { return $false }
         if ($AllRuns) { return $true }
         return ($_ -like "*$($script:ProbeRunStamp)*")
@@ -2807,7 +2880,7 @@ function Invoke-ScenarioBinaryCleanup {
     }
 
     $remaining = @(Get-ProbeListedPaths | Where-Object {
-        $inScope = ($_ -like "$($script:ProbeUploadDir)/*" -or $_ -like "$($script:ProbeDir)/*")
+        $inScope = Test-ProbeCleanupScope -Path $_
         if (-not $inScope) { return $false }
         if ($AllRuns) { return $true }
         return ($_ -like "*$($script:ProbeRunStamp)*")
@@ -3596,17 +3669,25 @@ function Invoke-ProbeMoveRequest {
         [string]$Case,
         [string]$From,
         [string]$To,
-        [string]$Note = ''
+        [string]$Note = '',
+        [hashtable]$ExtraHeaders
     )
 
     $uri = New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/move"
     Assert-ProbeWriteAllowed -Case $Case -Method 'POST' -Uri $uri
 
     $body = @{ from = $From; to = $To } | ConvertTo-Json -Compress
+
+    $requestHeaders = @{}
+    foreach ($key in $script:Headers.Keys) { $requestHeaders[$key] = $script:Headers[$key] }
+    if ($null -ne $ExtraHeaders) {
+        foreach ($key in $ExtraHeaders.Keys) { $requestHeaders[$key] = $ExtraHeaders[$key] }
+    }
+
     $response = Invoke-ProbeHttp `
         -Method 'POST' `
         -Uri $uri `
-        -Headers $script:Headers `
+        -Headers $requestHeaders `
         -BodyBytes (Get-Utf8NoBomBytes -Text $body) `
         -ContentType 'application/json'
 
@@ -4061,6 +4142,848 @@ function Invoke-ScenarioRenameDevToolsApply {
 
 
 # ---------------------------------------------------------------------------
+# Text-file create investigation (#37)
+#
+# #14 proved PUT /file cannot create. #15 and #16 can compose upload + move.
+# This block guesses single-request creates, characterizes composition, and
+# records a DevTools capture of what the Studio UI actually sends.
+# ---------------------------------------------------------------------------
+
+function Remove-ProbeListedPathIfOwned {
+    param(
+        [string]$Path,
+        [string]$Case
+    )
+
+    if ($null -eq (Get-ProbeRowOrNull -Path $Path)) { return $false }
+
+    try {
+        $result = Invoke-ProbeDeleteFile -Path $Path -Case $Case
+        if ($result.Deleted) {
+            while ($script:CreatedPaths.Contains($Path)) {
+                [void]$script:CreatedPaths.Remove($Path)
+            }
+        }
+        return $result.Deleted
+    }
+    catch {
+        Write-ProbeLog ("[CLEANUP] {0}: could not delete {1}: {2}" -f $Case, $Path, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-ProbeJsonBodyKeys {
+    param([hashtable]$Body)
+
+    if ($null -eq $Body) { return @() }
+    return @($Body.Keys | Sort-Object)
+}
+
+function Invoke-ProbeTextCreateDiscoverAttempt {
+    param(
+        [string]$Case,
+        [string]$Method,
+        [string]$Uri,
+        [hashtable]$BodyObj,
+        [string]$TargetPath,
+        [string]$Note
+    )
+
+    $bodyJson = $null
+    $bodyBytes = $null
+    if ($null -ne $BodyObj) {
+        $bodyJson = ($BodyObj | ConvertTo-Json -Compress)
+        $bodyBytes = Get-Utf8NoBomBytes -Text $bodyJson
+    }
+
+    Assert-ProbeWriteAllowed -Case $Case -Method $Method -Uri $Uri
+    $response = Invoke-ProbeHttp `
+        -Method $Method `
+        -Uri $Uri `
+        -Headers $script:Headers `
+        -BodyBytes $bodyBytes `
+        -ContentType 'application/json'
+
+    Start-Sleep -Milliseconds 350
+    $rowAfter = Get-ProbeRowOrNull -Path $TargetPath
+    $listedAfter = ($null -ne $rowAfter)
+    $sizeAfter = if ($null -ne $rowAfter) { $rowAfter.size } else { $null }
+
+    $bodyKeys = Get-ProbeJsonBodyKeys -Body $BodyObj
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note        = $Note
+        method      = $Method
+        uri         = $Uri
+        bodyKeys    = $bodyKeys
+        targetPath  = $TargetPath
+        http        = @{ status = $response.Status; body = $response.BodyText }
+        listedAfter = $listedAfter
+        size        = $sizeAfter
+    }
+    Write-ProbeLog ("[PROBED] {0} status={1} listedAfter={2}" -f $Case, $response.Status, $listedAfter)
+
+    if ($listedAfter -and $response.Status -ge 200 -and $response.Status -lt 300) {
+        if ($null -eq $script:TextCreateRouteFound) {
+            $relative = $Uri
+            if ($relative -match '/api/projects/[^/]+(.+)$') {
+                $relative = $Matches[1]
+            }
+            $script:TextCreateRouteFound = @{
+                method   = $Method
+                uri      = $Uri
+                bodyKeys = $bodyKeys
+            }
+        }
+        Remove-ProbeListedPathIfOwned -Path $TargetPath -Case "$Case-cleanup" | Out-Null
+    }
+
+    return [pscustomobject]@{
+        Status      = $response.Status
+        ListedAfter = $listedAfter
+    }
+}
+
+function Invoke-ProbeComposeTextAtPath {
+    param(
+        [string]$CasePrefix,
+        [string]$DestPath,
+        [byte[]]$Bytes,
+        [string]$FileNameSuffix,
+        [string]$ContentType = 'text/plain'
+    )
+
+    $fileName = Get-BinaryProbeName -Suffix $FileNameSuffix -Extension '.txt'
+    $upload = Invoke-ProbeBinaryUpload `
+        -Case "$CasePrefix-upload" `
+        -FileName $fileName `
+        -Bytes $Bytes `
+        -ContentType $ContentType `
+        -Note 'upload step for compose-at-path'
+
+    if ([string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        return $null
+    }
+
+    $move = Invoke-ProbeMoveRequest `
+        -Case "$CasePrefix-move" `
+        -From $upload.recordedPath `
+        -To $DestPath `
+        -Note 'move step for compose-at-path'
+
+    Start-Sleep -Milliseconds 350
+    $read = Get-ProbeReadOrNull -Path $DestPath
+    $fromStill = $null -ne (Get-ProbeRowOrNull -Path $upload.recordedPath)
+    $toListed = $null -ne (Get-ProbeRowOrNull -Path $DestPath)
+
+    if ($toListed) { $script:CreatedPaths.Add($DestPath) }
+    if ($fromStill) { $script:CreatedPaths.Add($upload.recordedPath) }
+
+    $adoptStatus = $null
+    if ($null -ne $upload.adopt) { $adoptStatus = $upload.adopt['status'] }
+
+    return [pscustomobject]@{
+        UploadPath     = $upload.recordedPath
+        UploadStatus   = $adoptStatus
+        MoveStatus     = $move.Status
+        MoveBody       = $move.BodyText
+        FromStillListed = $fromStill
+        ToListed       = $toListed
+        Moved          = $move.Moved
+        SentSize       = $Bytes.Length
+        SentSha256     = Get-Sha256Hex -Bytes $Bytes
+        ReadSize       = if ($null -ne $read) { $read.Bytes.Length } else { $null }
+        ReadSha256     = if ($null -ne $read) { $read.Sha256 } else { $null }
+        BytesPreserved = (
+            $null -ne $read -and
+            [string]::Equals((Get-Sha256Hex -Bytes $Bytes), $read.Sha256, [System.StringComparison]::OrdinalIgnoreCase)
+        )
+    }
+}
+
+function Invoke-ScenarioTextCreateDiscover {
+    $script:TextCreateRouteFound = $null
+    $content = 'discover probe content'
+    $bodyText = New-JsonContentBody -Text $content
+    $contentLen = $bodyText.Length
+
+    $targets = @(
+        @{
+            Case   = 'text-create-discover-post-files'
+            Method = 'POST'
+            Uri    = (New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/files")
+            Body   = @{ path = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-post-files.txt"; content = $content }
+            Path   = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-post-files.txt"
+            Note   = 'POST /files with path and content'
+        },
+        @{
+            Case   = 'text-create-discover-post-file-create'
+            Method = 'POST'
+            Uri    = (New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/file/create")
+            Body   = @{ path = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-file-create.txt"; content = $content }
+            Path   = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-file-create.txt"
+            Note   = 'POST /file/create with path and content'
+        },
+        @{
+            Case   = 'text-create-discover-put-files'
+            Method = 'PUT'
+            Uri    = (New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/files")
+            Body   = @{ path = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-put-files.txt"; content = $content }
+            Path   = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-put-files.txt"
+            Note   = 'PUT /files with path and content'
+        },
+        @{
+            Case   = 'text-create-discover-post-create'
+            Method = 'POST'
+            Uri    = (New-ProbeApiUrl -RelativePath "/api/projects/$ProjectId/create")
+            Body   = @{ path = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-create.txt"; content = $content; type = 'file' }
+            Path   = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-create.txt"
+            Note   = 'POST /create with path, content, and type file'
+        }
+    )
+
+    foreach ($shape in $targets) {
+        if ($null -ne (Get-ProbeRowOrNull -Path $shape.Path)) {
+            Remove-ProbeListedPathIfOwned -Path $shape.Path -Case "$($shape.Case)-preclean" | Out-Null
+        }
+        Invoke-ProbeTextCreateDiscoverAttempt `
+            -Case $shape.Case `
+            -Method $shape.Method `
+            -Uri $shape.Uri `
+            -BodyObj $shape.Body `
+            -TargetPath $shape.Path `
+            -Note $shape.Note | Out-Null
+    }
+
+    $postPath = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-discover-post-file.txt"
+    $postUri = New-ProbeFileUrl -Path $postPath
+    Assert-ProbeWriteAllowed -Case 'text-create-discover-post-file-route' -Method 'POST' -Uri $postUri
+    $postResponse = Invoke-ProbeHttp `
+        -Method 'POST' `
+        -Uri $postUri `
+        -Headers $script:Headers `
+        -BodyBytes (New-JsonContentBody -Text $content) `
+        -ContentType 'application/json'
+    Start-Sleep -Milliseconds 350
+    $postListed = $null -ne (Get-ProbeRowOrNull -Path $postPath)
+    Add-ProbeEvidence -Case 'text-create-discover-post-file-route' -Status 'PROBED' -Data @{
+        note        = 'POST on the file route; 405 means PUT-only (#14)'
+        method      = 'POST'
+        uri         = $postUri
+        bodyKeys    = @('content')
+        targetPath  = $postPath
+        http        = @{ status = $postResponse.Status; body = $postResponse.BodyText }
+        listedAfter = $postListed
+    }
+    Write-ProbeLog ("[PROBED] text-create-discover-post-file-route status={0}" -f $postResponse.Status)
+    if ($postListed) {
+        Remove-ProbeListedPathIfOwned -Path $postPath -Case 'text-create-discover-post-file-route-cleanup' | Out-Null
+    }
+
+    Add-ProbeEvidence -Case 'text-create-discover-summary' -Status 'OBSERVED' -Data @{
+        note              = 'guessed single-request create routes; UI capture is authoritative if all fail'
+        createRouteFound  = ($null -ne $script:TextCreateRouteFound)
+        createRoute       = $script:TextCreateRouteFound
+        contentLengthSent = $contentLen
+    }
+}
+
+function Invoke-ScenarioTextCreateCompose {
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-compose.txt"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'text-create-compose-preclean' | Out-Null
+    }
+
+    $bytes = Get-Utf8NoBomBytes -Text "compose target $([Guid]::NewGuid().ToString('N'))"
+    $result = Invoke-ProbeComposeTextAtPath `
+        -CasePrefix 'text-create-compose' `
+        -DestPath $dest `
+        -Bytes $bytes `
+        -FileNameSuffix 'compose'
+
+    if ($null -eq $result) {
+        Add-ProbeEvidence -Case 'text-create-compose' -Status 'STOPPED' -Data @{
+            note = 'upload step did not record a path'
+        }
+        Write-ProbeLog '[STOPPED] text-create-compose: upload did not succeed'
+        return
+    }
+
+    Add-ProbeEvidence -Case 'text-create-compose' -Status 'PROBED' -Data @{
+        note             = 'upload then POST /move; composition of #15 and #16, not a single create route'
+        destPath         = $dest
+        uploadPath       = $result.UploadPath
+        uploadAdoptStatus = $result.UploadStatus
+        moveStatus       = $result.MoveStatus
+        moveBody         = $result.MoveBody
+        fromStillListed  = $result.FromStillListed
+        toListed         = $result.ToListed
+        moved            = $result.Moved
+        sentSize         = $result.SentSize
+        sentSha256       = $result.SentSha256
+        readSize         = $result.ReadSize
+        readSha256       = $result.ReadSha256
+        bytesPreserved   = $result.BytesPreserved
+    }
+    Write-ProbeLog ("[PROBED] text-create-compose moveStatus={0} bytesPreserved={1}" -f $result.MoveStatus, $result.BytesPreserved)
+}
+
+function Invoke-ScenarioTextCreateIdempotency {
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-idempotent.txt"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'text-create-idempotency-preclean' | Out-Null
+    }
+
+    $bytes = Get-Utf8NoBomBytes -Text "idempotent compose $([Guid]::NewGuid().ToString('N'))"
+    $first = Invoke-ProbeComposeTextAtPath `
+        -CasePrefix 'text-create-idempotency-first' `
+        -DestPath $dest `
+        -Bytes $bytes `
+        -FileNameSuffix 'idempotent'
+
+    if ($null -eq $first -or -not $first.ToListed) {
+        Add-ProbeEvidence -Case 'text-create-idempotency' -Status 'STOPPED' -Data @{ note = 'first compose did not land at the destination' }
+        return
+    }
+
+    $shaBefore = $first.ReadSha256
+    $secondUpload = Invoke-ProbeBinaryUpload `
+        -Case 'text-create-idempotency-second-upload' `
+        -FileName (Get-BinaryProbeName -Suffix 'idempotent' -Extension '.txt') `
+        -Bytes $bytes `
+        -ContentType 'text/plain'
+
+    $secondMoveStatus = $null
+    $secondMoveBody = $null
+    $destShaAfter = $shaBefore
+    if (-not [string]::IsNullOrWhiteSpace($secondUpload.recordedPath)) {
+        $secondMove = Invoke-ProbeMoveRequest `
+            -Case 'text-create-idempotency-second-move' `
+            -From $secondUpload.recordedPath `
+            -To $dest
+        $secondMoveStatus = $secondMove.Status
+        $secondMoveBody = $secondMove.BodyText
+        Start-Sleep -Milliseconds 350
+        $readAfter = Get-ProbeReadOrNull -Path $dest
+        if ($null -ne $readAfter) { $destShaAfter = $readAfter.Sha256 }
+    }
+
+    $paths = Get-ProbeListedPaths
+    $suffixStem = "$($script:ProbeNamePrefix)-idempotent"
+    $related = @($paths | Where-Object { $_ -like "*$suffixStem*" })
+
+    Add-ProbeEvidence -Case 'text-create-idempotency' -Status 'OBSERVED' -Data @{
+        note               = 'second upload+move onto an occupied destination'
+        destPath           = $dest
+        firstMoveStatus    = $first.MoveStatus
+        secondUploadPath   = $secondUpload.recordedPath
+        secondMoveStatus   = $secondMoveStatus
+        secondMoveBody     = $secondMoveBody
+        shaBefore          = $shaBefore
+        shaAfter           = $destShaAfter
+        destinationUnchanged = (
+            -not [string]::IsNullOrWhiteSpace($shaBefore) -and
+            -not [string]::IsNullOrWhiteSpace($destShaAfter) -and
+            [string]::Equals($shaBefore, $destShaAfter, [System.StringComparison]::OrdinalIgnoreCase)
+        )
+        relatedListedPaths = $related
+        relatedCount       = $related.Count
+    }
+    Write-ProbeLog ("[OBSERVED] text-create-idempotency secondMoveStatus={0} relatedCount={1}" -f $secondMoveStatus, $related.Count)
+}
+
+function Invoke-ScenarioTextCreateBytes {
+    $cases = @(
+        @{
+            Case    = 'text-create-bytes-crlf'
+            Suffix  = 'bytes-crlf'
+            Text    = "a`r`nb`r`n"
+        },
+        @{
+            Case    = 'text-create-bytes-bom'
+            Suffix  = 'bytes-bom'
+            Text    = "$([char]0xFEFF)bom"
+        },
+        @{
+            Case    = 'text-create-bytes-empty'
+            Suffix  = 'bytes-empty'
+            Text    = $null
+            Empty   = $true
+        }
+    )
+
+    foreach ($item in $cases) {
+        $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-$($item.Suffix).txt"
+        if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+            Remove-ProbeListedPathIfOwned -Path $dest -Case "$($item.Case)-preclean" | Out-Null
+        }
+
+        if ($item.Empty) {
+            $bytes = @()
+            $fileName = Get-BinaryProbeName -Suffix $item.Suffix -Extension '.txt'
+            $upload = Invoke-ProbeBinaryUpload `
+                -Case "$($item.Case)-upload" `
+                -FileName $fileName `
+                -Bytes $bytes `
+                -ContentType 'text/plain'
+            Add-ProbeEvidence -Case "$($item.Case)-upload" -Status 'PROBED' -Data @{
+                note         = 'empty payload through upload-url'
+                uploadStatus = $upload.uploadUrl.status
+                adoptStatus  = if ($null -ne $upload.adopt) { $upload.adopt['status'] } else { $null }
+                recordedPath = $upload.recordedPath
+                sentSize     = 0
+            }
+            if ([string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+                Write-ProbeLog ("[STOPPED] {0}: empty upload did not record a path" -f $item.Case)
+                continue
+            }
+            $move = Invoke-ProbeMoveRequest -Case "$($item.Case)-move" -From $upload.recordedPath -To $dest
+            $read = Get-ProbeReadOrNull -Path $dest
+            Add-ProbeEvidence -Case $item.Case -Status 'PROBED' -Data @{
+                note           = 'empty file via compose'
+                moveStatus     = $move.Status
+                sentSize       = 0
+                readSize       = if ($null -ne $read) { $read.Bytes.Length } else { $null }
+                sentSha256     = (Get-Sha256Hex -Bytes $bytes)
+                readSha256     = if ($null -ne $read) { $read.Sha256 } else { $null }
+                bytesPreserved = ($null -ne $read -and $read.Bytes.Length -eq 0)
+            }
+            if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+                Remove-ProbeListedPathIfOwned -Path $dest -Case "$($item.Case)-cleanup" | Out-Null
+            }
+            continue
+        }
+
+        $bytes = Get-Utf8NoBomBytes -Text $item.Text
+        $result = Invoke-ProbeComposeTextAtPath `
+            -CasePrefix $item.Case `
+            -DestPath $dest `
+            -Bytes $bytes `
+            -FileNameSuffix $item.Suffix
+
+        Add-ProbeEvidence -Case $item.Case -Status 'PROBED' -Data @{
+            note           = 'byte preservation through compose'
+            destPath       = $dest
+            moveStatus     = if ($null -ne $result) { $result.MoveStatus } else { $null }
+            sentSize       = if ($null -ne $result) { $result.SentSize } else { $bytes.Length }
+            readSize       = if ($null -ne $result) { $result.ReadSize } else { $null }
+            sentSha256     = if ($null -ne $result) { $result.SentSha256 } else { (Get-Sha256Hex -Bytes $bytes) }
+            readSha256     = if ($null -ne $result) { $result.ReadSha256 } else { $null }
+            bytesPreserved = if ($null -ne $result) { $result.BytesPreserved } else { $false }
+        }
+
+        if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+            Remove-ProbeListedPathIfOwned -Path $dest -Case "$($item.Case)-cleanup" | Out-Null
+        }
+    }
+}
+
+function Invoke-ScenarioTextCreateRace {
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-race.txt"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'text-create-race-preclean' | Out-Null
+    }
+
+    $plannedFingerprint = Get-ProbeListFingerprint
+    $occupyBytes = Get-Utf8NoBomBytes -Text 'occupied'
+    $occupy = Invoke-ProbeComposeTextAtPath `
+        -CasePrefix 'text-create-race-occupy' `
+        -DestPath $dest `
+        -Bytes $occupyBytes `
+        -FileNameSuffix 'race-occupy'
+
+    $occupyRead = Get-ProbeReadOrNull -Path $dest
+    $shaOccupied = if ($null -ne $occupyRead) { $occupyRead.Sha256 } else { $null }
+
+    $createBytes = Get-Utf8NoBomBytes -Text 'planned create while absent'
+    $create = Invoke-ProbeComposeTextAtPath `
+        -CasePrefix 'text-create-race-create' `
+        -DestPath $dest `
+        -Bytes $createBytes `
+        -FileNameSuffix 'race-create'
+
+    $afterRead = Get-ProbeReadOrNull -Path $dest
+    $shaAfter = if ($null -ne $afterRead) { $afterRead.Sha256 } else { $null }
+
+    $paths = Get-ProbeListedPaths
+    $siblings = @($paths | Where-Object {
+        $_ -like "$($script:ProbeDir)/$($script:ProbeNamePrefix)-race*" -and
+        -not [string]::Equals($_, $dest, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+
+    Add-ProbeEvidence -Case 'text-create-race' -Status 'OBSERVED' -Data @{
+        note                 = 'destination occupied between plan and compose create'
+        destPath             = $dest
+        plannedFingerprint   = $plannedFingerprint
+        occupyMoveStatus     = if ($null -ne $occupy) { $occupy.MoveStatus } else { $null }
+        createMoveStatus     = if ($null -ne $create) { $create.MoveStatus } else { $null }
+        shaOccupied          = $shaOccupied
+        shaAfter             = $shaAfter
+        occupiedBytesSurvived = (
+            -not [string]::IsNullOrWhiteSpace($shaOccupied) -and
+            -not [string]::IsNullOrWhiteSpace($shaAfter) -and
+            [string]::Equals($shaOccupied, $shaAfter, [System.StringComparison]::OrdinalIgnoreCase)
+        )
+        siblingPaths         = $siblings
+    }
+    $createMoveStatus = $null
+    if ($null -ne $create) { $createMoveStatus = $create.MoveStatus }
+    $occupiedSurvived = (
+        -not [string]::IsNullOrWhiteSpace($shaOccupied) -and
+        -not [string]::IsNullOrWhiteSpace($shaAfter) -and
+        [string]::Equals($shaOccupied, $shaAfter, [System.StringComparison]::OrdinalIgnoreCase)
+    )
+    Write-ProbeLog ("[OBSERVED] text-create-race createMoveStatus={0} occupiedSurvived={1}" -f $createMoveStatus, $occupiedSurvived)
+
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'text-create-race-cleanup' | Out-Null
+    }
+}
+
+function Invoke-ProbeTextCreateConditionalMove {
+    param(
+        [string]$Case,
+        [hashtable]$ExtraHeaders,
+        [string]$Note
+    )
+
+    $source = New-ProbeOwnedTextFile -Suffix "cond-$Case" -Content "conditional move $Case"
+    if ($null -eq $source.Path) {
+        Add-ProbeEvidence -Case $Case -Status 'STOPPED' -Data @{ note = 'could not create a move source' }
+        return
+    }
+
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-cond-$Case.txt"
+    $move = Invoke-ProbeMoveRequest `
+        -Case $Case `
+        -From $source.Path `
+        -To $dest `
+        -Note $Note `
+        -ExtraHeaders $ExtraHeaders
+
+    $preconditionEnforced = ($move.Status -eq 412)
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note                  = $Note
+        http                  = @{ status = $move.Status; body = $move.BodyText }
+        destinationListed     = $move.ToListed
+        moved                 = $move.Moved
+        preconditionEnforced  = $preconditionEnforced
+    }
+    Write-ProbeLog ("[PROBED] {0} status={1} enforced={2}" -f $Case, $move.Status, $preconditionEnforced)
+
+    if ($move.ToListed) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case "$Case-cleanup-dest" | Out-Null
+    }
+    if ($null -ne (Get-ProbeRowOrNull -Path $source.Path)) {
+        Remove-ProbeListedPathIfOwned -Path $source.Path -Case "$Case-cleanup-src" | Out-Null
+    }
+}
+
+function Invoke-ScenarioTextCreateConditional {
+    Invoke-ProbeTextCreateConditionalMove `
+        -Case 'text-create-conditional-if-match-wrong' `
+        -ExtraHeaders @{ 'If-Match' = '"definitely-not-the-current-etag"' } `
+        -Note 'If-Match with a value that cannot match on POST /move'
+
+    Invoke-ProbeTextCreateConditionalMove `
+        -Case 'text-create-conditional-if-match-garbage' `
+        -ExtraHeaders @{ 'If-Match' = 'not-an-etag' } `
+        -Note 'malformed If-Match on POST /move'
+
+    Invoke-ProbeTextCreateConditionalMove `
+        -Case 'text-create-conditional-if-none-match-star' `
+        -ExtraHeaders @{ 'If-None-Match' = '*' } `
+        -Note 'If-None-Match: * on POST /move'
+
+    $anyDiscoverNonTerminal = $false
+    if ($null -ne $script:TextCreateRouteFound) {
+        $anyDiscoverNonTerminal = $true
+    }
+
+    Add-ProbeEvidence -Case 'text-create-conditional-summary' -Status 'OBSERVED' -Data @{
+        note                         = 'preconditions on POST /move; discover routes were 404/405 unless createRouteFound'
+        testedDiscoverConditional    = $anyDiscoverNonTerminal
+        createRouteFound             = ($null -ne $script:TextCreateRouteFound)
+    }
+}
+
+function Invoke-ScenarioTextCreateReserved {
+    $attempts = @(
+        @{
+            Case = 'text-create-reserved-git'
+            Dest = "/.git/$($script:ProbeNamePrefix)-reserved.txt"
+        },
+        @{
+            Case = 'text-create-reserved-rundot-sync'
+            Dest = "/.rundot-sync/$($script:ProbeNamePrefix)-reserved.txt"
+        },
+        @{
+            Case = 'text-create-reserved-traversal'
+            Dest = "/../$($script:ProbeNamePrefix)-escaped.txt"
+        }
+    )
+
+    foreach ($item in $attempts) {
+        $source = New-ProbeOwnedTextFile -Suffix $item.Case -Content "reserved probe $($item.Case)"
+        if ($null -eq $source.Path) {
+            Write-ProbeLog ("[STOPPED] {0}: no source" -f $item.Case)
+            continue
+        }
+
+        $move = Invoke-ProbeMoveRequest -Case $item.Case -From $source.Path -To $item.Dest `
+            -Note 'move onto a reserved-shaped or traversal destination'
+
+        Start-Sleep -Milliseconds 350
+        $destListed = $null -ne (Get-ProbeRowOrNull -Path $item.Dest)
+        $stamp = $script:ProbeNamePrefix
+        $paths = Get-ProbeListedPaths
+        $escapedOutside = @($paths | Where-Object {
+            $_ -like "*$stamp*" -and
+            $_ -notlike "$($script:ProbeDir)/*" -and
+            $_ -notlike "$($script:ProbeUploadDir)/*"
+        })
+
+        Add-ProbeEvidence -Case $item.Case -Status 'PROBED' -Data @{
+            note               = 'reserved or traversal destination; client must refuse regardless'
+            destPath           = $item.Dest
+            moveStatus         = $move.Status
+            moveBody           = $move.BodyText
+            destListed         = $destListed
+            stampPathsOutsideProbeDirs = $escapedOutside
+        }
+
+        if ($destListed) {
+            try {
+                Invoke-ProbeDeleteFile -Path $item.Dest -Case "$($item.Case)-cleanup" | Out-Null
+            }
+            catch {
+                Write-ProbeLog ("[CLEANUP] {0}: delete guard refused {1}" -f $item.Case, $item.Dest)
+            }
+        }
+
+        if ($null -ne (Get-ProbeRowOrNull -Path $source.Path)) {
+            Remove-ProbeListedPathIfOwned -Path $source.Path -Case "$($item.Case)-cleanup-src" | Out-Null
+        }
+    }
+
+    Add-ProbeEvidence -Case 'text-create-reserved-summary' -Status 'OBSERVED' -Data @{
+        note = 'the sync client keeps refusing .git/, .rundot-sync/, and .. even when the server accepts a move'
+    }
+}
+
+function Invoke-ScenarioTextCreateDevToolsPrepare {
+    $suggestedPath = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-created.txt"
+    $uniqueContent = "text-create devtools $([Guid]::NewGuid().ToString('N'))"
+    $target = New-ProbeOwnedTextFile -Suffix 'text-create-devtools' -Content $uniqueContent
+
+    if ($null -eq $target.Path) {
+        Write-ProbeLog '[STOPPED] text-create-devtools-prepare: could not create a baseline file'
+        return
+    }
+
+    $stateFile = Join-Path $OutDir 'probe-text-create-state.json'
+    @{
+        baselinePath = $target.Path
+        sha256       = $target.Sha256
+        runStamp     = $script:ProbeRunStamp
+        suggestedPath = $suggestedPath
+        preparedAt   = (Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $stateFile -Encoding UTF8
+
+    Add-ProbeEvidence -Case 'text-create-devtools-prepare' -Status 'PROBED' -Data @{
+        note          = 'create a NEW text file in the Studio UI; capture the Network request'
+        baselinePath  = $target.Path
+        sha256        = $target.Sha256
+        runStamp      = $script:ProbeRunStamp
+        suggestedPath = $suggestedPath
+        stateFile     = $stateFile
+    }
+
+    Write-ProbeLog ''
+    Write-ProbeLog 'NEXT (human step, only if Studio exposes a new-file action):'
+    Write-ProbeLog "  1. In Studio, create a new text file at: $suggestedPath"
+    Write-ProbeLog '     If the product has no such control, skip to apply with no'
+    Write-ProbeLog '     capture file and record uiCreateUnavailable in evidence.'
+    Write-ProbeLog '     Keep the probe-<stamp> prefix when the UI allows naming.'
+    Write-ProbeLog '  2. DevTools > Network open while you create it.'
+    Write-ProbeLog '     Copy as fetch, or Save all as HAR.'
+    Write-ProbeLog '  3. Save to e.g. %TEMP%\rundot-text-create-capture.txt'
+    Write-ProbeLog '  4. Run -Scenario text-create-devtools-apply -CapturePath <that file>'
+    Write-ProbeLog ''
+    Write-ProbeLog "  Baseline (API upload only) is at $($target.Path). UI text upload is not required."
+    Write-ProbeLog ''
+}
+
+function Get-ProbeDevToolsCaptureRoutes {
+    param([string]$CaptureText)
+
+    if ([string]::IsNullOrWhiteSpace($CaptureText)) { return $null, @(), $false }
+
+    $redact = {
+        param([string]$Text)
+        $t = $Text
+        $t = $t -replace '(?i)(authorization|bearer|token|cookie|api[-_]?key)("?\s*[:=]\s*"?)[^",\s]+', '$1$2<redacted>'
+        $t = $t -replace 'eyJ[A-Za-z0-9_\-]{5,}', '<redacted-jwt>'
+        return $t
+    }
+
+    $captureLines = @($CaptureText -split "`r?`n" |
+        Where-Object { $_ -match '(?i)fetch\(|"method"|"url"|\bmethod:|https?://' } |
+        Select-Object -First 60 |
+        ForEach-Object { & $redact $_ })
+
+    $routes = New-Object 'System.Collections.Generic.List[object]'
+    $lastUrl = $null
+    foreach ($line in ($CaptureText -split "`r?`n")) {
+        $fetchMatch = [regex]::Match($line, 'fetch\(\s*[''"](https?://[^''"]+)[''"]')
+        $harUrlMatch = [regex]::Match($line, '"(?:url|requestUrl)"\s*:\s*"(https?://[^"]+)"')
+
+        if ($fetchMatch.Success) {
+            $lastUrl = & $redact $fetchMatch.Groups[1].Value
+            continue
+        }
+        if ($harUrlMatch.Success) {
+            $lastUrl = & $redact $harUrlMatch.Groups[1].Value
+            continue
+        }
+
+        $methodMatch = [regex]::Match($line, '"method"\s*:\s*"([A-Za-z]+)"')
+        if ($methodMatch.Success -and $null -ne $lastUrl) {
+            $routes.Add([pscustomobject]@{
+                method = $methodMatch.Groups[1].Value
+                url    = $lastUrl
+            })
+            $lastUrl = $null
+        }
+    }
+
+    $captureHadResponse = ($CaptureText -match '(?i)"status"\s*:')
+    return $captureLines, $routes.ToArray(), $captureHadResponse
+}
+
+function Invoke-ScenarioTextCreateDevToolsApply {
+    param([string]$CapturePath)
+
+    $stateFile = Join-Path $OutDir 'probe-text-create-state.json'
+    $state = $null
+    if (Test-Path -LiteralPath $stateFile) {
+        $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+    }
+
+    $prepareStamp = if ($null -ne $state) { [string]$state.runStamp } else { $null }
+    $suggestedPath = if ($null -ne $state) { [string]$state.suggestedPath } else { $null }
+
+    $captureText = $null
+    $capturePathGiven = -not [string]::IsNullOrWhiteSpace($CapturePath)
+    $captureFileExists = $false
+    if ($capturePathGiven -and (Test-Path -LiteralPath $CapturePath -PathType Leaf)) {
+        $captureFileExists = $true
+        $captureText = (Get-Content -LiteralPath $CapturePath -Raw)
+    }
+
+    $captureLines = $null
+    $captureRoutes = $null
+    $captureHadResponse = $false
+    if (-not [string]::IsNullOrWhiteSpace($captureText)) {
+        $captureLines, $captureRoutes, $captureHadResponse = Get-ProbeDevToolsCaptureRoutes -CaptureText $captureText
+    }
+
+    $contentLength = $null
+    if (-not [string]::IsNullOrWhiteSpace($captureText)) {
+        $contentMatch = [regex]::Match($captureText, '(?i)"content"\s*:\s*"')
+        if ($contentMatch.Success) {
+            $contentLength = ($captureText.Length - $contentMatch.Index)
+        }
+    }
+
+    $ownedNow = @()
+    if (-not [string]::IsNullOrWhiteSpace($prepareStamp)) {
+        $ownedNow = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$prepareStamp*" })
+    }
+
+    $createdPath = $null
+    if (-not [string]::IsNullOrWhiteSpace($suggestedPath)) {
+        if ($null -ne (Get-ProbeRowOrNull -Path $suggestedPath)) {
+            $createdPath = $suggestedPath
+        }
+    }
+    if ($null -eq $createdPath -and $ownedNow.Count -gt 0) {
+        foreach ($candidate in $ownedNow) {
+            if ($candidate -like "$($script:ProbeDir)/*-created.txt") {
+                $createdPath = $candidate
+                break
+            }
+        }
+    }
+
+    $uiCreateListed = $false
+    if (-not [string]::IsNullOrWhiteSpace($suggestedPath)) {
+        $uiCreateListed = ($null -ne (Get-ProbeRowOrNull -Path $suggestedPath))
+    }
+
+    Add-ProbeEvidence -Case 'text-create-devtools-apply' -Status 'OBSERVED' -Data @{
+        note               = 'UI create route shape; request was not replayed'
+        prepareStamp       = $prepareStamp
+        suggestedPath      = $suggestedPath
+        createdPathListed  = $createdPath
+        uiCreateListed     = $uiCreateListed
+        ownedPathsNow      = $ownedNow
+        capturePathGiven   = $capturePathGiven
+        captureFileExists  = $captureFileExists
+        captureProvided    = (-not [string]::IsNullOrWhiteSpace($captureText))
+        captureHadResponse = $captureHadResponse
+        captureRoutes      = $captureRoutes
+        captureLines       = $captureLines
+        contentFieldLengthApprox = $contentLength
+    }
+
+    $cleanupTargets = @()
+    if (-not [string]::IsNullOrWhiteSpace($createdPath)) { $cleanupTargets += $createdPath }
+    if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.baselinePath)) {
+        $cleanupTargets += [string]$state.baselinePath
+    }
+
+    $deleted = @()
+    $manual = @()
+    foreach ($cleanupPath in ($cleanupTargets | Sort-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($cleanupPath)) { continue }
+        try {
+            $result = Invoke-ProbeDeleteFile -Path $cleanupPath -Case 'text-create-devtools-cleanup' `
+                -AllowedStamp @($prepareStamp)
+            if ($result.Deleted) { $deleted += $cleanupPath }
+            else { $manual += $cleanupPath }
+        }
+        catch {
+            $manual += $cleanupPath
+        }
+    }
+
+    Add-ProbeEvidence -Case 'text-create-devtools-cleanup' -Status 'OBSERVED' -Data @{
+        note        = 'hand-off cleanup where the delete guard allows'
+        attempted   = @($cleanupTargets | Sort-Object -Unique)
+        deleted     = $deleted
+        needsManual = $manual
+    }
+
+    if ($null -eq $captureText) {
+        if (-not $capturePathGiven) {
+            Write-ProbeLog '[WARNING] text-create-devtools-apply: -CapturePath was not passed; route shape was not recorded.'
+        }
+        elseif (-not $captureFileExists) {
+            Write-ProbeLog ("[WARNING] text-create-devtools-apply: capture file not found at '$CapturePath'.")
+        }
+        else {
+            Write-ProbeLog '[WARNING] text-create-devtools-apply: capture file was empty; route shape was not recorded.'
+        }
+    }
+
+    if (-not $uiCreateListed) {
+        Write-ProbeLog '[NOTE] text-create-devtools-apply: the suggested UI create path is not listed.'
+        Write-ProbeLog '       If Studio has no new-file action, that is expected; API create remains upload+move+PUT.'
+    }
+}
+
+
+# ---------------------------------------------------------------------------
 # Concurrency, revision identity, ETag, and conditional delete (#16)
 #
 # #14 proved a stale PUT silently clobbers a concurrent Studio edit and that
@@ -4318,6 +5241,315 @@ function Invoke-ProbeStep {
     }
 }
 
+function Get-ProbeReadIdentity {
+    param($Read)
+
+    if ($null -eq $Read) {
+        return @{
+            byteCount          = $null
+            sha256             = $null
+            encoding           = $null
+            contentStartsWithBom = $false
+        }
+    }
+
+    $startsWithBom = $false
+    if (-not [string]::IsNullOrEmpty($Read.Content)) {
+        $startsWithBom = ([int][char]$Read.Content[0] -eq 0xFEFF)
+    }
+
+    return @{
+        byteCount            = $Read.ByteCount
+        sha256               = $Read.Sha256
+        encoding             = $Read.Encoding
+        contentStartsWithBom = $startsWithBom
+    }
+}
+
+function Invoke-ProbePlaceTextExactCase {
+    # Upload under a unique /uploads name, move to the chosen path, then PUT
+    # the exact text. Upload is only how the path comes into existence. PUT
+    # is the byte-exact step, because #14 showed PUT preserves CRLF and BOM
+    # on a file that already exists.
+    param(
+        [string]$Case,
+        [string]$DestPath,
+        [string]$Text,
+        [string]$Extension,
+        [string]$ContentType = 'text/plain',
+        [switch]$UploadPlaceholder
+    )
+
+    $sentText = $Text
+    $uploadText = $Text
+    if ($UploadPlaceholder) {
+        $uploadText = 'x'
+    }
+
+    $sentBytes = Get-Utf8NoBomBytes -Text $sentText
+    $uploadBytes = Get-Utf8NoBomBytes -Text $uploadText
+    $sentSha = Get-Sha256Hex -Bytes $sentBytes
+    $fileName = Get-BinaryProbeName -Suffix $Case -Extension $Extension
+
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        Remove-ProbeListedPathIfOwned -Path $DestPath -Case "$Case-preclean" | Out-Null
+    }
+
+    $upload = Invoke-ProbeBinaryUpload `
+        -Case "$Case-upload" `
+        -FileName $fileName `
+        -Bytes $uploadBytes `
+        -ContentType $ContentType `
+        -Note 'unique upload so the destination can be created by move'
+
+    $afterUpload = $null
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        $afterUpload = Get-ProbeReadOrNull -Path $upload.recordedPath
+    }
+
+    $moveStatus = $null
+    $moveBody = $null
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        $move = Invoke-ProbeMoveRequest -Case "$Case-move" -From $upload.recordedPath -To $DestPath
+        $moveStatus = $move.Status
+        $moveBody = $move.BodyText
+    }
+
+    $afterMove = Get-ProbeReadOrNull -Path $DestPath
+    $putStatus = $null
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        $put = Invoke-ProbeTextPut -Path $DestPath -ContentBytes (New-JsonContentBody -Text $sentText)
+        $putStatus = $put.Status
+    }
+
+    Start-Sleep -Milliseconds 300
+    $afterPut = Get-ProbeReadOrNull -Path $DestPath
+    $uploadIdentity = Get-ProbeReadIdentity -Read $afterUpload
+    $moveIdentity = Get-ProbeReadIdentity -Read $afterMove
+    $putIdentity = Get-ProbeReadIdentity -Read $afterPut
+
+    $exactAfterPut = (
+        $null -ne $afterPut -and
+        [string]::Equals($afterPut.Sha256, $sentSha, [System.StringComparison]::OrdinalIgnoreCase) -and
+        ($afterPut.ByteCount -eq $sentBytes.Length)
+    )
+
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note                 = 'upload creates the path; PUT /file is the exact-bytes step'
+        destPath             = $DestPath
+        extension            = $Extension
+        contentType          = $ContentType
+        uploadPlaceholder    = [bool]$UploadPlaceholder
+        uploadStatus         = $upload.uploadUrl.status
+        adoptStatus          = if ($null -ne $upload.adopt) { $upload.adopt['status'] } else { $null }
+        uploadPath           = $upload.recordedPath
+        uploadEncoding       = $uploadIdentity.encoding
+        uploadByteCount      = $uploadIdentity.byteCount
+        uploadSha256         = $uploadIdentity.sha256
+        uploadStartsWithBom  = $uploadIdentity.contentStartsWithBom
+        moveStatus           = $moveStatus
+        moveBody             = $moveBody
+        moveEncoding         = $moveIdentity.encoding
+        moveByteCount        = $moveIdentity.byteCount
+        moveSha256           = $moveIdentity.sha256
+        moveStartsWithBom    = $moveIdentity.contentStartsWithBom
+        putStatus            = $putStatus
+        putEncoding          = $putIdentity.encoding
+        putByteCount         = $putIdentity.byteCount
+        putSha256            = $putIdentity.sha256
+        putStartsWithBom     = $putIdentity.contentStartsWithBom
+        sentSize             = $sentBytes.Length
+        sentSha256           = $sentSha
+        exactAfterPut        = $exactAfterPut
+    }
+    Write-ProbeLog ("[PROBED] {0} move={1} put={2} exactAfterPut={3}" -f $Case, $moveStatus, $putStatus, $exactAfterPut)
+
+    if ($null -ne (Get-ProbeRowOrNull -Path $DestPath)) {
+        Remove-ProbeListedPathIfOwned -Path $DestPath -Case "$Case-cleanup" | Out-Null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        if ($null -ne (Get-ProbeRowOrNull -Path $upload.recordedPath)) {
+            Remove-ProbeListedPathIfOwned -Path $upload.recordedPath -Case "$Case-cleanup-upload" | Out-Null
+        }
+        else {
+            while ($script:CreatedPaths.Contains($upload.recordedPath)) {
+                [void]$script:CreatedPaths.Remove($upload.recordedPath)
+            }
+        }
+    }
+
+    return $exactAfterPut
+}
+
+function Invoke-ScenarioTextPlaceExact {
+    $results = @()
+
+    $ts = "export const n = 1;`r`nconst q = `"quote`";`r`n"
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-ts' `
+        -DestPath "$($script:ProbeDir)/src/$($script:ProbeNamePrefix)-main.ts" `
+        -Text $ts `
+        -Extension '.ts'
+
+    $bom = "$([char]0xFEFF)export const bom = true;`n"
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-bom' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-bom.ts" `
+        -Text $bom `
+        -Extension '.ts'
+
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-empty' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-empty.ts" `
+        -Text '' `
+        -Extension '.ts' `
+        -UploadPlaceholder
+
+    $json = '{ "ok": true }'
+    $results += Invoke-ProbePlaceTextExactCase `
+        -Case 'text-place-exact-json' `
+        -DestPath "$($script:ProbeDir)/$($script:ProbeNamePrefix)-pack.json" `
+        -Text $json `
+        -Extension '.json'
+
+    $allExact = $true
+    foreach ($flag in $results) {
+        if (-not $flag) { $allExact = $false }
+    }
+
+    Add-ProbeEvidence -Case 'text-place-exact-summary' -Status 'OBSERVED' -Data @{
+        note     = 'trustworthy create is unique upload, move onto an absent path, then PUT /file'
+        allExact = $allExact
+        count    = $results.Count
+    }
+    Write-ProbeLog ("[OBSERVED] text-place-exact allExact={0}" -f $allExact)
+}
+
+function Invoke-ProbePlaceBinaryAtPath {
+    # #38. Upload a unique name, adopt it (which always records
+    # /uploads/<basename>), then POST /move to a chosen destination. This is
+    # the only observed way to get binary bytes to an arbitrary project path,
+    # because the upload flow ignores the requested path (#15) while /move
+    # honors the destination (#16). Returns everything a finding needs, or
+    # $null when the upload step did not record a path.
+    param(
+        [string]$CasePrefix,
+        [string]$DestPath,
+        [byte[]]$Bytes,
+        [string]$FileNameSuffix,
+        [string]$ContentType = 'image/png',
+        [string]$Note = 'upload creates /uploads/<basename>; POST /move relocates it to the chosen path'
+    )
+
+    $fileName = Get-BinaryProbeName -Suffix $FileNameSuffix
+    $upload = Invoke-ProbeBinaryUpload `
+        -Case "$CasePrefix-upload" `
+        -FileName $fileName `
+        -Bytes $Bytes `
+        -ContentType $ContentType `
+        -Note 'upload step: the path the server records is always /uploads/<basename>'
+
+    if ([string]::IsNullOrWhiteSpace($upload.recordedPath)) {
+        return $null
+    }
+
+    $move = Invoke-ProbeMoveRequest `
+        -Case "$CasePrefix-move" `
+        -From $upload.recordedPath `
+        -To $DestPath `
+        -Note 'move step: does it honor the destination path and preserve bytes?'
+
+    Start-Sleep -Milliseconds 350
+    $read = Get-ProbeReadOrNull -Path $DestPath
+    $fromStill = $null -ne (Get-ProbeRowOrNull -Path $upload.recordedPath)
+    $toListed = $null -ne (Get-ProbeRowOrNull -Path $DestPath)
+
+    if ($toListed) { $script:CreatedPaths.Add($DestPath) }
+    if ($fromStill) { $script:CreatedPaths.Add($upload.recordedPath) }
+
+    $sentSha = Get-Sha256Hex -Bytes $Bytes
+    $adoptStatus = $null
+    if ($null -ne $upload.adopt) { $adoptStatus = $upload.adopt['status'] }
+
+    return [pscustomobject]@{
+        Note            = $Note
+        DestPath        = $DestPath
+        UploadPath      = $upload.recordedPath
+        UploadUrlStatus = $upload.uploadUrl.status
+        AdoptStatus     = $adoptStatus
+        MoveStatus      = $move.Status
+        MoveBody        = $move.BodyText
+        FromStillListed = $fromStill
+        ToListed        = $toListed
+        Moved           = $move.Moved
+        SentSize        = $Bytes.Length
+        SentSha256      = $sentSha
+        ReadSize        = if ($null -ne $read) { $read.ByteCount } else { $null }
+        ReadSha256      = if ($null -ne $read) { $read.Sha256 } else { $null }
+        BytesPreserved  = (
+            $null -ne $read -and
+            [string]::Equals($sentSha, $read.Sha256, [System.StringComparison]::OrdinalIgnoreCase)
+        )
+    }
+}
+
+function Invoke-ProbeMalformedPresignedPut {
+    # A PUT to a URL that is not a real presigned target. #15 recorded that it
+    # produced no HTTP status at all: the request failed at the transport
+    # layer. This confirms the shape so a client never treats it as an
+    # ambiguous write to retry blindly.
+    param(
+        [string]$Case,
+        [byte[]]$Bytes
+    )
+
+    $bogusUrl = 'https://example.invalid/not-a-presigned-url'
+    Assert-ProbeWriteAllowed -Case $Case -Method 'PUT' -Uri $bogusUrl
+
+    $response = Invoke-ProbeHttp `
+        -Method 'PUT' `
+        -Uri $bogusUrl `
+        -BodyBytes $Bytes `
+        -ContentType 'image/png'
+
+    Add-ProbeEvidence -Case $Case -Status 'PROBED' -Data @{
+        note       = 'a PUT to a non-presigned URL; expect a transport failure with no HTTP status'
+        uri        = $bogusUrl
+        status     = $response.Status
+        body       = $response.BodyText
+        httpStatus = if ($null -eq $response.TransportError) { $response.Status } else { $null }
+        error      = if ($null -ne $response.TransportError) { [string]$response.TransportError.Message } else { $null }
+    }
+    Write-ProbeLog ("[PROBED] {0} status={1} transportError={2}" -f `
+        $Case, $response.Status, ($null -ne $response.TransportError))
+
+    return $response
+}
+
+function Invoke-ScenarioRunTextCreateAll {
+    Invoke-ProbeStep 'text-create-discover' { Invoke-ScenarioTextCreateDiscover }
+    Invoke-ProbeStep 'text-create-compose' { Invoke-ScenarioTextCreateCompose }
+    Invoke-ProbeStep 'text-create-idempotency' { Invoke-ScenarioTextCreateIdempotency }
+    Invoke-ProbeStep 'text-create-bytes' { Invoke-ScenarioTextCreateBytes }
+    Invoke-ProbeStep 'text-create-race' { Invoke-ScenarioTextCreateRace }
+    Invoke-ProbeStep 'text-create-conditional' { Invoke-ScenarioTextCreateConditional }
+    Invoke-ProbeStep 'text-create-reserved' { Invoke-ScenarioTextCreateReserved }
+    Invoke-ProbeStep 'text-create-route-survey' { Invoke-ScenarioSurvey }
+
+    if (-not $SkipCleanup) {
+        Invoke-ProbeStep 'binary-cleanup' { Invoke-ScenarioBinaryCleanup }
+    }
+    else {
+        Write-ProbeLog ''
+        Write-ProbeLog '[SKIPPED] binary-cleanup: -SkipCleanup was set; the created paths remain.'
+    }
+
+    Write-ProbeLog ''
+    Write-ProbeLog 'Optional: text-create-devtools-prepare / -apply if Studio exposes a new-file UI.'
+    Write-ProbeLog '  If not, run apply without -CapturePath after prepare to record uiCreateListed=false.'
+    Write-ProbeLog ''
+}
+
 function Invoke-ScenarioRunTextAll {
     # Re-runs the #14 text investigation end to end. Useful as a regression
     # check that the documented text semantics still hold.
@@ -4395,6 +5627,469 @@ function Invoke-ScenarioRunDeleteRenameAll {
     Write-ProbeLog '  ...rename that path by hand in Studio, then -Scenario rename-devtools-apply -CapturePath <file>.'
 }
 
+function Invoke-ScenarioBinaryPlaceSequence {
+    # The core question: can a binary end up at a chosen project path, with the
+    # /uploads staging copy gone? Upload -> adopt -> POST /move.
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-placed.png"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'binary-place-sequence-preclean' | Out-Null
+    }
+
+    $bytes = Get-BinaryProbeBytes -Variant 11
+    $result = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-sequence' `
+        -DestPath $dest `
+        -Bytes $bytes `
+        -FileNameSuffix 'sequence'
+
+    if ($null -eq $result) {
+        Add-ProbeEvidence -Case 'binary-place-sequence' -Status 'STOPPED' -Data @{
+            note = 'the upload step did not record a path, so no move was attempted'
+        }
+        Write-ProbeLog '[STOPPED] binary-place-sequence: upload did not succeed'
+        return
+    }
+
+    $destRow = Get-ProbeRowOrNull -Path $dest
+    $oneAtDest = ($null -ne $destRow) -and (-not $result.FromStillListed)
+
+    Add-ProbeEvidence -Case 'binary-place-sequence' -Status 'PROBED' -Data @{
+        note            = 'upload -> adopt -> POST /move; one binary at the chosen path, staging copy gone'
+        uploadUrlStatus = $result.UploadUrlStatus
+        adoptStatus     = $result.AdoptStatus
+        uploadPath      = $result.UploadPath
+        moveStatus      = $result.MoveStatus
+        moveBody        = $result.MoveBody
+        destPath        = $dest
+        fromStillListed = $result.FromStillListed
+        toListed        = $result.ToListed
+        moved           = $result.Moved
+        sentSize        = $result.SentSize
+        sentSha256      = $result.SentSha256
+        readSize        = $result.ReadSize
+        readSha256      = $result.ReadSha256
+        bytesPreserved  = $result.BytesPreserved
+        destRowSize     = if ($null -ne $destRow) { $destRow.size } else { $null }
+        oneAtDestNoStaging = $oneAtDest
+    }
+    Write-ProbeLog ("[PROBED] binary-place-sequence moveStatus={0} bytesPreserved={1} oneAtDestNoStaging={2}" -f `
+        $result.MoveStatus, $result.BytesPreserved, $oneAtDest)
+}
+
+function Invoke-ScenarioBinaryPlaceCollisionCleanup {
+    # The issue calls this out by name: a repeated upload name creates a
+    # numeric-suffixed sibling, so the sequence must not leave `name-1` behind.
+    # Upload the same basename twice (the second adopt collides), delete the
+    # sibling, then move the original to the chosen path.
+    $name = Get-BinaryProbeName -Suffix 'collide'
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-collide-placed.png"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'binary-place-collision-cleanup-preclean' | Out-Null
+    }
+
+    $bytes = Get-BinaryProbeBytes -Variant 12
+
+    # First adopt records /uploads/<name>.
+    $first = Invoke-ProbeBinaryUpload `
+        -Case 'binary-place-collision-first' `
+        -FileName $name `
+        -Bytes $bytes `
+        -ContentType 'image/png' `
+        -Note 'first adopt of this basename'
+
+    # Second adopt of the same basename collides; the server appends -1.
+    $second = Invoke-ProbeBinaryUpload `
+        -Case 'binary-place-collision-second' `
+        -FileName $name `
+        -Bytes $bytes `
+        -ContentType 'image/png' `
+        -Note 'second adopt of the same basename; expect a numeric-suffixed sibling'
+
+    $firstPath = $first.recordedPath
+    $secondPath = $second.recordedPath
+
+    $pathsAfterSecondUpload = @(Get-ProbeListedPaths | Where-Object {
+        $_ -like "*$($script:ProbeRunStamp)*"
+    } | Sort-Object)
+
+    $siblingDeleted = $false
+    if (-not [string]::IsNullOrWhiteSpace($secondPath) -and
+        -not [string]::Equals($secondPath, $firstPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $siblingDeleted = Remove-ProbeListedPathIfOwned -Path $secondPath -Case 'binary-place-collision-cleanup-sibling'
+    }
+
+    $moveStatus = $null
+    $moveBody = $null
+    if (-not [string]::IsNullOrWhiteSpace($firstPath) -and
+        ($null -ne (Get-ProbeRowOrNull -Path $firstPath))) {
+        $move = Invoke-ProbeMoveRequest `
+            -Case 'binary-place-collision-cleanup-move' `
+            -From $firstPath `
+            -To $dest `
+            -Note 'relocate the surviving original to the chosen path'
+        $moveStatus = $move.Status
+        $moveBody = $move.BodyText
+    }
+
+    Start-Sleep -Milliseconds 350
+    $destRow = Get-ProbeRowOrNull -Path $dest
+    $read = Get-ProbeReadOrNull -Path $dest
+    $sentSha = Get-Sha256Hex -Bytes $bytes
+
+    # A leftover sibling is a name-suffixed file the sequence did not place.
+    # Match the stamp AND a numeric suffix before the extension: a plain
+    # substring test for '-1' would also match the run stamp itself
+    # (probe-YYYYMMDD-HHMMSS), which is a false positive, not a sibling.
+    $leftoverSiblings = @(Get-ProbeListedPaths | Where-Object {
+        $_ -like "*$($script:ProbeRunStamp)*" -and $_ -match '-\d+(\.[A-Za-z0-9]+)?$'
+    } | Sort-Object)
+
+    $noSiblingLeft = ($leftoverSiblings.Count -eq 0)
+
+    Add-ProbeEvidence -Case 'binary-place-collision-cleanup' -Status 'PROBED' -Data @{
+        note                 = 'the sequence must not leave name-1 behind'
+        requestedName        = $name
+        firstPath            = $firstPath
+        secondPath           = $secondPath
+        siblingCollided      = (-not [string]::Equals($secondPath, $firstPath, [System.StringComparison]::OrdinalIgnoreCase))
+        pathsAfterSecondUpload = $pathsAfterSecondUpload
+        siblingDeleted       = $siblingDeleted
+        moveStatus           = $moveStatus
+        moveBody             = $moveBody
+        destPath             = $dest
+        toListed             = ($null -ne $destRow)
+        readSize             = if ($null -ne $read) { $read.ByteCount } else { $null }
+        readSha256           = if ($null -ne $read) { $read.Sha256 } else { $null }
+        sentSize             = $bytes.Length
+        sentSha256           = $sentSha
+        bytesPreserved       = ($null -ne $read -and [string]::Equals($sentSha, $read.Sha256, [System.StringComparison]::OrdinalIgnoreCase))
+        leftoverSiblings     = $leftoverSiblings
+        noSiblingLeft        = $noSiblingLeft
+    }
+    Write-ProbeLog ("[PROBED] binary-place-collision-cleanup collided={0} noSiblingLeft={1}" -f `
+        (-not [string]::Equals($secondPath, $firstPath, [System.StringComparison]::OrdinalIgnoreCase)), $noSiblingLeft)
+}
+
+function Invoke-ScenarioBinaryPlaceReplace {
+    # Can the bytes at a chosen path be replaced? The upload flow cannot
+    # replace (#15), and /move refuses an occupied destination with 409 (#16),
+    # so replacement is DELETE-then-place. This proves the old bytes are gone.
+    $dest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-replace.png"
+    if ($null -ne (Get-ProbeRowOrNull -Path $dest)) {
+        Remove-ProbeListedPathIfOwned -Path $dest -Case 'binary-place-replace-preclean' | Out-Null
+    }
+
+    $oldBytes = Get-BinaryProbeBytes -Variant 21
+    $oldSha = Get-Sha256Hex -Bytes $oldBytes
+    $first = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-replace-first' `
+        -DestPath $dest `
+        -Bytes $oldBytes `
+        -FileNameSuffix 'replace-old' `
+        -Note 'first placement: the bytes that must be provably gone afterwards'
+
+    if ($null -eq $first) {
+        Add-ProbeEvidence -Case 'binary-place-replace' -Status 'STOPPED' -Data @{
+            note = 'the first placement did not record a path'
+        }
+        Write-ProbeLog '[STOPPED] binary-place-replace: first placement failed'
+        return
+    }
+
+    $readBefore = Get-ProbeReadOrNull -Path $dest
+    $shaBefore = if ($null -ne $readBefore) { $readBefore.Sha256 } else { $null }
+
+    # Occupied destination: a second move onto it must be refused, not merged.
+    $newBytes = Get-BinaryProbeBytes -Variant 22
+    $newSha = Get-Sha256Hex -Bytes $newBytes
+    $blocked = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-replace-occupied' `
+        -DestPath $dest `
+        -Bytes $newBytes `
+        -FileNameSuffix 'replace-new-blocked' `
+        -Note 'move onto an occupied destination; expect 409 ALREADY_EXISTS'
+
+    $afterBlocked = Get-ProbeReadOrNull -Path $dest
+    $shaAfterBlocked = if ($null -ne $afterBlocked) { $afterBlocked.Sha256 } else { $null }
+
+    # The replacement: delete the existing path, then place new bytes there.
+    $delete = Invoke-ProbeDeleteFile -Path $dest -Case 'binary-place-replace-delete'
+    $goneFromList = $null -eq (Get-ProbeRowOrNull -Path $dest)
+    $readAfterDelete = Get-ProbeReadOrNull -Path $dest
+    $getAfterDeleteFailed = ($null -eq $readAfterDelete)
+
+    $second = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-replace-second' `
+        -DestPath $dest `
+        -Bytes $newBytes `
+        -FileNameSuffix 'replace-new' `
+        -Note 'replacement: delete then place the new bytes at the same path'
+
+    $readFinal = Get-ProbeReadOrNull -Path $dest
+    $shaFinal = if ($null -ne $readFinal) { $readFinal.Sha256 } else { $null }
+    $oldBytesGone = (
+        $null -ne $shaFinal -and
+        -not [string]::Equals($shaFinal, $shaBefore, [System.StringComparison]::OrdinalIgnoreCase)
+    )
+    $newBytesPresent = (
+        $null -ne $shaFinal -and
+        [string]::Equals($shaFinal, $newSha, [System.StringComparison]::OrdinalIgnoreCase)
+    )
+
+    Add-ProbeEvidence -Case 'binary-place-replace' -Status 'PROBED' -Data @{
+        note                 = 'replacement is delete-then-place; a move onto an occupied path is refused'
+        destPath             = $dest
+        oldSentSize          = $oldBytes.Length
+        oldSentSha256        = $oldSha
+        shaBefore            = $shaBefore
+        blockedMoveStatus    = if ($null -ne $blocked) { $blocked.MoveStatus } else { $null }
+        blockedMoveBody      = if ($null -ne $blocked) { $blocked.MoveBody } else { $null }
+        shaAfterBlockedMove  = $shaAfterBlocked
+        occupiedUnchanged    = ($null -ne $shaBefore -and [string]::Equals($shaBefore, $shaAfterBlocked, [System.StringComparison]::OrdinalIgnoreCase))
+        deleteStatus         = $delete.Status
+        deleteBody           = $delete.Body
+        goneFromList         = $goneFromList
+        getAfterDeleteFailed = $getAfterDeleteFailed
+        newSentSize          = $newBytes.Length
+        newSentSha256        = $newSha
+        secondPlacementMoved = if ($null -ne $second) { $second.Moved } else { $null }
+        finalSha256          = $shaFinal
+        oldBytesGone         = $oldBytesGone
+        newBytesPresent      = $newBytesPresent
+    }
+    Write-ProbeLog ("[PROBED] binary-place-replace blockedMove={0} oldBytesGone={1} newBytesPresent={2}" -f `
+        $(if ($null -ne $blocked) { $blocked.MoveStatus } else { '-' }), $oldBytesGone, $newBytesPresent)
+}
+
+function Invoke-ScenarioBinaryPlaceFailure {
+    # What is left on Studio when a step fails mid-sequence, and can it be
+    # cleaned up? Four failure shapes, each recorded with the paths that remain.
+    $bytes = Get-BinaryProbeBytes -Variant 31
+
+    # (a) move from a source that does not exist.
+    $absentSource = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-absent-source.png"
+    $destA = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-failure-a.png"
+    $moveA = Invoke-ProbeMoveRequest -Case 'binary-place-failure-absent-source' -From $absentSource -To $destA `
+        -Note 'move from a path that does not exist; expect 404'
+    $leftA = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" } | Sort-Object)
+
+    Add-ProbeEvidence -Case 'binary-place-failure-absent-source' -Status 'PROBED' -Data @{
+        note       = 'move from an absent source'
+        from       = $absentSource
+        to         = $destA
+        http       = @{ status = $moveA.Status; body = $moveA.BodyText }
+        moved      = $moveA.Moved
+        pathsLeft  = $leftA
+    }
+
+    # (b) move onto an occupied destination. The source must be a file that has
+    # NOT already been moved, or the case degenerates into (a): occupying the
+    # destination consumes its own /uploads source, so moving from that path
+    # would test an absent source rather than an occupied destination.
+    $occupiedDest = "$($script:ProbeDir)/$($script:ProbeNamePrefix)-failure-b-dest.png"
+    $occupy = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-failure-occupy' `
+        -DestPath $occupiedDest `
+        -Bytes $bytes `
+        -FileNameSuffix 'failure-b-dest'
+    $destReadBefore = Get-ProbeReadOrNull -Path $occupiedDest
+    $destShaBefore = if ($null -ne $destReadBefore) { $destReadBefore.Sha256 } else { $null }
+
+    $freshSource = Invoke-ProbeBinaryUpload `
+        -Case 'binary-place-failure-b-source' `
+        -FileName (Get-BinaryProbeName -Suffix 'failure-b-source') `
+        -Bytes (Get-BinaryProbeBytes -Variant 32) `
+        -ContentType 'image/png' `
+        -Note 'a fresh source still at /uploads, so the move below tests the occupied destination'
+
+    $sourceB = $freshSource.recordedPath
+    $moveB = $null
+    if (-not [string]::IsNullOrWhiteSpace($sourceB)) {
+        $moveB = Invoke-ProbeMoveRequest -Case 'binary-place-failure-occupied-dest' -From $sourceB -To $occupiedDest `
+            -Note 'move onto an occupied destination; expect 409 ALREADY_EXISTS'
+    }
+
+    Start-Sleep -Milliseconds 300
+    $destReadAfter = Get-ProbeReadOrNull -Path $occupiedDest
+    $destShaAfter = if ($null -ne $destReadAfter) { $destReadAfter.Sha256 } else { $null }
+    $destUnchanged = (
+        $null -ne $destShaBefore -and
+        [string]::Equals($destShaBefore, $destShaAfter, [System.StringComparison]::OrdinalIgnoreCase)
+    )
+    $leftB = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" } | Sort-Object)
+
+    Add-ProbeEvidence -Case 'binary-place-failure-occupied-dest' -Status 'PROBED' -Data @{
+        note              = 'move onto an occupied destination, from a fresh source still at /uploads'
+        sourcePath        = $sourceB
+        destPath          = $occupiedDest
+        http              = if ($null -ne $moveB) { @{ status = $moveB.Status; body = $moveB.BodyText } } else { $null }
+        sourceStillListed = if ($null -ne $sourceB) { $null -ne (Get-ProbeRowOrNull -Path $sourceB) } else { $null }
+        destShaBefore     = $destShaBefore
+        destShaAfter      = $destShaAfter
+        destUnchanged     = $destUnchanged
+        pathsLeft         = $leftB
+    }
+    Write-ProbeLog ("[PROBED] binary-place-failure-occupied-dest status={0} destUnchanged={1}" -f `
+        $(if ($null -ne $moveB) { $moveB.Status } else { '-' }), $destUnchanged)
+
+    # (c) adopt with a fabricated uploadId.
+    $fakeAdopt = Invoke-ProbeUploadAdoptRequest -Body @{ uploadId = 'not-a-minted-upload-id'; name = "$($script:ProbeNamePrefix)-fake.png" }
+    Add-ProbeEvidence -Case 'binary-place-failure-fake-adopt' -Status 'PROBED' -Data @{
+        note = 'adopt with a fabricated uploadId; expect 400'
+        http = @{ status = $fakeAdopt.Status; body = $fakeAdopt.BodyText }
+    }
+    Write-ProbeLog ("[PROBED] binary-place-failure-fake-adopt status={0}" -f $fakeAdopt.Status)
+
+    # (d) PUT to a malformed presigned URL.
+    Invoke-ProbeMalformedPresignedPut -Case 'binary-place-failure-malformed-put' -Bytes $bytes | Out-Null
+
+    # Cleanability: every probe path left by these failures must be removable.
+    $leftovers = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" } | Sort-Object)
+    $cleaned = @()
+    foreach ($path in $leftovers) {
+        if (Remove-ProbeListedPathIfOwned -Path $path -Case 'binary-place-failure-cleanup') {
+            $cleaned += $path
+        }
+    }
+    $remaining = @(Get-ProbeListedPaths | Where-Object { $_ -like "*$($script:ProbeRunStamp)*" } | Sort-Object)
+
+    Add-ProbeEvidence -Case 'binary-place-failure-cleanup' -Status 'PROBED' -Data @{
+        note          = 'every path the failed steps left behind is removable'
+        leftovers     = $leftovers
+        cleaned       = $cleaned
+        remaining     = $remaining
+        allCleanable  = ($remaining.Count -eq 0)
+    }
+    Write-ProbeLog ("[PROBED] binary-place-failure-cleanup cleaned={0} remaining={1}" -f $cleaned.Count, $remaining.Count)
+}
+
+function Invoke-ScenarioBinaryPlaceEdgeNames {
+    # Leading-dot names and paths outside /uploads. Two questions: does a
+    # leading-dot destination keep its dot (the upload flow strips it, #15),
+    # and does /move honor a destination outside /uploads at all?
+    $bytes = Get-BinaryProbeBytes -Variant 41
+
+    # A leading-dot destination. The upload flow strips a leading dot from the
+    # source name, so the dot must come from the move destination.
+    $dotDest = "$($script:ProbeDir)/.probe-$($script:ProbeRunStamp)-dot.png"
+    $dot = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-edge-dot' `
+        -DestPath $dotDest `
+        -Bytes $bytes `
+        -FileNameSuffix 'edge-dot' `
+        -Note 'leading-dot destination; does /move keep the dot?'
+    $dotRead = Get-ProbeReadOrNull -Path $dotDest
+    $dotRow = Get-ProbeRowOrNull -Path $dotDest
+
+    Add-ProbeEvidence -Case 'binary-place-edge-dot' -Status 'PROBED' -Data @{
+        note            = 'a leading-dot destination, which the upload flow strips but /move may honor'
+        destPath        = $dotDest
+        uploadPath      = if ($null -ne $dot) { $dot.UploadPath } else { $null }
+        moveStatus      = if ($null -ne $dot) { $dot.MoveStatus } else { $null }
+        moveBody        = if ($null -ne $dot) { $dot.MoveBody } else { $null }
+        destListed      = ($null -ne $dotRow)
+        rawPathListed   = if ($null -ne $dotRow) { $dotRow.RawPath } else { $null }
+        dotPreserved    = ($null -ne $dotRow -and ([string]$dotRow.RawPath).Contains('/.probe-'))
+        readSha256      = if ($null -ne $dotRead) { $dotRead.Sha256 } else { $null }
+        sentSha256      = Get-Sha256Hex -Bytes $bytes
+    }
+    Write-ProbeLog ("[PROBED] binary-place-edge-dot moveStatus={0} destListed={1}" -f `
+        $(if ($null -ne $dot) { $dot.MoveStatus } else { '-' }), ($null -ne $dotRow))
+
+    # A nested destination outside /uploads.
+    $nestedDest = "$($script:ProbeDir)/src/assets/$($script:ProbeNamePrefix)-nested.png"
+    $nested = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-edge-nested' `
+        -DestPath $nestedDest `
+        -Bytes $bytes `
+        -FileNameSuffix 'edge-nested' `
+        -Note 'a nested destination outside /uploads; is the destination honored verbatim?'
+    $nestedRow = Get-ProbeRowOrNull -Path $nestedDest
+    $nestedRead = Get-ProbeReadOrNull -Path $nestedDest
+
+    Add-ProbeEvidence -Case 'binary-place-edge-nested' -Status 'PROBED' -Data @{
+        note           = 'a nested destination outside /uploads'
+        destPath       = $nestedDest
+        moveStatus     = if ($null -ne $nested) { $nested.MoveStatus } else { $null }
+        destListed     = ($null -ne $nestedRow)
+        rawPathListed  = if ($null -ne $nestedRow) { $nestedRow.RawPath } else { $null }
+        destHonored    = ($null -ne $nestedRow -and [string]::Equals($nestedRow.RawPath, $nestedDest, [System.StringComparison]::OrdinalIgnoreCase))
+        readSha256     = if ($null -ne $nestedRead) { $nestedRead.Sha256 } else { $null }
+        sentSha256     = Get-Sha256Hex -Bytes $bytes
+    }
+    Write-ProbeLog ("[PROBED] binary-place-edge-nested moveStatus={0} destListed={1}" -f `
+        $(if ($null -ne $nested) { $nested.MoveStatus } else { '-' }), ($null -ne $nestedRow))
+
+    # Reserved-shaped destinations. The server does not uniformly guard these
+    # (a move onto /.rundot-sync/ was 200 in #37), so a 200 here is a
+    # client-side refusal the product must keep, not a permission.
+    foreach ($reserved in @(
+        @{ Case = 'binary-place-edge-reserved-git'; Dest = "/.git/$($script:ProbeNamePrefix)-reserved.png" },
+        @{ Case = 'binary-place-edge-reserved-rundot-sync'; Dest = "/.rundot-sync/$($script:ProbeNamePrefix)-reserved.png" },
+        @{ Case = 'binary-place-edge-reserved-rundot'; Dest = "/.rundot/$($script:ProbeNamePrefix)-reserved.png" }
+    )) {
+        $placed = Invoke-ProbePlaceBinaryAtPath `
+            -CasePrefix $reserved.Case `
+            -DestPath $reserved.Dest `
+            -Bytes $bytes `
+            -FileNameSuffix 'edge-reserved' `
+            -Note 'a reserved-shaped destination; a 200 is a client-side refusal to keep, not a permission'
+
+        $row = Get-ProbeRowOrNull -Path $reserved.Dest
+        Add-ProbeEvidence -Case $reserved.Case -Status 'PROBED' -Data @{
+            note          = 'reserved-shaped destination'
+            destPath      = $reserved.Dest
+            moveStatus    = if ($null -ne $placed) { $placed.MoveStatus } else { $null }
+            moveBody      = if ($null -ne $placed) { $placed.MoveBody } else { $null }
+            destListed    = ($null -ne $row)
+            uploadPath    = if ($null -ne $placed) { $placed.UploadPath } else { $null }
+            fromStillListed = if ($null -ne $placed) { $placed.FromStillListed } else { $null }
+        }
+        Write-ProbeLog ("[PROBED] {0} moveStatus={1} destListed={2}" -f `
+            $reserved.Case, $(if ($null -ne $placed) { $placed.MoveStatus } else { '-' }), ($null -ne $row))
+    }
+
+    # A traversal spelling.
+    $traversalDest = "/../$($script:ProbeNamePrefix)-escaped.png"
+    $traversal = Invoke-ProbePlaceBinaryAtPath `
+        -CasePrefix 'binary-place-edge-traversal' `
+        -DestPath $traversalDest `
+        -Bytes $bytes `
+        -FileNameSuffix 'edge-traversal' `
+        -Note 'a traversal spelling; expect 400 to must be a normalized absolute project path'
+    Add-ProbeEvidence -Case 'binary-place-edge-traversal' -Status 'PROBED' -Data @{
+        note       = 'a traversal destination spelling'
+        destPath   = $traversalDest
+        moveStatus = if ($null -ne $traversal) { $traversal.MoveStatus } else { $null }
+        moveBody   = if ($null -ne $traversal) { $traversal.MoveBody } else { $null }
+        destListed = ($null -ne (Get-ProbeRowOrNull -Path $traversalDest))
+    }
+    Write-ProbeLog ("[PROBED] binary-place-edge-traversal moveStatus={0}" -f `
+        $(if ($null -ne $traversal) { $traversal.MoveStatus } else { '-' }))
+}
+
+function Invoke-ScenarioRunBinaryPlaceAll {
+    # The #38 characterization, in evidence order: prove the plain sequence,
+    # then the collision cleanup, then replacement, then what a failed step
+    # leaves behind, then the edge names.
+    Invoke-ProbeStep 'binary-place-sequence' { Invoke-ScenarioBinaryPlaceSequence }
+    Invoke-ProbeStep 'binary-place-collision-cleanup' { Invoke-ScenarioBinaryPlaceCollisionCleanup }
+    Invoke-ProbeStep 'binary-place-replace' { Invoke-ScenarioBinaryPlaceReplace }
+    Invoke-ProbeStep 'binary-place-failure' { Invoke-ScenarioBinaryPlaceFailure }
+    Invoke-ProbeStep 'binary-place-edge-names' { Invoke-ScenarioBinaryPlaceEdgeNames }
+    Invoke-ProbeStep 'binary-place-survey' { Invoke-ScenarioSurvey }
+
+    # Cleanup last, so a full run leaves the project as it found it. Pass
+    # -SkipCleanup to keep the artifacts for inspection.
+    if (-not $SkipCleanup) {
+        Invoke-ProbeStep 'binary-cleanup' { Invoke-ScenarioBinaryCleanup }
+    }
+    else {
+        Write-ProbeLog ''
+        Write-ProbeLog '[SKIPPED] binary-cleanup: -SkipCleanup was set; the created paths remain.'
+    }
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -4443,6 +6138,25 @@ switch ($Scenario) {
     'run-text-all'               { Invoke-ScenarioRunTextAll }
     'run-binary-all'             { Invoke-ScenarioRunBinaryAll }
     'run-delete-rename-all'      { Invoke-ScenarioRunDeleteRenameAll }
+    'text-create-discover'       { Invoke-ScenarioTextCreateDiscover }
+    'text-create-compose'        { Invoke-ScenarioTextCreateCompose }
+    'text-create-idempotency'    { Invoke-ScenarioTextCreateIdempotency }
+    'text-create-bytes'          { Invoke-ScenarioTextCreateBytes }
+    'text-create-race'           { Invoke-ScenarioTextCreateRace }
+    'text-create-conditional'    { Invoke-ScenarioTextCreateConditional }
+    'text-create-reserved'       { Invoke-ScenarioTextCreateReserved }
+    'text-create-route-survey'   { Invoke-ScenarioSurvey }
+    'text-create-devtools-prepare' { Invoke-ScenarioTextCreateDevToolsPrepare }
+    'text-create-devtools-apply' { Invoke-ScenarioTextCreateDevToolsApply -CapturePath $CapturePath }
+    'text-place-exact'           { Invoke-ScenarioTextPlaceExact }
+    'run-text-create-all'        { Invoke-ScenarioRunTextCreateAll }
+    'binary-place-sequence'      { Invoke-ScenarioBinaryPlaceSequence }
+    'binary-place-collision-cleanup' { Invoke-ScenarioBinaryPlaceCollisionCleanup }
+    'binary-place-replace'       { Invoke-ScenarioBinaryPlaceReplace }
+    'binary-place-failure'       { Invoke-ScenarioBinaryPlaceFailure }
+    'binary-place-edge-names'    { Invoke-ScenarioBinaryPlaceEdgeNames }
+    'binary-place-survey'        { Invoke-ScenarioSurvey }
+    'run-binary-place-all'       { Invoke-ScenarioRunBinaryPlaceAll }
     default {
         throw "Scenario '$Scenario' is not implemented."
     }

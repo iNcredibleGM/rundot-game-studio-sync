@@ -12,10 +12,60 @@ $script:SyncPlanArtifactSchemaVersion = 1
 $script:SyncPlanDefaultTtlMinutes = 20
 
 # Push consumes plan fingerprints but a plan is never permission to write.
-# Only a clean text overwrite may be marked applicable; creates, binaries, and
-# deletes stay blocked with explicit reasons.
+# Applicability for text overwrites, text creates, binary places, and remote
+# deletes is decided here; refused paths carry explicit reasons.
 $script:SyncPlanTextCreateReason = 'PUT /file cannot create a new path; a missing remote file returns 404.'
-$script:SyncPlanDeleteRemoteBlockedReason = 'Push does not delete remote files.'
+$script:SyncPlanDeleteRemoteRefusalReason = 'This remote path cannot be deleted: a delete never touches a reserved path or a directory-shaped path.'
+$script:SyncPlanBinaryEmptyReason = 'An empty binary cannot be placed: the upload route requires a positive declared size, and there is no later write that restores exact empty bytes.'
+function Get-SyncTextCreatePathRefusalReason {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath,
+
+        [AllowNull()]
+        [string[]]$RemotePaths
+    )
+
+    $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
+    if (-not [string]::IsNullOrEmpty($reservedRoot)) {
+        return (
+            "Reserved path '$reservedRoot': a text create never touches sync state or repository metadata."
+        )
+    }
+
+    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+        return (
+            'Directory-shaped path: a text create must target a new file path, not a directory prefix.'
+        )
+    }
+
+    return $null
+}
+
+function Get-SyncBinaryPlacePathRefusalReason {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath,
+
+        [AllowNull()]
+        [string[]]$RemotePaths
+    )
+
+    $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
+    if (-not [string]::IsNullOrEmpty($reservedRoot)) {
+        return (
+            "Reserved path '$reservedRoot': a binary place never touches sync state or repository metadata."
+        )
+    }
+
+    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+        return (
+            'Directory-shaped path: a binary place must target a file path, not a directory prefix.'
+        )
+    }
+
+    return $null
+}
 
 $script:SyncPlanDryRunClosingLines = @(
     'Dry run only. No remote files were modified.'
@@ -81,21 +131,7 @@ function Get-SyncPlanBaseMapFromResolution {
     }
 
     $files = $filesProperty.Value
-    $map = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-
-    if ($files -is [System.Collections.IDictionary]) {
-        foreach ($key in @($files.Keys)) {
-            $map[[string]$key] = $files[$key]
-        }
-
-        return $map
-    }
-
-    foreach ($property in $files.PSObject.Properties) {
-        $map[[string]$property.Name] = $property.Value
-    }
-
-    return $map
+    return (Copy-SyncMapToHashtable -Map $files)
 }
 
 function Get-SyncLocalManifestFingerprint {
@@ -104,15 +140,7 @@ function Get-SyncLocalManifestFingerprint {
     # without storing any file contents.
     param($Local)
 
-    $paths = @()
-    if ($null -ne $Local) {
-        if ($Local -is [System.Collections.IDictionary]) {
-            $paths = @($Local.Keys | ForEach-Object { [string]$_ })
-        }
-        else {
-            $paths = @($Local.PSObject.Properties | ForEach-Object { [string]$_.Name })
-        }
-    }
+    $paths = Get-SyncMapKeys -Map $Local
 
     if ($paths.Count -gt 0) {
         $sorted = New-Object string[] $paths.Count
@@ -138,10 +166,17 @@ function Get-SyncLocalManifestFingerprint {
     return Convert-Utf8Sha256Hex -Text ([string]::Join("`n", $lines.ToArray()))
 }
 
+function Get-SyncPlanRemotePaths {
+    # The canonical paths the live REMOTE map lists. Used by the delete
+    # applicability check to tell a leaf from a directory-shaped path.
+    param($Remote)
+
+    return (Get-SyncMapKeys -Map $Remote)
+}
+
 function Get-SyncPlanOperationRows {
     # Display-ready operation rows. The classifier decides status; Plan adds
-    # the publish policy on top: only a utf8 text overwrite may be applicable,
-    # and every blocked remote-mutating row carries a reason.
+    # the publish policy on top, and every blocked remote-mutating row carries a reason.
     param(
         [object[]]$Changes,
         $Base,
@@ -159,7 +194,14 @@ function Get-SyncPlanOperationRows {
 
         $status = [string]$change.Status
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
+        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
         $remoteMutating = Test-SyncRemoteMutatingStatus -Status $status
+        $remotePathsList = @(Get-SyncPlanRemotePaths -Remote $Remote)
+        $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+        $localSizeValue = 0
+        if ($null -ne $localSize) {
+            $localSizeValue = [int64]$localSize
+        }
 
         $applicable = [bool]$change.Applicable
         $reason = $change.Reason
@@ -168,12 +210,60 @@ function Get-SyncPlanOperationRows {
         if ($remoteMutating) {
             if ($status -eq $script:SyncStatusUpload) {
                 if ($localKind -eq 'binary') {
-                    $applicable = $false
+                    $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                        -CanonicalPath $path `
+                        -RemotePaths $remotePathsList
+
+                    if ($localSizeValue -le 0) {
+                        $applicable = $false
+                        $reason = $script:SyncPlanBinaryEmptyReason
+                    }
+                    elseif (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                        $applicable = $false
+                        $reason = $placeRefusal
+                    }
+                    elseif ([string]::IsNullOrEmpty($remoteSha)) {
+                        # A binary create. Over the read limit it is still
+                        # publishable: the place sequence verifies it from the
+                        # upload ETag instead of a GET /file read-back (#54).
+                        if ($null -ne $remoteEntry) {
+                            $applicable = $false
+                            $reason = 'REMOTE is present, so this is not a binary create.'
+                        }
+                        else {
+                            $applicable = $true
+                            $reason = $null
+                        }
+                    }
+                    elseif (Test-SyncOversizeSize -Size $localSizeValue) {
+                        # A binary REPLACE over the limit cannot be backed up
+                        # or hash-gated, so it stays refused (#54).
+                        $applicable = $false
+                        $reason = Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue
+                    }
+                    elseif ($remoteKind -ne 'binary') {
+                        $applicable = $false
+                        $reason = 'REMOTE is not a binary file, so a binary replace cannot apply.'
+                    }
+                    else {
+                        $applicable = $true
+                        $reason = $null
+                    }
                 }
                 elseif ($localKind -eq 'utf8') {
                     if ([string]::IsNullOrEmpty($remoteSha)) {
-                        $applicable = $false
-                        $reason = $script:SyncPlanTextCreateReason
+                        $createRefusal = Get-SyncTextCreatePathRefusalReason `
+                            -CanonicalPath $path `
+                            -RemotePaths $remotePathsList
+
+                        if ([string]::IsNullOrEmpty($createRefusal)) {
+                            $applicable = $true
+                            $reason = $null
+                        }
+                        else {
+                            $applicable = $false
+                            $reason = $createRefusal
+                        }
                     }
                 }
                 else {
@@ -181,8 +271,27 @@ function Get-SyncPlanOperationRows {
                 }
             }
             elseif ($status -eq $script:SyncStatusDeleteRemoteCandidate) {
-                $applicable = $false
-                $reason = $script:SyncPlanDeleteRemoteBlockedReason
+                # A delete is applicable only when the route may touch the
+                # path: not reserved, not directory-shaped, and carrying the
+                # expectedRemoteHash the engine re-verifies before DELETE.
+                # Plan and Push share one predicate so they cannot drift.
+                $refusal = Get-SyncDeletePathRefusalReason `
+                    -CanonicalPath $path `
+                    -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+
+                if ([string]::IsNullOrEmpty($refusal) -and -not [string]::IsNullOrEmpty($remoteSha)) {
+                    $applicable = $true
+                    $reason = $null
+                }
+                else {
+                    $applicable = $false
+                    if (-not [string]::IsNullOrEmpty($refusal)) {
+                        $reason = $refusal
+                    }
+                    else {
+                        $reason = $script:SyncPlanDeleteRemoteRefusalReason
+                    }
+                }
             }
             else {
                 $applicable = $false
@@ -652,6 +761,10 @@ function Format-SyncPlanReport {
             })
         }
         [pscustomobject]@{
+            Header = 'UNVERIFIABLE'
+            Rows   = @($operations | Where-Object { $_.status -eq $script:SyncStatusUnverifiable })
+        }
+        [pscustomobject]@{
             Header = 'IGNORED'
             Rows   = @($operations | Where-Object { $_.status -eq $script:SyncStatusIgnored })
         }
@@ -665,7 +778,8 @@ function Format-SyncPlanReport {
         $sections += [pscustomobject]@{
             Header = 'UNCHANGED'
             Rows   = @($operations | Where-Object {
-                Test-SyncNoOpStatus -Status ([string]$_.status)
+                (Test-SyncNoOpStatus -Status ([string]$_.status)) -and
+                $_.status -ne $script:SyncStatusUnverifiable
             })
         }
     }
@@ -710,7 +824,8 @@ function Format-SyncPlanReport {
         $script:SyncStatusUnchanged,
         $script:SyncStatusSynchronizedChange,
         $script:SyncStatusSynchronizedAddition,
-        $script:SyncStatusSettledAbsent
+        $script:SyncStatusSettledAbsent,
+        $script:SyncStatusUnverifiable
     )) {
         $count = @($operations | Where-Object { $_.status -eq $status }).Count
         $lines.Add(('  {0}: {1}' -f $status, $count))

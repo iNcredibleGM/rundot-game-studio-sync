@@ -1,9 +1,9 @@
-# Acceptance: v0.1.3 safe pull planner and v0.2.0 Push
+# Acceptance: v0.1.3 pull, v0.2.0 Push, and v0.3.0 publish
 
-This is the acceptance record for the safe pull planner milestone and the Push
-write route shipped on the v0.2.0 integration branch. It maps each public gate
-to the evidence that proves it, so a reviewer can check the claims without
-trusting the release notes.
+This is the acceptance record for the safe pull planner, the Push write routes
+(text overwrite, text create, binary place, and remote delete), and the
+confirmed local-wins publish. It maps each public gate to the evidence that
+proves it.
 
 Two kinds of evidence appear below:
 
@@ -24,6 +24,63 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 
 The runner dot-sources every `tests/*.Tests.ps1` into one scope and exits
 non-zero if any assertion failed. It prints the pass and fail counts.
+
+### Everything in one shot
+
+`tests/Test-All.ps1` is a thin orchestrator over the three entry points below.
+It runs each in a child process, streams the output, and prints one combined
+summary:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+| Phase | Script | Needs a project |
+| --- | --- | --- |
+| 1 | `tests/Run-Tests.ps1` (unit suite) | no |
+| 2 | `tests/Acceptance.ps1 -SkipLive` (offline gates) | no |
+| 3 | `tests/Live-RoundTrip.ps1` (live round-trip) | yes |
+
+Exit code is 0 only when every phase that ran passed. A phase that cannot run
+is reported `SKIP`, never a silent pass. `-KeepWorkspace` and
+`-SkipRemoteCleanup` pass through to phase 3.
+
+`Test-All.ps1` deliberately does **not** run `Acceptance.ps1`'s live gates:
+gates 2-4 pause on `Read-Host` for a human Studio edit, so they cannot be
+unattended. Phase 3 covers the same up/down/restore ground with no pause.
+
+### Supplying the project id once
+
+The live phase needs a disposable project id. Instead of passing `-ProjectId`
+on every run, put it in a local-only config file:
+
+```powershell
+Copy-Item .rundot-test.local.example.json .rundot-test.local.json
+# then edit .rundot-test.local.json and set your project id
+```
+
+```json
+{ "projectId": "<your disposable project id>" }
+```
+
+Resolution order:
+
+1. `-ProjectId` on the command line (wins)
+2. `.rundot-test.local.json` at the repo root
+3. the `RUNDOT_TEST_PROJECT_ID` environment variable
+
+`.rundot-test.local.json` is git-ignored (both `.gitignore` and
+`.git/info/exclude`), so it is never committed or published. A project id is an
+identifier rather than a credential, but it is still not published. The
+committed `.rundot-test.local.example.json` is the template, and it carries no
+real id.
+
+`tests/Live-RoundTrip.ps1` reads the same config, so it also runs without
+`-ProjectId`.
 
 ### Running the final acceptance harness
 
@@ -46,6 +103,54 @@ reuse the Gate 2 local edit after Pull and publish it with documented
 `PUT /file` (no extra Studio pause). The harness only ever reads from Studio
 for Pull, prints no tokens or file contents, and exits non-zero if any gate
 failed.
+
+### Fully automatic live round-trip
+
+`tests/Acceptance.ps1` pauses for a human Studio edit. When you want an
+end-to-end live run with **no manual step at all**, use
+`tests/Live-RoundTrip.ps1`. It makes its own Studio-side change, so it runs
+setup → up → down → restore → teardown unattended and asserts progress output
+at every step:
+
+```powershell
+powershell -NoProfile -File .\tests\Live-RoundTrip.ps1 -ProjectId <id>
+```
+
+What it does, in order:
+
+1. **Setup.** `Init -InitMode FromRemote` into an empty temp workspace.
+2. **Adopt hashing progress.** `Init -InitMode Adopt` on a throwaway tree, the
+   case #43 is about (it hashes before printing anything).
+3. **Up.** Writes two new utf8 text files, `Plan`, then `Push -ForcePush`
+   publishes them through the documented create sequence. A second edit plus
+   `Push -ForcePush` exercises the overwrite path, then re-reads Studio to
+   confirm the served bytes match.
+4. **Down.** Rewrites one probe file **on Studio** using the documented
+   `PUT /file` route (acting as a separate client), `Plan`, then
+   `Pull -ForcePull`, and confirms the local file now holds the Studio bytes.
+5. **Restore.** Confirms the Pull backup set reproduces the pre-pull local
+   bytes, and that a plain copy back restores the original hash. Also confirms
+   the Push backup set holds the **previous remote** bytes.
+6. **Fail-closed.** Locks a local file and confirms `Plan` still aborts with
+   non-zero exit *and* still printed the hashing line, so progress never
+   softens a failure.
+7. **Teardown.** Deletes the probe files from Studio via the documented
+   `DELETE /file` route and proves they are gone from `GET /files`, then
+   removes the temp workspace.
+
+Everything it creates lives under one GUID probe folder (`sync-live/<id>/`),
+so teardown removes exactly what setup made. It never creates a new Studio
+write route: it only calls the documented `PUT` / `DELETE` helpers the product
+already owns, and it never prints tokens, auth paths, or file contents.
+
+Cleanup behavior:
+
+- The temp workspace and scratch directory are removed at the end, including on
+  an early abort.
+- `-KeepWorkspace` leaves them in place for inspection.
+- `-SkipRemoteCleanup` leaves the probe files on Studio (for debugging a failed
+  teardown) instead of deleting them.
+
 
 **The run leaves sensitive state behind, so run it into a throwaway
 directory.** A live run creates a `.rundot-sync` workspace, which names every
@@ -81,10 +186,15 @@ not a license to leave workspace state lying around.
 | 7 | Unreadable local file aborts Plan | `tests/Manifest.Tests.ps1` + harness gate 7a/7b | Automated |
 | 8 | Plan without BASE refuses | `tests/SyncPlan.Tests.ps1`, `tests/Workspace.Tests.ps1` | Automated |
 | 9 | Plan shows `expiresAt` | `tests/SyncPlan.Tests.ps1` | Automated |
-| 10 | Mutation grep allows only documented `PUT /file` | `tests/NoRemoteMutation.Tests.ps1` + harness gate 10 | Automated |
+| 10 | Mutation grep allows only the documented write routes | `tests/NoRemoteMutation.Tests.ps1` + harness gate 10 | Automated |
 | 11 | Push without force refuses in a non-interactive run | `tests/Push.Tests.ps1` + live check | Both |
 | 12 | Push `-ForcePush` applies with remote backup and BASE update | `tests/Push.Tests.ps1` + live check | Both |
 | 13 | Push journals success and `push-backup` without secrets | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1` + live check | Both |
+| 14 | Binary create via documented place sequence | `tests/Acceptance.ps1` gate 14 + live check | Both |
+| 15 | Binary replace with remote backup | `tests/Acceptance.ps1` gate 15 + live check | Both |
+| 16 | Host-visible progress for hashing, download, and publish | `tests/Progress.Tests.ps1`, `tests/Manifest.Tests.ps1`, `tests/Snapshot.Tests.ps1` + `tests/Live-RoundTrip.ps1` | Both |
+| 17 | An oversize remote file is unverifiable, not a project-wide abort | `tests/Snapshot.Tests.ps1`, `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` + live check | Both |
+| 18 | A confirmed Push deletes one remote file with a backup and no secret in the journal | `tests/Push.Tests.ps1`, `tests/RemoteDelete.Tests.ps1`, `tests/Journal.Tests.ps1` + `tests/Live-RoundTrip.ps1` | Both |
 
 ### 1. Test suite green
 
@@ -105,8 +215,9 @@ Editing one tracked file in place, leaving BASE and REMOTE untouched, is the
 **Zero invented deletes** is structural, not incidental: `deleteRemoteCandidate`
 requires LOCAL to be genuinely absent (`A / - / A`). An edit in place cannot
 reach that row, so an unchanged-but-edited project cannot produce a delete
-candidate. Deletion candidates are also classification-only here — no command
-deletes anything (see gate 10 and the non-goals).
+candidate. A delete candidate is applied only by a confirmed `Push` with its own
+confirmation, a client-side hash guard, and a backup first ([delete.md](delete.md));
+`Pull` never deletes anything (see gate 10 and the non-goals).
 
 **Live check:** initialize a disposable project with `Init -InitMode FromRemote`,
 edit one file, run `Plan`. Expect exactly one `UPLOAD` row for that path, no
@@ -210,19 +321,22 @@ refuses `-AllowNoBase` entirely.
 `createdAt`, that an explicit TTL controls it, and that the console report
 prints it so expiry is visible rather than buried in the JSON.
 
-### 10. Mutation grep allows only documented `PUT /file`
+### 10. Mutation grep allows only the documented write routes
 
 `tests/NoRemoteMutation.Tests.ps1` scans `game-studio-sync.ps1`,
 `game-studio-export.ps1`, and `lib/**/*.ps1` for Studio write helpers: HTTP
-`PUT` outside `lib/RemoteWrite.ps1`, HTTP `DELETE`, `upload-url`, `upload-adopt`,
-`/move`, reachability to the non-product `StudioProbe`, and any `Set-*` /
-`Remove-*` function in `lib/RemoteApi.ps1`. The v0.2.0 milestone ships one
-documented write route: `PUT /file` in `lib/RemoteWrite.ps1`.
+`PUT` outside `lib/RemoteWrite.ps1`, HTTP `DELETE` outside
+`lib/RemoteDelete.ps1`, `upload-url`, `upload-adopt`, `/move`, reachability to
+the non-product `StudioProbe`, and any `Set-*` / `Remove-*` function in
+`lib/RemoteApi.ps1`. Two documented write routes exist: `PUT /file` in
+`lib/RemoteWrite.ps1` and `DELETE /file` in `lib/RemoteDelete.ps1`
+([push.md](push.md), [delete.md](delete.md)).
 
 The plan layer enforces publish policy at runtime:
-`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite may be
-applicable among remote-mutating rows, that every blocked remote-mutating row
-carries a reason, and that a download is not remote-mutating.
+`tests/SyncPlan.Tests.ps1` asserts that only a utf8 text overwrite and a
+route-allowed remote delete may be applicable among remote-mutating rows, that
+every blocked remote-mutating row carries a reason, and that a download is not
+remote-mutating.
 
 ### 11. Push without force refuses in a non-interactive run
 
@@ -265,14 +379,191 @@ it). Expect at least one `push` record with `status: success` and one
 `push-backup` record per backed-up path, with no credential or `"content"`
 patterns in the raw file.
 
-## What this milestone deliberately does not do
+### 14. Binary create via documented place sequence
 
-Confirmed absent, not merely undocumented:
+| Property | Evidence |
+| --- | --- |
+| Plan marks one applicable binary `upload` for a new path | `tests/SyncPlan.Tests.ps1`, `tests/Acceptance.ps1` gate 14 |
+| Non-interactive `Push` refuses before mutation | gate 14a |
+| `Push -ForcePush` places bytes at the planned path | gate 14b |
+| Journal records `push-binary` | gate 14b |
 
-- No remote create except the documented utf8 text overwrite route (`Push`).
-- No binary upload or adopt.
-- No automatic deletion, locally or remotely. `deleteLocalCandidate` leaves the
-  file in place; `deleteRemoteCandidate` is reported only.
+**Live check:** run the full harness on a disposable project. Before gate 2, the harness deletes unpublished files it previously wrote under `sync-acceptance/` so a re-run is not an extra upload. After gates 2–13, no other upload rows should remain. Gate 14 writes `sync-acceptance/acceptance-*.bin` (bytes that are not valid UTF-8),
+plans, declines a non-interactive push, then `-ForcePush` creates the file.
+Expect `BINARY` / `(binary create)` in the report, `BASE updated: true`, and a
+`push-binary` journal line for that path.
+
+### 15. Binary replace with remote backup (via `Push -LocalWins`)
+
+| Property | Evidence |
+| --- | --- |
+| Replace plans with `expectedRemoteHash` | `tests/SyncPlan.Tests.ps1` |
+| `Push -LocalWins -ForcePush` applies the replace | gate 15 |
+| Backup holds pre-replace remote bytes | gate 15 |
+| BASE records the new local hash and moves | gate 15 |
+| Journal records `push-backup` and `push-binary` | gate 15 |
+| A binary **replace** over the 2,000,000-byte read limit is refused before mutation | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
+| A binary **create** over the 2,000,000-byte read limit is published and verified from the upload `ETag` (#54) | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1`, `tests/Hashing.Tests.ps1`, `tests/Live-RoundTrip.ps1` |
+| An oversize **REMOTE** file no longer fails the snapshot; it is captured as `unverifiable` (path + size, no hash), reported under `UNVERIFIABLE`, and never treated as in sync (#57) | `tests/Snapshot.Tests.ps1`, `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+
+**Live check:** gate 15 rewrites the gate 14 file, plans one binary replace,
+and runs `Push -LocalWins -ForcePush` (the mode a real publish of a diverged
+tree uses). Expect `(binary replace)` in the `BINARY` section, `BASE updated:
+true`, a backup whose SHA matches the pre-replace remote content (not the new
+local bytes), and both journal events. The fully automatic
+`tests/Live-RoundTrip.ps1 -BinaryAssetPath <real image>` covers the same ground
+with a real image and a direct remote read-back hash, including a
+post-move failure-evidence block.
+
+The same live run publishes an **oversize create** (`<read limit> + 4096` bytes)
+and asserts it is selected as a create, BASE moves, and `GET /files` lists it at
+the expected size. It cannot read the bytes back — that is the whole point — so
+the ETag verify inside the place sequence is what makes the gate pass
+([binary-place-protocol.md](binary-place-protocol.md)).
+
+The read limit is the reason a replace must be verified rather than assumed:
+`GET /file` returns 413 above 2,000,000 bytes, so the place could succeed while
+the read-back cannot. A create is different: the upload `ETag` carries the MD5
+of the stored bytes, so it is verifiable at any size (#54,
+[binary-place.md](binary-place.md)).
+
+### 16. Host-visible progress for hashing, download, and publish
+
+| Property | Evidence |
+| --- | --- |
+| Plain start and final lines for local hashing | `tests/Progress.Tests.ps1`, `tests/Manifest.Tests.ps1` |
+| Plain start and final lines for remote download | `tests/Progress.Tests.ps1`, `tests/Snapshot.Tests.ps1` |
+| Intermediate lines are throttled; `-Force` bypasses it | `tests/Progress.Tests.ps1` |
+| Each published path is named with applied/remaining counts | `tests/Progress.Tests.ps1`, `tests/Push.Tests.ps1`, `tests/Pull.Tests.ps1` |
+| Progress carries a path and integers only, never tokens or contents | `tests/Progress.Tests.ps1`, source scan |
+| A progress write never softens fail-closed behavior | `tests/Manifest.Tests.ps1`, `tests/Push.Tests.ps1`, live round-trip |
+| The CLI requests progress for Init, Plan/Status, Pull, and Push | `tests/SyncCli.Tests.ps1` |
+
+The plain lines are what make progress visible in hosts that hide
+`Write-Progress`; the bar is still updated where the host shows it. The output
+contract is asserted on captured CLI output by `tests/Live-RoundTrip.ps1`, so
+it holds end to end rather than only at the helper boundary.
+
+**Live check:** run `tests/Live-RoundTrip.ps1 -ProjectId <id>`. Expect every
+`progress lines: ...` step to pass, and the fail-closed step to pass with a
+non-zero exit for the locked file.
+
+### 17. An oversize remote file is unverifiable, not a project-wide abort (#57)
+
+| Property | Evidence |
+| --- | --- |
+| The snapshot captures an oversize remote path without calling `GET /file` | `tests/Snapshot.Tests.ps1` |
+| The captured entry carries the listed size, no hash, and no staged bytes | `tests/Snapshot.Tests.ps1` |
+| The rest of the snapshot still downloads and hashes readable files | `tests/Snapshot.Tests.ps1` |
+| An oversize remote path classifies as `unverifiable`, never `unchanged` | `tests/SyncEngine.Tests.ps1` |
+| A declared hash on an oversize remote is not treated as agreement | `tests/SyncEngine.Tests.ps1` |
+| A guessed remote kind never escalates an unverifiable path to `conflict` | `tests/SyncEngine.Tests.ps1` |
+| An unverifiable path is never applicable: Pull never downloads it, Push never rewrites it | `tests/SyncEngine.Tests.ps1`, `tests/Pull.Tests.ps1`, `tests/Push.Tests.ps1` |
+| Plan reports it under `UNVERIFIABLE` and counts it in the summary, never as `UNCHANGED` | `tests/SyncPlan.Tests.ps1` |
+| An oversize binary **create** (remote absent) still publishes via the `ETag` route | `tests/SyncEngine.Tests.ps1`, `tests/Push.Tests.ps1` |
+| An oversize binary **replace** stays refused with its own reason | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+
+**Live check:** on a project that already contains an oversize file, `Plan`
+completes and lists the path under `UNVERIFIABLE` with its size, `Pull` leaves it
+untouched, and a `Push` of other paths in the same run still applies. The
+[#57](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/57) bug was
+observed exactly here: two 2,254,917-byte PNGs placed by an earlier `Push` made
+every later `Plan`/`Push` fail until they were captured as unverifiable.
+
+### 18. A confirmed Push deletes one remote file, with a backup and no secret in the journal
+
+| Property | Evidence |
+| --- | --- |
+| A removed local file plans as `deleteRemoteCandidate` (`BASE=A LOCAL=— REMOTE=A`) | `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+| A non-interactive default `Push` refuses before any `DELETE` | `tests/Push.Tests.ps1`, live check |
+| `Push -ForcePush` sends the documented `DELETE /file` and proves the path absent from `GET /files` | `tests/RemoteDelete.Tests.ps1`, `tests/Push.Tests.ps1`, live check |
+| The pre-delete remote bytes are backed up before the `DELETE` | `tests/Push.Tests.ps1`, `tests/Backup.Tests.ps1`, live check |
+| The deleted path is dropped from BASE | `tests/Push.Tests.ps1`, live check |
+| The journal records `push-delete` with metadata only | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1`, live check |
+| A reserved or directory-shaped path is refused before any request | `tests/RemoteDelete.Tests.ps1` |
+| A `404` is success only when the path is absent from `GET /files` | `tests/RemoteDelete.Tests.ps1`, `tests/Push.Tests.ps1` |
+
+**Live check:** `tests/Live-RoundTrip.ps1` publishes probe B in its UP phase,
+removes the local copy, and confirms the delete end to end. `Plan` reports one
+`deleteRemoteCandidate`; a non-interactive default `Push` exits non-zero and the
+file is still listed; `Push -ForcePush` reports `deleted ≥ 1`, moves BASE, and
+the file is gone from `GET /files`. The delete backup holds the pre-delete
+remote bytes, and `journal.jsonl` carries a `push-delete` record for the path
+with no credential or `"content"` pattern.
+
+The production publish recorded below exercised the same route for real: the
+remote tree was a subset of LOCAL, so it had zero delete candidates, and the
+gate is proven by the live round-trip plus the unit coverage instead.
+
+## Production publish acceptance (v0.3.0, #44)
+
+The gate above is proven on a disposable project. This section records the
+**real** publish that closed the milestone: a diverged local tree was published
+to a live Studio project through the documented routes only.
+
+The tree was a 931-file `dev` folder that was a complete superset of the live
+project. Its own `.gitignore` excluded 70 paths (~946 MB) that the tool's fixed
+ignore set still treated as candidates, including a `.env.local` secret; those
+were moved out of the tree before the run rather than uploaded. That gap is the
+reason for the follow-up in [ROADMAP.md](../ROADMAP.md) on honoring a present
+`.gitignore`.
+
+`Init -InitMode Adopt` recorded the proven matches. `Plan` on the 931-file tree
+reported 550 `synchronized-addition`, 56 `unchanged`, 268 binary `upload`, 55
+`conflict`, and 2 `unverifiable`, with zero `deleteRemoteCandidate` — the remote
+tree was a subset, so `-LocalWins` deleted nothing.
+
+Publishing ran as `Push -ForcePush` for the clean utf8 rows, then
+`Push -LocalWins` for the creates, binaries, and confirmed conflicts. A
+20-minute plan TTL means one artifact cannot cover a 268-binary publish: the
+first run published 191 actions and refused the remaining 132 with
+`this plan has expired`, so the run re-planned and resumed. Re-planning resolved
+every expiry refusal, and no path was refused for any reason other than the
+2,000,000-character editor limit noted below.
+
+Final `Plan` after the publish:
+
+```text
+total: 931
+upload: 0
+download: 0
+conflict: 1
+deleteRemoteCandidate: 0
+deleteLocalCandidate: 0
+ignored: 0
+unchanged: 373
+synchronized-addition: 550
+unverifiable: 7
+applicable: 0
+```
+
+The single remaining `conflict` is `docs/plaque-attack/STATUS.md`, whose text
+exceeds Studio's 2,000,000-character editor limit, so the documented `PUT`
+refuses it before writing. The 7 `unverifiable` paths are binaries over the
+2,000,000-byte read limit; each was published as a **create** and verified from
+the presigned upload `ETag` ([binary-place.md](binary-place.md)), and a later
+`Plan` cannot read them back, so they are reported `UNVERIFIABLE` rather than
+`UNCHANGED` (gate 17).
+
+| What the record shows | Where |
+| --- | --- |
+| Text overwrites and creates published through `PUT /file` and the create sequence | `.rundot-sync/journal.jsonl`, `push` records |
+| 270 binary places, including oversize creates, through the place sequence | `journal.jsonl`, `push-binary` records |
+| 54 remote originals backed up before overwrite or delete | `journal.jsonl`, `push-backup` records |
+| Backup sets on disk for every overwritten remote original | `.rundot-sync/backups/<timestamp>/` |
+| No tokens, refresh tokens, or file contents in the journal | `journal.jsonl` secret scan |
+| No unconfirmed conflict clobbered | the single remaining `conflict` above |
+
+The publish is the acceptance evidence that a stranger can do the same on a
+disposable project: `Init` → `Plan` → confirmed `Push`, with Studio matching the
+confirmed paths, backups on disk, and every unconfirmed path untouched.
+
+## What this record deliberately does not claim
+
+- No content merge of a conflict, and no guessed sibling path as success.
+- No automatic local deletion. `deleteLocalCandidate` leaves the file in place.
+  A remote delete happens only through a confirmed `Push` delete
+  ([delete.md](delete.md)).
 - No `.rundotignore`. The default ignore set is fixed and documented.
 - No newline or encoding normalization; text is preserved byte-for-byte.
 - No FileSystemWatcher, device IDs, or multi-machine BASE. One initialized
@@ -285,7 +576,8 @@ Direction beyond this milestone is in [ROADMAP.md](../ROADMAP.md).
 - Initializing a workspace: [init.md](init.md)
 - Dry-run planning and the artifact: [plan.md](plan.md)
 - Applying remote-only changes: [pull.md](pull.md)
-- Publishing local text overwrites: [push.md](push.md)
+- Publishing local changes: [push.md](push.md)
+- Placing binaries: [binary-place.md](binary-place.md)
 - BASE ownership and atomic writes: [base-schema.md](base-schema.md)
 - Canonical paths, safety, and ignores: [path-safety.md](path-safety.md)
 - Torn-read protection: [remote-snapshot.md](remote-snapshot.md)

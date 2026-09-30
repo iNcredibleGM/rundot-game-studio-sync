@@ -1,18 +1,31 @@
-# Safe Push: publish clean local text overwrites to Studio.
+# Safe Push: publish clean local text overwrites, utf8 text creates, binary
+# places, and confirmed remote deletes; optional -LocalWins publish for
+# conflicts and remote-only paths after one confirmation.
 #
-# Push applies exactly one classification from a verified plan artifact: a clean
-# text overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set).
-# Creates, binaries, conflicts, kind mismatches, and deletes are refused.
+# Push applies four classifications from a verified plan artifact: a clean text
+# overwrite (BASE=A LOCAL=B REMOTE=A, utf8 kind, expectedRemoteHash set), a
+# utf8 text create (BASE=- LOCAL=A REMOTE=-, documented upload + move + PUT /file),
+# a binary create or replace (documented upload + move place sequence, #41), and
+# a remote delete (BASE=A LOCAL=- REMOTE=A, expectedRemoteHash set, path not
+# reserved and not directory-shaped). Conflicts and kind mismatches are refused.
+#
+# A delete cannot be made conditional: Studio exposes no ETag or version and
+# ignores If-Match (docs/delete-rename-protocol.md), so the guard is a client
+# re-read of the remote bytes immediately before the request, plus a backup of
+# those bytes first. A 404 after a 200 means the path is already absent, and
+# absence is proven from GET /files rather than from a status code.
 #
 # This file owns three layers:
 #
 #   1. validation   - plan artifact fingerprints and live state gates
 #   2. selection    - which plan rows Push may apply, and why the rest are not
-#   3. apply/BASE   - remote backup, per-file GET+PUT with echo verify, additive BASE
+#   3. apply/BASE   - remote backup, per-file GET+PUT with echo verify, DELETE
+#                     with absence verify, and the verified BASE update
 #
 # Callers must load Paths.ps1, Ignore.ps1, Hashing.ps1, Workspace.ps1,
 # Manifest.ps1, Snapshot.ps1, Classifier.ps1, Plan.ps1, Backup.ps1, Journal.ps1,
-# RemoteApi.ps1, RemoteWrite.ps1, and Push.ps1 first.
+# RemoteApi.ps1, RemoteWrite.ps1, RemoteDelete.ps1, RemoteUpload.ps1,
+# RemoteMove.ps1, RemoteTextCreate.ps1, RemoteBinaryPlace.ps1, and Push.ps1 first.
 
 
 # ----------------------------------------------------------------------------
@@ -177,13 +190,16 @@ function Get-SyncPushExclusionReason {
             return 'REMOTE no longer has this path while LOCAL still matches BASE. Push does not delete local content.'
         }
         $script:SyncStatusDeleteRemoteCandidate {
-            return $script:SyncPlanDeleteRemoteBlockedReason
+            return $script:SyncPlanDeleteRemoteRefusalReason
         }
         $script:SyncStatusIgnored {
             return $script:SyncIgnoredReason
         }
         $script:SyncStatusUnchanged {
             return 'BASE, LOCAL, and REMOTE all agree, so there is nothing to push.'
+        }
+        $script:SyncStatusUnverifiable {
+            return 'REMOTE is over Studio''s read limit, so its bytes cannot be read or hashed. Push never rewrites an unverifiable path.'
         }
         $script:SyncStatusSynchronizedChange {
             return 'LOCAL and REMOTE already agree on the new content, so there is nothing to push.'
@@ -200,9 +216,10 @@ function Get-SyncPushExclusionReason {
 }
 
 function Get-SyncPushSelection {
-    # Split the plan artifact into publishable text overwrites and everything
-    # else. Pure over the supplied maps except for the hard refusal when a row
-    # the plan marked applicable is no longer a clean upload.
+    # Split the plan artifact into publishable text overwrites, applicable
+    # remote deletes, and everything else. Pure over the supplied maps except
+    # for the hard refusal when a row the plan marked applicable is no longer
+    # the clean action it was planned as.
     param(
         [Parameter(Mandatory)]
         $Artifact,
@@ -213,14 +230,21 @@ function Get-SyncPushSelection {
     )
 
     $actions = New-Object 'System.Collections.Generic.List[object]'
+    $creates = New-Object 'System.Collections.Generic.List[object]'
+    $binaries = New-Object 'System.Collections.Generic.List[object]'
+    $deletes = New-Object 'System.Collections.Generic.List[object]'
     $excluded = New-Object 'System.Collections.Generic.List[object]'
+    $remotePaths = @(Get-SyncPlanRemotePaths -Remote $Remote)
 
     foreach ($operation in @($Artifact.operations)) {
         $path = [string]$operation.path
         $status = [string]$operation.status
         $applicable = [bool]$operation.applicable
 
-        if ($status -ne $script:SyncStatusUpload -or -not $applicable) {
+        $isUploadRow = ($status -eq $script:SyncStatusUpload -and $applicable)
+        $isDeleteRow = ($status -eq $script:SyncStatusDeleteRemoteCandidate -and $applicable)
+
+        if (-not $isUploadRow -and -not $isDeleteRow) {
             $excluded.Add([pscustomobject]@{
                 Path       = $path
                 Status     = $status
@@ -232,12 +256,71 @@ function Get-SyncPushSelection {
             continue
         }
 
+        $baseEntry = Get-SyncMapEntry -Map $Base -Path $path
+        $localEntry = Get-SyncMapEntry -Map $Local -Path $path
+        $remoteEntry = Get-SyncMapEntry -Map $Remote -Path $path
+
         $change = Get-SyncPlanChange `
             -Path $path `
-            -Base (Get-SyncMapEntry -Map $Base -Path $path) `
-            -Local (Get-SyncMapEntry -Map $Local -Path $path) `
-            -Remote (Get-SyncMapEntry -Map $Remote -Path $path)
+            -Base $baseEntry `
+            -Local $localEntry `
+            -Remote $remoteEntry
         $liveStatus = [string]$change.Status
+
+        if ($isDeleteRow) {
+            if ($liveStatus -ne $script:SyncStatusDeleteRemoteCandidate) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is no longer a remote delete candidate (now {1}). Re-run Plan." -f $path, $liveStatus)
+                )
+            }
+
+            # LOCAL must still be genuinely absent, and REMOTE must still match
+            # the verified BASE the plan was computed against. Otherwise the
+            # delete would remove content nobody agreed to remove.
+            if ($null -ne $localEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: LOCAL for '{0}' reappeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            $baseSha = [string](Get-SyncEntrySha256 -Entry $baseEntry)
+            $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+            if (-not (Test-SyncHashEqual -LeftSha256 $baseSha -RightSha256 $liveRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' no longer matches BASE. Re-run Plan." -f $path)
+                )
+            }
+
+            $expectedRemoteSha = [string]$operation.expectedRemoteHash
+            if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' has no expectedRemoteHash to verify before DELETE." -f $path)
+                )
+            }
+
+            if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+                )
+            }
+
+            # Defense in depth: the plan already refused a reserved or
+            # directory-shaped path, and the engine refuses it again against
+            # the live remote list rather than trusting the artifact.
+            Assert-SyncDeletePathAllowed `
+                -CanonicalPath $path `
+                -RemotePaths $remotePaths
+
+            $deletes.Add([pscustomobject]@{
+                Path               = $path
+                Status             = $status
+                ExpectedRemoteHash = $expectedRemoteSha
+                RemoteSha256       = $liveRemoteSha
+                RemotePaths        = @($remotePaths)
+            })
+
+            continue
+        }
 
         if ($liveStatus -ne $script:SyncStatusUpload) {
             throw [System.InvalidOperationException]::new(
@@ -251,17 +334,7 @@ function Get-SyncPushSelection {
             )
         }
 
-        $localEntry = Get-SyncMapEntry -Map $Local -Path $path
-        $remoteEntry = Get-SyncMapEntry -Map $Remote -Path $path
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
-        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
-
-        if ($localKind -ne 'utf8' -or $remoteKind -ne 'utf8') {
-            throw [System.InvalidOperationException]::new(
-                ("Refusing to push: '{0}' is not a utf8 text overwrite." -f $path)
-            )
-        }
-
         $planLocalSha = [string]$operation.localSha256
         $liveLocalSha = [string](Get-SyncEntrySha256 -Entry $localEntry)
         if (-not (Test-SyncHashEqual -LeftSha256 $planLocalSha -RightSha256 $liveLocalSha)) {
@@ -271,13 +344,150 @@ function Get-SyncPushSelection {
         }
 
         $expectedRemoteSha = [string]$operation.expectedRemoteHash
-        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+        $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+        $localSizeValue = 0
+        if ($null -ne $localSize) {
+            $localSizeValue = [int64]$localSize
+        }
+
         if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+            if ($localKind -eq 'binary') {
+                if ($null -ne $baseEntry) {
+                    throw [System.InvalidOperationException]::new(
+                        ("Refusing to push: BASE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                    )
+                }
+
+                if ($null -ne $remoteEntry) {
+                    throw [System.InvalidOperationException]::new(
+                        ("Refusing to push: REMOTE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                    )
+                }
+
+                if ($localSizeValue -le 0) {
+                    throw [System.InvalidOperationException]::new(
+                        ("Refusing to push: '{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+                    )
+                }
+
+                # An oversize binary CREATE is publishable: the place sequence
+                # verifies it from the upload ETag rather than a read-back
+                # (#54). An oversize REPLACE is still refused below.
+
+                $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                    -CanonicalPath $path `
+                    -RemotePaths $remotePaths
+                if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                    throw [System.InvalidOperationException]::new(
+                        ("Refusing to push: '{0}' is no longer a publishable binary create. {1}" -f $path, $placeRefusal)
+                    )
+                }
+
+                $binaries.Add([pscustomobject]@{
+                    Path        = $path
+                    Status      = $status
+                    Kind        = $localKind
+                    Mode        = 'create'
+                    LocalSha256 = $planLocalSha
+                })
+
+                continue
+            }
+
+            if ($localKind -ne 'utf8') {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is not a utf8 text create." -f $path)
+                )
+            }
+
+            if ($null -ne $baseEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: BASE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            if ($null -ne $remoteEntry) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+                )
+            }
+
+            $createRefusal = Get-SyncTextCreatePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $remotePaths
+            if (-not [string]::IsNullOrEmpty($createRefusal)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is no longer a publishable text create. {1}" -f $path, $createRefusal)
+                )
+            }
+
+            $creates.Add([pscustomobject]@{
+                Path        = $path
+                Status      = $status
+                Kind        = $localKind
+                LocalSha256 = $planLocalSha
+            })
+
+            continue
+        }
+
+        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
+
+        if ($localKind -eq 'binary') {
+            if ($remoteKind -ne 'binary') {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is not a binary replace." -f $path)
+                )
+            }
+
+            if ($localSizeValue -le 0) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+                )
+            }
+
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
+                )
+            }
+
+            $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $remotePaths
+            if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: '{0}' is no longer a publishable binary replace. {1}" -f $path, $placeRefusal)
+                )
+            }
+
+            $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+            if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+                throw [System.InvalidOperationException]::new(
+                    ("Refusing to push: REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+                )
+            }
+
+            $binaries.Add([pscustomobject]@{
+                Path               = $path
+                Status             = $status
+                Kind               = $localKind
+                Mode               = 'replace'
+                LocalSha256        = $planLocalSha
+                ExpectedRemoteHash = $expectedRemoteSha
+                RemoteSha256       = $liveRemoteSha
+            })
+
+            continue
+        }
+
+        if ($localKind -ne 'utf8' -or $remoteKind -ne 'utf8') {
             throw [System.InvalidOperationException]::new(
-                ("Refusing to push: '{0}' has no expectedRemoteHash to verify." -f $path)
+                ("Refusing to push: '{0}' is not a utf8 text overwrite." -f $path)
             )
         }
 
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
         if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
             throw [System.InvalidOperationException]::new(
                 ("Refusing to push: REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
@@ -299,14 +509,644 @@ function Get-SyncPushSelection {
         $actionRows = $actions.ToArray()
     }
 
+    $createRows = @()
+    if ($creates.Count -gt 0) {
+        $createRows = $creates.ToArray()
+    }
+
+    $deleteRows = @()
+    if ($deletes.Count -gt 0) {
+        $deleteRows = $deletes.ToArray()
+    }
+
+    $binaryRows = @()
+    if ($binaries.Count -gt 0) {
+        $binaryRows = $binaries.ToArray()
+    }
+
     $excludedRows = @()
     if ($excluded.Count -gt 0) {
         $excludedRows = $excluded.ToArray()
     }
 
     return [pscustomobject]@{
-        Actions  = $actionRows
-        Excluded = $excludedRows
+        Actions       = $actionRows
+        CreateActions = $createRows
+        BinaryActions = $binaryRows
+        DeleteActions = $deleteRows
+        Excluded      = $excludedRows
+    }
+}
+
+function Add-SyncPushLocalWinsExcludedRow {
+    param(
+        $ExcludedList,
+
+        [string]$Path,
+        [string]$Status,
+        [string]$Reason,
+
+        [bool]$Ignored = $false,
+        [bool]$KindChange = $false
+    )
+
+    [void]$ExcludedList.Add([pscustomobject]@{
+        Path       = $Path
+        Status     = $Status
+        Reason     = $Reason
+        Ignored    = $Ignored
+        KindChange = $KindChange
+    })
+}
+
+function Get-SyncPushLocalWinsPlanDriftReason {
+    param(
+        [string]$PlanStatus,
+        [string]$LiveStatus
+    )
+
+    if ([string]::Equals($PlanStatus, $LiveStatus, [System.StringComparison]::Ordinal)) {
+        return $null
+    }
+
+    return ("Path no longer matches plan status (now {0}). Re-run Plan." -f $LiveStatus)
+}
+
+function Add-SyncPushLocalWinsDeleteAction {
+    param(
+        $DeletesList,
+        [string]$Path,
+        [string]$Status,
+        [string]$ExpectedRemoteSha,
+        [string]$LiveRemoteSha,
+        [object[]]$RemotePaths
+    )
+
+    $refusal = Get-SyncDeletePathRefusalReason `
+        -CanonicalPath $Path `
+        -RemotePaths $RemotePaths
+    if (-not [string]::IsNullOrEmpty($refusal)) {
+        return $refusal
+    }
+
+    if ([string]::IsNullOrEmpty($ExpectedRemoteSha)) {
+        return ("'{0}' has no expectedRemoteHash to verify before DELETE." -f $Path)
+    }
+
+    if (-not (Test-SyncHashEqual -LeftSha256 $ExpectedRemoteSha -RightSha256 $LiveRemoteSha)) {
+        return ("REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $Path)
+    }
+
+    [void]$DeletesList.Add([pscustomobject]@{
+        Path               = $Path
+        Status             = $Status
+        ExpectedRemoteHash = $ExpectedRemoteSha
+        RemoteSha256       = $LiveRemoteSha
+        RemotePaths        = @($RemotePaths)
+    })
+
+    return $null
+}
+
+function Get-SyncPushLocalWinsStandardRow {
+    # Same publish rules as default Push, but drift becomes an exclusion reason
+    # instead of aborting the whole run.
+    param(
+        $Operation,
+        $BaseEntry,
+        $LocalEntry,
+        $RemoteEntry,
+        $Change,
+        [object[]]$RemotePaths,
+        $ActionsList,
+        $CreatesList,
+        $BinariesList,
+        $DeletesList
+    )
+
+    $path = [string]$Operation.path
+    $status = [string]$Operation.status
+    $liveStatus = [string]$Change.Status
+    $applicable = [bool]$Operation.applicable
+
+    $isUploadRow = ($status -eq $script:SyncStatusUpload -and $applicable)
+    $isDeleteRow = ($status -eq $script:SyncStatusDeleteRemoteCandidate -and $applicable)
+
+    if (-not $isUploadRow -and -not $isDeleteRow) {
+        return ''
+    }
+
+    if ($isDeleteRow) {
+        if ($liveStatus -ne $script:SyncStatusDeleteRemoteCandidate) {
+            return ("'{0}' is no longer a remote delete candidate (now {1}). Re-run Plan." -f $path, $liveStatus)
+        }
+
+        if ($null -ne $localEntry) {
+            return ("LOCAL for '{0}' reappeared since this plan was created. Re-run Plan." -f $path)
+        }
+
+        $baseSha = [string](Get-SyncEntrySha256 -Entry $baseEntry)
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+        if (-not (Test-SyncHashEqual -LeftSha256 $baseSha -RightSha256 $liveRemoteSha)) {
+            return ("REMOTE for '{0}' no longer matches BASE. Re-run Plan." -f $path)
+        }
+
+        $expectedRemoteSha = [string]$Operation.expectedRemoteHash
+        return (Add-SyncPushLocalWinsDeleteAction `
+            -DeletesList $DeletesList `
+            -Path $path `
+            -Status $status `
+            -ExpectedRemoteSha $expectedRemoteSha `
+            -LiveRemoteSha $liveRemoteSha `
+            -RemotePaths $RemotePaths)
+    }
+
+    if ($liveStatus -ne $script:SyncStatusUpload) {
+        return ("'{0}' is no longer an upload candidate (now {1}). Re-run Plan." -f $path, $liveStatus)
+    }
+
+    if ([bool]$Change.KindChange) {
+        return ("'{0}' has an unsupported kind change. Re-run Plan." -f $path)
+    }
+
+    $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
+    $planLocalSha = [string]$Operation.localSha256
+    $liveLocalSha = [string](Get-SyncEntrySha256 -Entry $localEntry)
+    if (-not (Test-SyncHashEqual -LeftSha256 $planLocalSha -RightSha256 $liveLocalSha)) {
+        return ("LOCAL for '{0}' changed since this plan was created. Re-run Plan." -f $path)
+    }
+
+    $expectedRemoteSha = [string]$Operation.expectedRemoteHash
+    $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+    $localSizeValue = 0
+    if ($null -ne $localSize) {
+        $localSizeValue = [int64]$localSize
+    }
+
+    if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+        if ($localKind -eq 'binary') {
+            if ($null -ne $baseEntry) {
+                return ("BASE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+            }
+
+            if ($null -ne $remoteEntry) {
+                return ("REMOTE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+            }
+
+            if ($localSizeValue -le 0) {
+                return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+            }
+
+            # An oversize binary CREATE is publishable: the place sequence
+            # verifies it from the upload ETag rather than a read-back (#54).
+
+            $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $RemotePaths
+            if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                return ("'{0}' is no longer a publishable binary create. {1}" -f $path, $placeRefusal)
+            }
+
+            [void]$BinariesList.Add([pscustomobject]@{
+                Path        = $path
+                Status      = $status
+                Kind        = $localKind
+                Mode        = 'create'
+                LocalSha256 = $planLocalSha
+            })
+
+            return $null
+        }
+
+        if ($localKind -ne 'utf8') {
+            return ("'{0}' is not a utf8 text create." -f $path)
+        }
+
+        if ($null -ne $baseEntry) {
+            return ("BASE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+        }
+
+        if ($null -ne $remoteEntry) {
+            return ("REMOTE for '{0}' appeared since this plan was created. Re-run Plan." -f $path)
+        }
+
+        $createRefusal = Get-SyncTextCreatePathRefusalReason `
+            -CanonicalPath $path `
+            -RemotePaths $RemotePaths
+        if (-not [string]::IsNullOrEmpty($createRefusal)) {
+            return ("'{0}' is no longer a publishable text create. {1}" -f $path, $createRefusal)
+        }
+
+        [void]$CreatesList.Add([pscustomobject]@{
+            Path        = $path
+            Status      = $status
+            Kind        = $localKind
+            LocalSha256 = $planLocalSha
+        })
+
+        return $null
+    }
+
+    $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
+
+    if ($localKind -eq 'binary') {
+        if ($remoteKind -ne 'binary') {
+            return ("'{0}' is not a binary replace." -f $path)
+        }
+
+        if ($localSizeValue -le 0) {
+            return ("'{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+        }
+
+        if (Test-SyncOversizeSize -Size $localSizeValue) {
+            return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
+        }
+
+        $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+            -CanonicalPath $path `
+            -RemotePaths $RemotePaths
+        if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+            return ("'{0}' is no longer a publishable binary replace. {1}" -f $path, $placeRefusal)
+        }
+
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+        if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+            return ("REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+        }
+
+        [void]$BinariesList.Add([pscustomobject]@{
+            Path               = $path
+            Status             = $status
+            Kind               = $localKind
+            Mode               = 'replace'
+            LocalSha256        = $planLocalSha
+            ExpectedRemoteHash = $expectedRemoteSha
+            RemoteSha256       = $liveRemoteSha
+        })
+
+        return $null
+    }
+
+    if ($localKind -ne 'utf8' -or $remoteKind -ne 'utf8') {
+        return ("'{0}' is not a utf8 text overwrite." -f $path)
+    }
+
+    $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+    if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+        return ("REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+    }
+
+    [void]$ActionsList.Add([pscustomobject]@{
+        Path               = $path
+        Status             = $status
+        Kind               = $localKind
+        LocalSha256        = $planLocalSha
+        ExpectedRemoteHash = $expectedRemoteSha
+        RemoteSha256       = $liveRemoteSha
+    })
+
+    return $null
+}
+
+function Get-SyncPushLocalWinsConflictRow {
+    param(
+        $Operation,
+        $BaseEntry,
+        $LocalEntry,
+        $RemoteEntry,
+        $Change,
+        [object[]]$RemotePaths,
+        $ActionsList,
+        $CreatesList,
+        $BinariesList,
+        $DeletesList
+    )
+
+    $path = [string]$Operation.path
+    $status = [string]$Operation.status
+    $planLocalSha = [string]$Operation.localSha256
+    $expectedRemoteSha = [string]$Operation.expectedRemoteHash
+
+    if ([bool]$Operation.kindChange -or [bool]$Change.KindChange) {
+        return $script:SyncKindChangeReason
+    }
+
+    $liveLocalSha = [string](Get-SyncEntrySha256 -Entry $localEntry)
+    if (-not [string]::IsNullOrEmpty($planLocalSha) -and $null -ne $localEntry) {
+        if (-not (Test-SyncHashEqual -LeftSha256 $planLocalSha -RightSha256 $liveLocalSha)) {
+            return ("LOCAL for '{0}' changed since this plan was created. Re-run Plan." -f $path)
+        }
+    }
+
+    $hasLocal = ($null -ne $localEntry)
+    $hasRemote = ($null -ne $remoteEntry)
+
+    if ($hasLocal -and $hasRemote) {
+        $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
+        $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+
+        if (-not [string]::IsNullOrEmpty($expectedRemoteSha)) {
+            if (-not (Test-SyncHashEqual -LeftSha256 $expectedRemoteSha -RightSha256 $liveRemoteSha)) {
+                return ("REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $path)
+            }
+        }
+        else {
+            $expectedRemoteSha = $liveRemoteSha
+        }
+
+        if ($localKind -eq 'utf8' -and $remoteKind -eq 'utf8') {
+            [void]$ActionsList.Add([pscustomobject]@{
+                Path               = $path
+                Status             = $status
+                Kind               = $localKind
+                LocalSha256        = $planLocalSha
+                ExpectedRemoteHash = $expectedRemoteSha
+                RemoteSha256       = $liveRemoteSha
+            })
+
+            return $null
+        }
+
+        if ($localKind -eq 'binary' -and $remoteKind -eq 'binary') {
+            $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+            $localSizeValue = 0
+            if ($null -ne $localSize) {
+                $localSizeValue = [int64]$localSize
+            }
+
+            if ($localSizeValue -le 0) {
+                return ("'{0}' is not a publishable binary replace. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+            }
+
+            if (Test-SyncOversizeSize -Size $localSizeValue) {
+                return ("'{0}' is over Studio's read limit. {1}" -f $path, (Get-SyncOversizeReplaceRefusalReason -Size $localSizeValue))
+            }
+
+            $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $RemotePaths
+            if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                return ("'{0}' is not a publishable binary replace. {1}" -f $path, $placeRefusal)
+            }
+
+            [void]$BinariesList.Add([pscustomobject]@{
+                Path               = $path
+                Status             = $status
+                Kind               = $localKind
+                Mode               = 'replace'
+                LocalSha256        = $planLocalSha
+                ExpectedRemoteHash = $expectedRemoteSha
+                RemoteSha256       = $liveRemoteSha
+            })
+
+            return $null
+        }
+
+        return ("'{0}' is not a publishable local-wins overwrite (unsupported kind pairing)." -f $path)
+    }
+
+    if ($hasLocal -and -not $hasRemote) {
+        $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
+        $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
+        $localSizeValue = 0
+        if ($null -ne $localSize) {
+            $localSizeValue = [int64]$localSize
+        }
+
+        if ($localKind -eq 'utf8') {
+            $createRefusal = Get-SyncTextCreatePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $RemotePaths
+            if (-not [string]::IsNullOrEmpty($createRefusal)) {
+                return ("'{0}' is not a publishable text create. {1}" -f $path, $createRefusal)
+            }
+
+            [void]$CreatesList.Add([pscustomobject]@{
+                Path        = $path
+                Status      = $status
+                Kind        = $localKind
+                LocalSha256 = $planLocalSha
+            })
+
+            return $null
+        }
+
+        if ($localKind -eq 'binary') {
+            if ($localSizeValue -le 0) {
+                return ("'{0}' is not a publishable binary create. {1}" -f $path, $script:SyncPlanBinaryEmptyReason)
+            }
+
+            # An oversize binary CREATE is publishable: the place sequence
+            # verifies it from the upload ETag rather than a read-back (#54).
+
+            $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
+                -CanonicalPath $path `
+                -RemotePaths $RemotePaths
+            if (-not [string]::IsNullOrEmpty($placeRefusal)) {
+                return ("'{0}' is not a publishable binary create. {1}" -f $path, $placeRefusal)
+            }
+
+            [void]$BinariesList.Add([pscustomobject]@{
+                Path        = $path
+                Status      = $status
+                Kind        = $localKind
+                Mode        = 'create'
+                LocalSha256 = $planLocalSha
+            })
+
+            return $null
+        }
+
+        return ("'{0}' is not a publishable local-wins create." -f $path)
+    }
+
+    if (-not $hasLocal -and $hasRemote) {
+        $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+        if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+            $expectedRemoteSha = $liveRemoteSha
+        }
+
+        return (Add-SyncPushLocalWinsDeleteAction `
+            -DeletesList $DeletesList `
+            -Path $path `
+            -Status $status `
+            -ExpectedRemoteSha $expectedRemoteSha `
+            -LiveRemoteSha $liveRemoteSha `
+            -RemotePaths $RemotePaths)
+    }
+
+    return $script:SyncConflictReason
+}
+
+function Get-SyncPushLocalWinsRemoteOnlyDownloadRow {
+    param(
+        $Operation,
+        $LocalEntry,
+        $RemoteEntry,
+        [object[]]$RemotePaths,
+        $DeletesList
+    )
+
+    $path = [string]$Operation.path
+    $status = [string]$Operation.status
+
+    if ($null -ne $localEntry) {
+        return 'REMOTE differs from BASE while LOCAL still matches BASE. Push never downloads remote content.'
+    }
+
+    if ($null -eq $remoteEntry) {
+        return ("REMOTE for '{0}' is absent. Re-run Plan." -f $path)
+    }
+
+    $expectedRemoteSha = [string]$Operation.expectedRemoteHash
+    $liveRemoteSha = [string](Get-SyncEntrySha256 -Entry $remoteEntry)
+    if ([string]::IsNullOrEmpty($expectedRemoteSha)) {
+        $expectedRemoteSha = $liveRemoteSha
+    }
+
+    return (Add-SyncPushLocalWinsDeleteAction `
+        -DeletesList $DeletesList `
+        -Path $path `
+        -Status $status `
+        -ExpectedRemoteSha $expectedRemoteSha `
+        -LiveRemoteSha $liveRemoteSha `
+        -RemotePaths $RemotePaths)
+}
+
+function Get-SyncPushLocalWinsSelection {
+    # Local-wins publish: default applicable rows plus conflicts (not kind
+    # change) and remote-only downloads, with drift as per-path exclusion.
+    param(
+        [Parameter(Mandatory)]
+        $Artifact,
+
+        $Base,
+        $Local,
+        $Remote
+    )
+
+    $actions = New-Object 'System.Collections.Generic.List[object]'
+    $creates = New-Object 'System.Collections.Generic.List[object]'
+    $binaries = New-Object 'System.Collections.Generic.List[object]'
+    $deletes = New-Object 'System.Collections.Generic.List[object]'
+    $excluded = New-Object 'System.Collections.Generic.List[object]'
+    $remotePaths = @(Get-SyncPlanRemotePaths -Remote $Remote)
+
+    foreach ($operation in @($Artifact.operations)) {
+        $path = [string]$operation.path
+        $planStatus = [string]$operation.status
+
+        $baseEntry = Get-SyncMapEntry -Map $Base -Path $path
+        $localEntry = Get-SyncMapEntry -Map $Local -Path $path
+        $remoteEntry = Get-SyncMapEntry -Map $Remote -Path $path
+
+        $change = Get-SyncPlanChange `
+            -Path $path `
+            -Base $baseEntry `
+            -Local $localEntry `
+            -Remote $remoteEntry
+        $liveStatus = [string]$change.Status
+
+        $driftReason = Get-SyncPushLocalWinsPlanDriftReason `
+            -PlanStatus $planStatus `
+            -LiveStatus $liveStatus
+        if (-not [string]::IsNullOrEmpty($driftReason)) {
+            Add-SyncPushLocalWinsExcludedRow `
+                -ExcludedList $excluded `
+                -Path $path `
+                -Status $planStatus `
+                -Reason $driftReason `
+                -Ignored ([bool]$operation.ignored) `
+                -KindChange ([bool]$operation.kindChange)
+            continue
+        }
+
+        $standardOutcome = Get-SyncPushLocalWinsStandardRow `
+            -Operation $operation `
+            -BaseEntry $baseEntry `
+            -LocalEntry $localEntry `
+            -RemoteEntry $remoteEntry `
+            -Change $change `
+            -RemotePaths $remotePaths `
+            -ActionsList $actions `
+            -CreatesList $creates `
+            -BinariesList $binaries `
+            -DeletesList $deletes
+        if ($standardOutcome -is [string] -and -not [string]::IsNullOrEmpty($standardOutcome)) {
+            Add-SyncPushLocalWinsExcludedRow `
+                -ExcludedList $excluded `
+                -Path $path `
+                -Status $planStatus `
+                -Reason $standardOutcome `
+                -Ignored ([bool]$operation.ignored) `
+                -KindChange ([bool]$operation.kindChange)
+            continue
+        }
+
+        if ($standardOutcome -eq $null) {
+            continue
+        }
+
+        if ($liveStatus -eq $script:SyncStatusConflict) {
+            $rowReason = Get-SyncPushLocalWinsConflictRow `
+                -Operation $operation `
+                -BaseEntry $baseEntry `
+                -LocalEntry $localEntry `
+                -RemoteEntry $remoteEntry `
+                -Change $change `
+                -RemotePaths $remotePaths `
+                -ActionsList $actions `
+                -CreatesList $creates `
+                -BinariesList $binaries `
+                -DeletesList $deletes
+            if ($null -ne $rowReason) {
+                Add-SyncPushLocalWinsExcludedRow `
+                    -ExcludedList $excluded `
+                    -Path $path `
+                    -Status $planStatus `
+                    -Reason $rowReason `
+                    -Ignored ([bool]$operation.ignored) `
+                    -KindChange ([bool]$operation.kindChange)
+            }
+            continue
+        }
+
+        if ($liveStatus -eq $script:SyncStatusDownload) {
+            $rowReason = Get-SyncPushLocalWinsRemoteOnlyDownloadRow `
+                -Operation $operation `
+                -LocalEntry $localEntry `
+                -RemoteEntry $remoteEntry `
+                -RemotePaths $remotePaths `
+                -DeletesList $deletes
+            if ($null -ne $rowReason) {
+                Add-SyncPushLocalWinsExcludedRow `
+                    -ExcludedList $excluded `
+                    -Path $path `
+                    -Status $planStatus `
+                    -Reason $rowReason `
+                    -Ignored ([bool]$operation.ignored) `
+                    -KindChange ([bool]$operation.kindChange)
+            }
+            continue
+        }
+
+        Add-SyncPushLocalWinsExcludedRow `
+            -ExcludedList $excluded `
+            -Path $path `
+            -Status $planStatus `
+            -Reason (Get-SyncPushExclusionReason -PlanOperation $operation) `
+            -Ignored ([bool]$operation.ignored) `
+            -KindChange ([bool]$operation.kindChange)
+    }
+
+    return [pscustomobject]@{
+        Actions       = @($actions.ToArray())
+        CreateActions = @($creates.ToArray())
+        BinaryActions = @($binaries.ToArray())
+        DeleteActions = @($deletes.ToArray())
+        Excluded      = @($excluded.ToArray())
+        LocalWins     = $true
     }
 }
 
@@ -324,24 +1164,6 @@ function Get-LocalUtf8TextForPush {
     $bytes = [System.IO.File]::ReadAllBytes($LiteralPath)
     $utf8 = New-Object System.Text.UTF8Encoding $false
     return $utf8.GetString($bytes)
-}
-
-function Get-RemoteFileContentSha256 {
-    param(
-        [Parameter(Mandatory)]
-        $Response
-    )
-
-    $bytes = ConvertFrom-RemoteFileContent -Response $Response
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($bytes)
-    }
-    finally {
-        $sha.Dispose()
-    }
-
-    return [System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
 }
 
 function Assert-SyncPushLocalUnchanged {
@@ -370,6 +1192,19 @@ function Assert-SyncPushLocalUnchanged {
     }
 }
 
+function Get-SyncPushDefaultRemoteFileReader {
+    # The real GET used when a caller injects no reader. Shared so the read
+    # route cannot drift between the overwrite and delete paths.
+    return {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        Get-RemoteProjectFile `
+            -StudioOrigin $Origin `
+            -ProjectId $Id `
+            -Path $ApiPath `
+            -Headers $Hdr
+    }
+}
+
 function Get-SyncPushVerifiedRemoteResponse {
     param(
         [Parameter(Mandatory)]
@@ -393,14 +1228,7 @@ function Get-SyncPushVerifiedRemoteResponse {
     $absolutePath = ConvertTo-StudioAbsoluteApiPath -CanonicalPath $Path
 
     if ($null -eq $GetRemoteFile) {
-        $GetRemoteFile = {
-            param($Origin, $Id, $ApiPath, $Hdr)
-            Get-RemoteProjectFile `
-                -StudioOrigin $Origin `
-                -ProjectId $Id `
-                -Path $ApiPath `
-                -Headers $Hdr
-        }
+        $GetRemoteFile = Get-SyncPushDefaultRemoteFileReader
     }
 
     try {
@@ -438,6 +1266,35 @@ function Get-SyncPushVerifiedRemoteResponse {
     return $remoteResponse
 }
 
+function Get-SyncPushVerifiedBinaryRemoteResponse {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRemoteHash,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [scriptblock]$GetRemoteFile = $null
+    )
+
+    return Get-RemoteBinaryPlaceVerifiedRemoteResponse `
+        -Path $Path `
+        -ExpectedRemoteHash $ExpectedRemoteHash `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers `
+        -GetRemoteFile $GetRemoteFile
+}
+
 function Save-RundotSyncPushRemoteBackup {
     param(
         [Parameter(Mandatory)]
@@ -464,13 +1321,29 @@ function Save-RundotSyncPushRemoteBackup {
     )
 
     $path = [string]$Action.Path
-    $remoteResponse = Get-SyncPushVerifiedRemoteResponse `
-        -Path $path `
-        -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
-        -StudioOrigin $StudioOrigin `
-        -ProjectId $ProjectId `
-        -Headers $Headers `
-        -GetRemoteFile $GetRemoteFile
+    $kind = [string]$Action.Kind
+    if ([string]::IsNullOrEmpty($kind)) {
+        $kind = 'utf8'
+    }
+
+    if ($kind -eq 'binary') {
+        $remoteResponse = Get-SyncPushVerifiedBinaryRemoteResponse `
+            -Path $path `
+            -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile
+    }
+    else {
+        $remoteResponse = Get-SyncPushVerifiedRemoteResponse `
+            -Path $path `
+            -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile
+    }
 
     $bytes = ConvertFrom-RemoteFileContent -Response $remoteResponse
     $tempRoot = Join-Path (Get-RundotSyncRoot -WorkspaceRoot $WorkspaceRoot) 'temp'
@@ -550,14 +1423,7 @@ function Invoke-RundotSyncPushWriteAction {
     $text = Get-LocalUtf8TextForPush -LiteralPath $localFullPath
 
     if ($null -eq $GetRemoteFile) {
-        $GetRemoteFile = {
-            param($Origin, $Id, $ApiPath, $Hdr)
-            Get-RemoteProjectFile `
-                -StudioOrigin $Origin `
-                -ProjectId $Id `
-                -Path $ApiPath `
-                -Headers $Hdr
-        }
+        $GetRemoteFile = Get-SyncPushDefaultRemoteFileReader
     }
 
     if ($null -eq $PutRemoteFile) {
@@ -597,6 +1463,240 @@ function Invoke-RundotSyncPushWriteAction {
     }
 }
 
+function Invoke-RundotSyncPushCreateAction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        $Action,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$InvokeTextCreate = $null
+    )
+
+    $path = [string]$Action.Path
+
+    if ($null -eq $InvokeTextCreate) {
+        $InvokeTextCreate = {
+            param($Ws, $Canonical, $Sha, $Origin, $Id, $Hdr, $GetFile, $PutFile)
+            Invoke-RemoteTextCreate `
+                -WorkspaceRoot $Ws `
+                -CanonicalPath $Canonical `
+                -LocalSha256 $Sha `
+                -StudioOrigin $Origin `
+                -ProjectId $Id `
+                -Headers $Hdr `
+                -GetRemoteFile $GetFile `
+                -PutRemoteFile $PutFile
+        }
+    }
+
+    return & $InvokeTextCreate `
+        $WorkspaceRoot `
+        $path `
+        ([string]$Action.LocalSha256) `
+        $StudioOrigin `
+        $ProjectId `
+        $Headers `
+        $GetRemoteFile `
+        $PutRemoteFile
+}
+
+function Invoke-RundotSyncPushBinaryAction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        $Action,
+
+        [Parameter(Mandatory)]
+        $Artifact,
+
+        [Parameter(Mandatory)]
+        $Resolution,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null,
+
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
+    )
+
+    $path = [string]$Action.Path
+    $mode = [string]$Action.Mode
+
+    if ($null -eq $InvokeBinaryPlace) {
+        $InvokeBinaryPlace = {
+            param($Ws, $Canonical, $Sha, $PlaceMode, $ExpectedRemote, $Art, $Res, $Origin, $Id, $Hdr, $GetFile, $GetList, $LiveLocal)
+            Invoke-RemoteBinaryPlace `
+                -WorkspaceRoot $Ws `
+                -CanonicalPath $Canonical `
+                -LocalSha256 $Sha `
+                -Mode $PlaceMode `
+                -ExpectedRemoteHash $ExpectedRemote `
+                -Artifact $Art `
+                -Resolution $Res `
+                -ProjectId $Id `
+                -StudioOrigin $Origin `
+                -Headers $Hdr `
+                -GetRemoteFile $GetFile `
+                -GetRemoteFileList $GetList `
+                -LiveLocalManifest $LiveLocal
+        }
+    }
+
+    $expectedRemote = $null
+    if ($mode -eq 'replace') {
+        $expectedRemote = [string]$Action.ExpectedRemoteHash
+    }
+
+    return & $InvokeBinaryPlace `
+        $WorkspaceRoot `
+        $path `
+        ([string]$Action.LocalSha256) `
+        $mode `
+        $expectedRemote `
+        $Artifact `
+        $Resolution `
+        $StudioOrigin `
+        $ProjectId `
+        $Headers `
+        $GetRemoteFile `
+        $GetRemoteFileList `
+        $LiveLocalManifest
+}
+
+function Invoke-RundotSyncDeleteAction {
+    # Remove exactly one remote file. The order matters and cannot be
+    # rearranged: the route is unversioned, so the remote bytes are re-read and
+    # compared to expectedRemoteHash immediately before DELETE, and the proof
+    # that the file is gone is that GET /files stops listing it.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        $Action,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [AllowNull()]
+        [string[]]$RemotePaths,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null
+    )
+
+    $path = [string]$Action.Path
+    Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+    # Resolve the live remote list when the caller did not supply one, so the
+    # directory-shape refusal is never skipped rather than silently passing.
+    if ($null -eq $RemotePaths) {
+        $RemotePaths = @(Get-RemoteListedFilePaths `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFileList $GetRemoteFileList)
+    }
+
+    Assert-SyncDeletePathAllowed -CanonicalPath $path -RemotePaths $RemotePaths
+
+    # Re-read the remote bytes and compare to expectedRemoteHash immediately
+    # before the request. This is the only guard a delete can have: If-Match is
+    # ignored, so the server cannot refuse a stale delete for us.
+    $null = Get-SyncPushVerifiedRemoteResponse `
+        -Path $path `
+        -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers `
+        -GetRemoteFile $GetRemoteFile
+
+    if ($null -eq $DeleteRemoteFile) {
+        $DeleteRemoteFile = {
+            param($Origin, $Id, $Canonical, $Hdr)
+            Invoke-RemoteDeleteFile `
+                -StudioOrigin $Origin `
+                -ProjectId $Id `
+                -CanonicalPath $Canonical `
+                -Headers $Hdr
+        }
+    }
+
+    try {
+        $null = & $DeleteRemoteFile $StudioOrigin $ProjectId $path $Headers
+    }
+    catch {
+        # A 404 after an ambiguous failure means the postcondition already
+        # holds. Treat it as already-deleted only when GET /files agrees.
+        if (Test-RemoteNotFoundException -Exception $_.Exception) {
+            Assert-RemotePathAbsent `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -CanonicalPath $path `
+                -GetRemoteFileList $GetRemoteFileList
+
+            return [pscustomobject]@{
+                Path          = $path
+                AlreadyAbsent = $true
+            }
+        }
+
+        throw
+    }
+
+    # A 200 is not the proof. Confirm the path is gone from the file list.
+    Assert-RemotePathAbsent `
+        -StudioOrigin $StudioOrigin `
+        -ProjectId $ProjectId `
+        -Headers $Headers `
+        -CanonicalPath $path `
+        -GetRemoteFileList $GetRemoteFileList
+
+    return [pscustomobject]@{
+        Path          = $path
+        AlreadyAbsent = $false
+    }
+}
+
 function Invoke-RundotSyncPushApply {
     param(
         [Parameter(Mandatory)]
@@ -617,19 +1717,58 @@ function Invoke-RundotSyncPushApply {
 
         [string]$BackupSetPath,
 
+        [AllowEmptyCollection()]
+        [object[]]$DeleteActions = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$CreateActions = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$BinaryActions = @(),
+
+        [AllowNull()]
+        $Artifact = $null,
+
+        [AllowNull()]
+        $Resolution = $null,
+
         [scriptblock]$GetRemoteFile = $null,
 
         [scriptblock]$PutRemoteFile = $null,
 
-        [scriptblock]$CopyBackupFile = $null
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null,
+
+        [scriptblock]$CopyBackupFile = $null,
+
+        [scriptblock]$InvokeTextCreate = $null,
+
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     $actionRows = @($Actions)
-    if ($actionRows.Count -eq 0) {
+    $createRows = @($CreateActions)
+    $binaryRows = @($BinaryActions)
+    $deleteRows = @($DeleteActions)
+
+    if ($actionRows.Count -eq 0 -and $createRows.Count -eq 0 -and $binaryRows.Count -eq 0 -and $deleteRows.Count -eq 0) {
         return [pscustomobject]@{
             AppliedActions = @()
             AppliedLocals  = @()
+            CreatedActions = @()
+            CreatedLocals  = @()
+            BinaryActions  = @()
+            BinaryLocals   = @()
+            DeletedActions = @()
             Applied        = 0
+            Created        = 0
+            BinaryCreated  = 0
+            BinaryReplaced = 0
+            Deleted        = 0
             BackupSet      = $null
             BackupSetPath  = $null
         }
@@ -663,11 +1802,74 @@ function Invoke-RundotSyncPushApply {
             -LocalFullPath $localFullPath
     }
 
+    foreach ($action in $createRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
+    foreach ($action in $binaryRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
+    $remotePaths = @()
+    foreach ($action in $deleteRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        if ($null -ne $action.PSObject.Properties['RemotePaths'] -and $null -ne $action.RemotePaths) {
+            $remotePaths = @($action.RemotePaths)
+            break
+        }
+    }
+
     $appliedActions = New-Object 'System.Collections.Generic.List[object]'
     $appliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    $createdActions = New-Object 'System.Collections.Generic.List[object]'
+    $createdLocals = New-Object 'System.Collections.Generic.List[object]'
+    $binaryActionsDone = New-Object 'System.Collections.Generic.List[object]'
+    $binaryLocals = New-Object 'System.Collections.Generic.List[object]'
+    $deletedActions = New-Object 'System.Collections.Generic.List[object]'
 
     try {
+        # Back up every path first, writes and deletes alike. No DELETE runs
+        # until every backup it depends on has verified.
+        #
+        # Progress counts are separate for the backup and write phases so each
+        # line reports applied versus remaining for the phase it belongs to.
+        $backupTotal = $actionRows.Count `
+            + @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' }).Count `
+            + $deleteRows.Count
+        $writeTotal = $actionRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+        $backupDone = 0
+        $writeDone = 0
+
         foreach ($action in $actionRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
             Save-RundotSyncPushRemoteBackup `
                 -WorkspaceRoot $WorkspaceRoot `
                 -BackupSetPath $BackupSetPath `
@@ -677,9 +1879,451 @@ function Invoke-RundotSyncPushApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
+        }
+
+        foreach ($action in @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' })) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
+            Save-RundotSyncPushRemoteBackup `
+                -WorkspaceRoot $WorkspaceRoot `
+                -BackupSetPath $BackupSetPath `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
+        }
+
+        foreach ($action in $deleteRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'backup' `
+                -Path ([string]$action.Path) `
+                -Index ($backupDone + 1) `
+                -Total $backupTotal `
+                -Applied $backupDone
+
+            Save-RundotSyncPushRemoteBackup `
+                -WorkspaceRoot $WorkspaceRoot `
+                -BackupSetPath $BackupSetPath `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -CopyBackupFile $CopyBackupFile | Out-Null
+            $backupDone++
         }
 
         foreach ($action in $actionRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
+            $appliedLocal = Invoke-RundotSyncPushWriteAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile
+
+            [void]$appliedActions.Add($action)
+            [void]$appliedLocals.Add($appliedLocal)
+            $writeDone++
+        }
+
+        foreach ($action in $createRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
+            $createdLocal = Invoke-RundotSyncPushCreateAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile `
+                -InvokeTextCreate $InvokeTextCreate
+
+            [void]$createdActions.Add($action)
+            [void]$createdLocals.Add($createdLocal)
+            $writeDone++
+        }
+
+        foreach ($action in $binaryRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
+            $binaryLocal = Invoke-RundotSyncPushBinaryAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -Artifact $Artifact `
+                -Resolution $Resolution `
+                -ProjectId $ProjectId `
+                -StudioOrigin $StudioOrigin `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList `
+                -InvokeBinaryPlace $InvokeBinaryPlace `
+                -LiveLocalManifest $LiveLocalManifest
+
+            [void]$binaryActionsDone.Add($action)
+            [void]$binaryLocals.Add($binaryLocal)
+            $writeDone++
+        }
+
+        foreach ($action in $deleteRows) {
+            Write-RundotSyncPublishProgress `
+                -Phase 'write' `
+                -Path ([string]$action.Path) `
+                -Index ($writeDone + 1) `
+                -Total $writeTotal `
+                -Applied $writeDone
+
+            $deleted = Invoke-RundotSyncDeleteAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -RemotePaths $remotePaths `
+                -GetRemoteFile $GetRemoteFile `
+                -DeleteRemoteFile $DeleteRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList
+
+            [void]$deletedActions.Add($deleted)
+            $writeDone++
+        }
+    }
+    catch {
+        $originalError = $_.Exception
+        $wrapper = [System.InvalidOperationException]::new(
+            ("Push aborted: {0}" -f [string]$originalError.Message),
+            $originalError
+        )
+        $wrapper.Data['PushAppliedCount'] = $appliedActions.Count
+        $wrapper.Data['PushCreatedCount'] = $createdActions.Count
+        $wrapper.Data['PushBinaryCount'] = $binaryActionsDone.Count
+        $wrapper.Data['PushDeletedCount'] = $deletedActions.Count
+        throw $wrapper
+    }
+
+    $binaryCreatedCount = 0
+    $binaryReplacedCount = 0
+    foreach ($action in @($binaryActionsDone.ToArray())) {
+        if ([string]$action.Mode -eq 'create') {
+            $binaryCreatedCount++
+        }
+        else {
+            $binaryReplacedCount++
+        }
+    }
+
+    $allAppliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($local in @($appliedLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+    foreach ($local in @($createdLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+    foreach ($local in @($binaryLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+
+    return [pscustomobject]@{
+        AppliedActions = @($appliedActions.ToArray())
+        AppliedLocals  = @($allAppliedLocals.ToArray())
+        CreatedActions = @($createdActions.ToArray())
+        CreatedLocals  = @($createdLocals.ToArray())
+        BinaryActions  = @($binaryActionsDone.ToArray())
+        BinaryLocals   = @($binaryLocals.ToArray())
+        DeletedActions = @($deletedActions.ToArray())
+        Applied        = $appliedActions.Count + $binaryReplacedCount
+        Created        = $createdActions.Count + $binaryCreatedCount
+        BinaryCreated  = $binaryCreatedCount
+        BinaryReplaced = $binaryReplacedCount
+        Deleted        = $deletedActions.Count
+        BackupSet      = $backupSet
+        BackupSetPath  = $BackupSetPath
+    }
+}
+
+function Add-SyncPushLocalWinsRefusedRow {
+    param(
+        $RefusedList,
+        $Action,
+        [string]$Reason
+    )
+
+    $status = 'upload'
+    if ($null -ne $Action -and $null -ne $Action.PSObject.Properties['Status']) {
+        $status = [string]$Action.Status
+    }
+
+    $path = [string]$Action.Path
+    [void]$RefusedList.Add([pscustomobject]@{
+        Path   = $path
+        Status = $status
+        Reason = $Reason
+    })
+}
+
+function Invoke-RundotSyncLocalWinsApply {
+    # Same backup-all-first contract as default Push, but a per-path write or
+    # drift failure is recorded and the run continues with the remaining paths.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Actions,
+
+        [Parameter(Mandatory)]
+        [string]$StudioOrigin,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [string]$BackupSetPath,
+
+        [AllowEmptyCollection()]
+        [object[]]$DeleteActions = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$CreateActions = @(),
+
+        [AllowEmptyCollection()]
+        [object[]]$BinaryActions = @(),
+
+        [AllowNull()]
+        $Artifact = $null,
+
+        [AllowNull()]
+        $Resolution = $null,
+
+        [scriptblock]$GetRemoteFile = $null,
+
+        [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null,
+
+        [scriptblock]$CopyBackupFile = $null,
+
+        [scriptblock]$InvokeTextCreate = $null,
+
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
+    )
+
+    $actionRows = @($Actions)
+    $createRows = @($CreateActions)
+    $binaryRows = @($BinaryActions)
+    $deleteRows = @($DeleteActions)
+    $refused = New-Object 'System.Collections.Generic.List[object]'
+
+    if ($actionRows.Count -eq 0 -and $createRows.Count -eq 0 -and $binaryRows.Count -eq 0 -and $deleteRows.Count -eq 0) {
+        return [pscustomobject]@{
+            AppliedActions = @()
+            AppliedLocals  = @()
+            CreatedActions = @()
+            CreatedLocals  = @()
+            BinaryActions  = @()
+            BinaryLocals   = @()
+            DeletedActions = @()
+            Refused        = @()
+            Applied        = 0
+            Created        = 0
+            BinaryCreated  = 0
+            BinaryReplaced = 0
+            Deleted        = 0
+            BackupSet      = $null
+            BackupSetPath  = $null
+        }
+    }
+
+    $backupSet = $null
+    if (-not [string]::IsNullOrEmpty($BackupSetPath)) {
+        New-Item -ItemType Directory -Force -Path $BackupSetPath | Out-Null
+        $backupSet = [pscustomobject]@{
+            Name      = Split-Path -Leaf $BackupSetPath
+            Path      = $BackupSetPath
+            Timestamp = [DateTime]::UtcNow
+        }
+    }
+    else {
+        $backupSet = New-RundotSyncBackupSet -WorkspaceRoot $WorkspaceRoot
+        $BackupSetPath = [string]$backupSet.Path
+    }
+
+    foreach ($action in $actionRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
+    foreach ($action in $createRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
+    foreach ($action in $binaryRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        $localFullPath = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $WorkspaceRoot `
+            -CanonicalPath $path
+
+        Assert-SyncPushLocalUnchanged `
+            -Path $path `
+            -ExpectedSha256 ([string]$action.LocalSha256) `
+            -LocalFullPath $localFullPath
+    }
+
+    $remotePaths = @()
+    foreach ($action in $deleteRows) {
+        $path = [string]$action.Path
+        Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $path
+
+        if ($null -ne $action.PSObject.Properties['RemotePaths'] -and $null -ne $action.RemotePaths) {
+            $remotePaths = @($action.RemotePaths)
+            break
+        }
+    }
+
+    $appliedActions = New-Object 'System.Collections.Generic.List[object]'
+    $appliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    $createdActions = New-Object 'System.Collections.Generic.List[object]'
+    $createdLocals = New-Object 'System.Collections.Generic.List[object]'
+    $binaryActionsDone = New-Object 'System.Collections.Generic.List[object]'
+    $binaryLocals = New-Object 'System.Collections.Generic.List[object]'
+    $deletedActions = New-Object 'System.Collections.Generic.List[object]'
+
+    # Progress counts are separate per phase so each line reports applied
+    # versus remaining for the work it belongs to. LocalWins continues after a
+    # refusal, so the write counter advances on the attempt, not the success.
+    $backupTotal = $actionRows.Count `
+        + @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' }).Count `
+        + $deleteRows.Count
+    $writeTotal = $actionRows.Count + $createRows.Count + $binaryRows.Count + $deleteRows.Count
+    $backupDone = 0
+    $writeDone = 0
+
+    foreach ($action in $actionRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
+        Save-RundotSyncPushRemoteBackup `
+            -WorkspaceRoot $WorkspaceRoot `
+            -BackupSetPath $BackupSetPath `
+            -Action $action `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile `
+            -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
+    }
+
+    foreach ($action in @($binaryRows | Where-Object { [string]$_.Mode -eq 'replace' })) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
+        Save-RundotSyncPushRemoteBackup `
+            -WorkspaceRoot $WorkspaceRoot `
+            -BackupSetPath $BackupSetPath `
+            -Action $action `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile `
+            -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
+    }
+
+    foreach ($action in $deleteRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'backup' `
+            -Path ([string]$action.Path) `
+            -Index ($backupDone + 1) `
+            -Total $backupTotal `
+            -Applied $backupDone
+
+        Save-RundotSyncPushRemoteBackup `
+            -WorkspaceRoot $WorkspaceRoot `
+            -BackupSetPath $BackupSetPath `
+            -Action $action `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile `
+            -CopyBackupFile $CopyBackupFile | Out-Null
+        $backupDone++
+    }
+
+    foreach ($action in $actionRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
+        try {
             $appliedLocal = Invoke-RundotSyncPushWriteAction `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Action $action `
@@ -692,21 +2336,147 @@ function Invoke-RundotSyncPushApply {
             [void]$appliedActions.Add($action)
             [void]$appliedLocals.Add($appliedLocal)
         }
+        catch {
+            Add-SyncPushLocalWinsRefusedRow `
+                -RefusedList $refused `
+                -Action $action `
+                -Reason ([string]$_.Exception.Message)
+        }
+        $writeDone++
     }
-    catch {
-        $originalError = $_.Exception
-        $wrapper = [System.InvalidOperationException]::new(
-            ("Push aborted: {0}" -f [string]$originalError.Message),
-            $originalError
-        )
-        $wrapper.Data['PushAppliedCount'] = $appliedActions.Count
-        throw $wrapper
+
+    foreach ($action in $createRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
+        try {
+            $createdLocal = Invoke-RundotSyncPushCreateAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile `
+                -InvokeTextCreate $InvokeTextCreate
+
+            [void]$createdActions.Add($action)
+            [void]$createdLocals.Add($createdLocal)
+        }
+        catch {
+            Add-SyncPushLocalWinsRefusedRow `
+                -RefusedList $refused `
+                -Action $action `
+                -Reason ([string]$_.Exception.Message)
+        }
+        $writeDone++
+    }
+
+    foreach ($action in $binaryRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
+        try {
+            $binaryLocal = Invoke-RundotSyncPushBinaryAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -Artifact $Artifact `
+                -Resolution $Resolution `
+                -ProjectId $ProjectId `
+                -StudioOrigin $StudioOrigin `
+                -Headers $Headers `
+                -GetRemoteFile $GetRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList `
+                -InvokeBinaryPlace $InvokeBinaryPlace `
+                -LiveLocalManifest $LiveLocalManifest
+
+            [void]$binaryActionsDone.Add($action)
+            [void]$binaryLocals.Add($binaryLocal)
+        }
+        catch {
+            Add-SyncPushLocalWinsRefusedRow `
+                -RefusedList $refused `
+                -Action $action `
+                -Reason ([string]$_.Exception.Message)
+        }
+        $writeDone++
+    }
+
+    foreach ($action in $deleteRows) {
+        Write-RundotSyncPublishProgress `
+            -Phase 'write' `
+            -Path ([string]$action.Path) `
+            -Index ($writeDone + 1) `
+            -Total $writeTotal `
+            -Applied $writeDone
+
+        try {
+            $deleted = Invoke-RundotSyncDeleteAction `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Action $action `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -RemotePaths $remotePaths `
+                -GetRemoteFile $GetRemoteFile `
+                -DeleteRemoteFile $DeleteRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList
+
+            [void]$deletedActions.Add($deleted)
+        }
+        catch {
+            Add-SyncPushLocalWinsRefusedRow `
+                -RefusedList $refused `
+                -Action $action `
+                -Reason ([string]$_.Exception.Message)
+        }
+        $writeDone++
+    }
+
+    $binaryCreatedCount = 0
+    $binaryReplacedCount = 0
+    foreach ($action in @($binaryActionsDone.ToArray())) {
+        if ([string]$action.Mode -eq 'create') {
+            $binaryCreatedCount++
+        }
+        else {
+            $binaryReplacedCount++
+        }
+    }
+
+    $allAppliedLocals = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($local in @($appliedLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+    foreach ($local in @($createdLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
+    }
+    foreach ($local in @($binaryLocals.ToArray())) {
+        [void]$allAppliedLocals.Add($local)
     }
 
     return [pscustomobject]@{
         AppliedActions = @($appliedActions.ToArray())
-        AppliedLocals  = @($appliedLocals.ToArray())
-        Applied        = $appliedActions.Count
+        AppliedLocals  = @($allAppliedLocals.ToArray())
+        CreatedActions = @($createdActions.ToArray())
+        CreatedLocals  = @($createdLocals.ToArray())
+        BinaryActions  = @($binaryActionsDone.ToArray())
+        BinaryLocals   = @($binaryLocals.ToArray())
+        DeletedActions = @($deletedActions.ToArray())
+        Refused        = @($refused.ToArray())
+        Applied        = $appliedActions.Count + $binaryReplacedCount
+        Created        = $createdActions.Count + $binaryCreatedCount
+        BinaryCreated  = $binaryCreatedCount
+        BinaryReplaced = $binaryReplacedCount
+        Deleted        = $deletedActions.Count
         BackupSet      = $backupSet
         BackupSetPath  = $BackupSetPath
     }
@@ -720,21 +2490,13 @@ function Invoke-RundotSyncPushApply {
 function New-RundotSyncPushBaseFiles {
     param(
         $BaseFiles,
-        [object[]]$AppliedLocals
+        [object[]]$AppliedLocals,
+
+        [AllowNull()]
+        [string[]]$DeletedPaths
     )
 
-    $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
-
-    if ($BaseFiles -is [System.Collections.IDictionary]) {
-        foreach ($key in @($BaseFiles.Keys)) {
-            $files[[string]$key] = $BaseFiles[$key]
-        }
-    }
-    elseif ($null -ne $BaseFiles) {
-        foreach ($property in $BaseFiles.PSObject.Properties) {
-            $files[[string]$property.Name] = $property.Value
-        }
-    }
+    $files = Copy-SyncMapToHashtable -Map $BaseFiles
 
     foreach ($applied in @($AppliedLocals)) {
         if ($null -eq $applied) {
@@ -747,6 +2509,19 @@ function New-RundotSyncPushBaseFiles {
             LocalDetectedKind = [string]$applied.LocalDetectedKind
             LineEnding        = $applied.LineEnding
             HasBom            = [bool]$applied.HasBom
+        }
+    }
+
+    # A deleted path is dropped from BASE, not tombstoned. The path is now gone
+    # from both LOCAL and REMOTE, so a later identical re-create in Studio
+    # classifies as a download rather than another delete candidate.
+    foreach ($deletedPath in @($DeletedPaths)) {
+        if ([string]::IsNullOrEmpty([string]$deletedPath)) {
+            continue
+        }
+
+        if ($files.ContainsKey([string]$deletedPath)) {
+            [void]$files.Remove([string]$deletedPath)
         }
     }
 
@@ -794,6 +2569,9 @@ function Update-RundotSyncBaseAfterPush {
 
         [object[]]$AppliedLocals,
 
+        [AllowNull()]
+        [string[]]$DeletedPaths,
+
         $BaseFiles
     )
 
@@ -803,7 +2581,8 @@ function Update-RundotSyncBaseAfterPush {
 
     $files = New-RundotSyncPushBaseFiles `
         -BaseFiles $BaseFiles `
-        -AppliedLocals $AppliedLocals
+        -AppliedLocals $AppliedLocals `
+        -DeletedPaths $DeletedPaths
 
     Save-BaseManifest `
         -WorkspaceRoot $WorkspaceRoot `
@@ -829,7 +2608,19 @@ function Format-SyncPushReport {
 
         [int]$Applied = 0,
 
+        [object[]]$CreatedActions = $null,
+
+        [int]$Created = 0,
+
+        [object[]]$DeletedActions = $null,
+
+        [int]$Deleted = 0,
+
+        [object[]]$BinaryActions = $null,
+
         [object[]]$Skipped = $null,
+
+        [object[]]$Refused = $null,
 
         [bool]$Cancelled = $false,
 
@@ -856,21 +2647,55 @@ function Format-SyncPushReport {
     }
 
     $actionRows = @($AppliedActions)
+    $createdRows = @($CreatedActions)
+    $binaryRows = @($BinaryActions)
+    $deletedRows = @($DeletedActions)
     $skippedRows = @($Skipped)
     if ($null -eq $Skipped -and $null -ne $Selection) {
         $skippedRows = @($Selection.Excluded)
     }
 
-    if ($actionRows.Count -eq 0) {
+    if ($actionRows.Count -eq 0 -and $createdRows.Count -eq 0 -and $binaryRows.Count -eq 0 -and $deletedRows.Count -eq 0) {
         [void]$lines.Add('')
-        [void]$lines.Add('Nothing to push: no publishable text overwrite remains in this plan.')
+        [void]$lines.Add('Nothing to push: no publishable overwrite, text create, binary place, or confirmed delete remains in this plan.')
         [void]$lines.Add('BASE was not updated.')
     }
     else {
-        [void]$lines.Add('')
-        [void]$lines.Add('APPLIED')
-        foreach ($action in $actionRows) {
-            [void]$lines.Add(('  {0}  (overwrite)' -f [string]$action.Path))
+        if ($actionRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('APPLIED')
+            foreach ($action in $actionRows) {
+                [void]$lines.Add(('  {0}  (overwrite)' -f [string]$action.Path))
+            }
+        }
+
+        if ($createdRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('CREATED')
+            foreach ($action in $createdRows) {
+                [void]$lines.Add(('  {0}  (text create)' -f [string]$action.Path))
+            }
+        }
+
+        if ($binaryRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('BINARY')
+            foreach ($action in $binaryRows) {
+                $modeLabel = [string]$action.Mode
+                if ([string]::IsNullOrEmpty($modeLabel)) {
+                    $modeLabel = 'place'
+                }
+
+                [void]$lines.Add(('  {0}  (binary {1})' -f [string]$action.Path, $modeLabel))
+            }
+        }
+
+        if ($deletedRows.Count -gt 0) {
+            [void]$lines.Add('')
+            [void]$lines.Add('DELETED')
+            foreach ($action in $deletedRows) {
+                [void]$lines.Add(('  {0}  (delete)' -f [string]$action.Path))
+            }
         }
     }
 
@@ -883,10 +2708,23 @@ function Format-SyncPushReport {
         }
     }
 
+    $refusedRows = @($Refused)
+    if ($refusedRows.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('REFUSED')
+        foreach ($row in $refusedRows) {
+            $reason = ([string]$row.Reason).Replace("`r", ' ').Replace("`n", ' ')
+            [void]$lines.Add(('  {0}  [{1}]  {2}' -f [string]$row.Path, [string]$row.Status, $reason))
+        }
+    }
+
     [void]$lines.Add('')
     [void]$lines.Add('SUMMARY')
     [void]$lines.Add(('  applied:      {0}' -f $Applied))
+    [void]$lines.Add(('  created:      {0}' -f $Created))
+    [void]$lines.Add(('  deleted:      {0}' -f $Deleted))
     [void]$lines.Add(('  skipped:      {0}' -f $skippedRows.Count))
+    [void]$lines.Add(('  refused:      {0}' -f $refusedRows.Count))
     [void]$lines.Add(('  BASE updated: {0}' -f ([bool]$BaseUpdated).ToString().ToLowerInvariant()))
 
     if (-not [string]::IsNullOrEmpty($BackupRoot)) {
@@ -935,11 +2773,25 @@ function Invoke-RundotSyncPush {
 
         [scriptblock]$ConfirmOverwrite = $null,
 
+        [scriptblock]$ConfirmDelete = $null,
+
+        [scriptblock]$ConfirmCreate = $null,
+
+        [scriptblock]$ConfirmBinary = $null,
+
+        [scriptblock]$ConfirmLocalWins = $null,
+
+        [switch]$LocalWins,
+
         [switch]$Force,
 
         [scriptblock]$GetRemoteFile = $null,
 
-        [scriptblock]$PutRemoteFile = $null
+        [scriptblock]$PutRemoteFile = $null,
+
+        [scriptblock]$DeleteRemoteFile = $null,
+
+        [scriptblock]$GetRemoteFileList = $null
     )
 
     Assert-RundotSyncPushPlanArtifact `
@@ -951,19 +2803,68 @@ function Invoke-RundotSyncPush {
         -Snapshot $Snapshot
 
     $baseMap = Get-SyncPlanBaseMapFromResolution -Resolution $Resolution
-    $selection = Get-SyncPushSelection `
-        -Artifact $Artifact `
-        -Base $baseMap `
-        -Local $Local `
-        -Remote $Remote
+    if ($LocalWins) {
+        $selection = Get-SyncPushLocalWinsSelection `
+            -Artifact $Artifact `
+            -Base $baseMap `
+            -Local $Local `
+            -Remote $Remote
+    }
+    else {
+        $selection = Get-SyncPushSelection `
+            -Artifact $Artifact `
+            -Base $baseMap `
+            -Local $Local `
+            -Remote $Remote
+    }
 
     $actions = @($selection.Actions)
+    $createActions = @($selection.CreateActions)
+    $binaryActions = @($selection.BinaryActions)
+    $deleteActions = @($selection.DeleteActions)
     $planId = [string]$Artifact.planId
     $backupRoot = Get-RundotSyncBackupRoot -WorkspaceRoot $WorkspaceRoot
 
-    # Confirmation before any write. A declined overwrite changes nothing, so
-    # it is not journaled as a run.
-    if ($actions.Count -gt 0 -and -not $Force) {
+    $cancelledResult = {
+        return [pscustomobject]@{
+            Applied        = 0
+            Created        = 0
+            Deleted        = 0
+            Cancelled      = $true
+            BaseUpdated    = $false
+            PlanId         = $planId
+            Selection      = $selection
+            AppliedActions = @()
+            CreatedActions = @()
+            DeletedActions = @()
+            Report         = (Format-SyncPushReport `
+                -Selection $selection `
+                -AppliedActions @() `
+                -Cancelled $true `
+                -PlanId $planId)
+        }
+    }
+
+    $publishCount = $actions.Count + $createActions.Count + $binaryActions.Count + $deleteActions.Count
+
+    if ($LocalWins -and $publishCount -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmLocalWins) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} path(s) would be published with local-wins. " -f $publishCount) +
+                'Confirm with -LocalWins and type yes, or pass -ForcePush to proceed. ' +
+                'Backups and live hash checks are never skipped.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmLocalWins $actions $createActions $binaryActions $deleteActions)
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
+    # Confirmation before any write or delete. Every confirmation is collected
+    # before the first backup, so a decline changes nothing at all.
+    if (-not $LocalWins -and $actions.Count -gt 0 -and -not $Force) {
         if ($null -eq $ConfirmOverwrite) {
             throw [System.InvalidOperationException]::new(
                 ("Refusing to push: {0} remote text file(s) would be overwritten. " -f $actions.Count) +
@@ -974,30 +2875,73 @@ function Invoke-RundotSyncPush {
 
         $confirmed = [bool](& $ConfirmOverwrite $actions.Count @($actions | ForEach-Object { [string]$_.Path }))
         if (-not $confirmed) {
-            return [pscustomobject]@{
-                Applied        = 0
-                Cancelled      = $true
-                BaseUpdated    = $false
-                PlanId         = $planId
-                Selection      = $selection
-                AppliedActions = @()
-                Report         = (Format-SyncPushReport `
-                    -Selection $selection `
-                    -AppliedActions @() `
-                    -Cancelled $true `
-                    -PlanId $planId)
-            }
+            return (& $cancelledResult)
         }
     }
 
-    if ($actions.Count -eq 0) {
+    if (-not $LocalWins -and $createActions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmCreate) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote text file(s) would be created. " -f $createActions.Count) +
+                'Confirm the create, or pass -ForcePush to proceed.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmCreate $createActions.Count @($createActions | ForEach-Object { [string]$_.Path }))
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
+    if (-not $LocalWins -and $binaryActions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmBinary) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote binary file(s) would be created or replaced. " -f $binaryActions.Count) +
+                'Confirm the binary place, or pass -ForcePush to proceed. ' +
+                'A backup of each remote original is always created before a replacement.'
+            )
+        }
+
+        $binaryPathLabels = @($binaryActions | ForEach-Object {
+            ('{0} ({1})' -f [string]$_.Path, [string]$_.Mode)
+        })
+        $confirmed = [bool](& $ConfirmBinary $binaryActions.Count @binaryPathLabels)
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
+    # A delete is unrecoverable from Studio, so it gets its own confirmation
+    # even when the overwrite half was accepted.
+    if (-not $LocalWins -and $deleteActions.Count -gt 0 -and -not $Force) {
+        if ($null -eq $ConfirmDelete) {
+            throw [System.InvalidOperationException]::new(
+                ("Refusing to push: {0} remote file(s) would be deleted. " -f $deleteActions.Count) +
+                'Confirm the delete, or pass -ForcePush to proceed. ' +
+                'A backup of each remote original is always created first.'
+            )
+        }
+
+        $confirmed = [bool](& $ConfirmDelete $deleteActions.Count @($deleteActions | ForEach-Object { [string]$_.Path }))
+        if (-not $confirmed) {
+            return (& $cancelledResult)
+        }
+    }
+
+    if ($publishCount -eq 0) {
         return [pscustomobject]@{
             Applied        = 0
+            Created        = 0
+            Deleted        = 0
             Cancelled      = $false
             BaseUpdated    = $false
+            HadRefusals    = $false
             PlanId         = $planId
             Selection      = $selection
             AppliedActions = @()
+            CreatedActions = @()
+            DeletedActions = @()
+            RefusedActions = @()
             Report         = (Format-SyncPushReport `
                 -Selection $selection `
                 -AppliedActions @() `
@@ -1006,23 +2950,64 @@ function Invoke-RundotSyncPush {
     }
 
     $backupSet = New-RundotSyncBackupSet -WorkspaceRoot $WorkspaceRoot
+    $refusedActions = @()
+    $hadRefusals = $false
 
     try {
-        $applyResult = Invoke-RundotSyncPushApply `
-            -WorkspaceRoot $WorkspaceRoot `
-            -Actions $actions `
-            -StudioOrigin $StudioOrigin `
-            -ProjectId $ProjectId `
-            -Headers $Headers `
-            -BackupSetPath ([string]$backupSet.Path) `
-            -GetRemoteFile $GetRemoteFile `
-            -PutRemoteFile $PutRemoteFile
+        if ($LocalWins) {
+            $applyResult = Invoke-RundotSyncLocalWinsApply `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Actions $actions `
+                -CreateActions $createActions `
+                -BinaryActions $binaryActions `
+                -Artifact $Artifact `
+                -Resolution $Resolution `
+                -DeleteActions $deleteActions `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -BackupSetPath ([string]$backupSet.Path) `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile `
+                -DeleteRemoteFile $DeleteRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList `
+                -LiveLocalManifest $Local
+            $refusedActions = @($applyResult.Refused)
+            $hadRefusals = ($refusedActions.Count -gt 0)
+        }
+        else {
+            $applyResult = Invoke-RundotSyncPushApply `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Actions $actions `
+                -CreateActions $createActions `
+                -BinaryActions $binaryActions `
+                -Artifact $Artifact `
+                -Resolution $Resolution `
+                -DeleteActions $deleteActions `
+                -StudioOrigin $StudioOrigin `
+                -ProjectId $ProjectId `
+                -Headers $Headers `
+                -BackupSetPath ([string]$backupSet.Path) `
+                -GetRemoteFile $GetRemoteFile `
+                -PutRemoteFile $PutRemoteFile `
+                -DeleteRemoteFile $DeleteRemoteFile `
+                -GetRemoteFileList $GetRemoteFileList `
+                -LiveLocalManifest $Local
+        }
     }
     catch {
         $applyError = $_.Exception
         $appliedBeforeFailure = 0
+        $deletedBeforeFailure = 0
         if ($applyError.Data.Contains('PushAppliedCount')) {
             $appliedBeforeFailure = [int]$applyError.Data['PushAppliedCount']
+        }
+        if ($applyError.Data.Contains('PushDeletedCount')) {
+            $deletedBeforeFailure = [int]$applyError.Data['PushDeletedCount']
+        }
+        $createdBeforeFailure = 0
+        if ($applyError.Data.Contains('PushCreatedCount')) {
+            $createdBeforeFailure = [int]$applyError.Data['PushCreatedCount']
         }
 
         try {
@@ -1036,6 +3021,8 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $appliedBeforeFailure
                     overwritten = $appliedBeforeFailure
+                    created     = $createdBeforeFailure
+                    deleted     = $deletedBeforeFailure
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
                     reason      = 'Push failed while writing REMOTE. BASE was not updated. The backup set holds the previous remote bytes.'
@@ -1053,32 +3040,120 @@ function Invoke-RundotSyncPush {
         $baseFiles = $Resolution.Base.files
     }
 
+    $deletedPaths = @($applyResult.DeletedActions | ForEach-Object { [string]$_.Path })
+
+    $baseUpdateActions = @($applyResult.AppliedActions) + @($applyResult.CreatedActions) + @($applyResult.BinaryActions)
+    $verifiedWriteCount = $applyResult.AppliedActions.Count `
+        + $applyResult.CreatedActions.Count `
+        + $applyResult.BinaryActions.Count `
+        + $applyResult.DeletedActions.Count
+    $baseUpdated = $false
+
     try {
-        Update-RundotSyncBaseAfterPush `
-            -WorkspaceRoot $WorkspaceRoot `
-            -ProjectId $ProjectId `
-            -AppliedActions $applyResult.AppliedActions `
-            -AppliedLocals $applyResult.AppliedLocals `
-            -BaseFiles $baseFiles | Out-Null
+        if ($verifiedWriteCount -gt 0) {
+            Update-RundotSyncBaseAfterPush `
+                -WorkspaceRoot $WorkspaceRoot `
+                -ProjectId $ProjectId `
+                -AppliedActions $baseUpdateActions `
+                -AppliedLocals $applyResult.AppliedLocals `
+                -DeletedPaths $deletedPaths `
+                -BaseFiles $baseFiles | Out-Null
+            $baseUpdated = $true
+        }
+
+        $journalStatus = 'success'
+        $journalReason = $null
+        if ($hadRefusals) {
+            $journalStatus = 'failed'
+            if ($baseUpdated) {
+                $journalReason = (
+                    '{0} path(s) refused after confirmation; BASE updated only for verified paths.' -f $refusedActions.Count
+                )
+            }
+            else {
+                $journalReason = (
+                    '{0} path(s) refused after confirmation; BASE was not updated.' -f $refusedActions.Count
+                )
+            }
+        }
+
+        $journalRecord = @{
+            status      = $journalStatus
+            projectId   = $ProjectId
+            planId      = $planId
+            backupSet   = [string]$backupSet.Name
+            applied     = $applyResult.Applied
+            overwritten = $applyResult.Applied
+            created     = $applyResult.Created
+            deleted     = $applyResult.Deleted
+            skipped     = @($selection.Excluded).Count
+            baseUpdated = $baseUpdated
+        }
+        if (-not [string]::IsNullOrEmpty($journalReason)) {
+            $journalRecord.reason = $journalReason
+        }
 
         Add-RundotSyncJournalRecord `
             -WorkspaceRoot $WorkspaceRoot `
             -Event 'push' `
-            -Record @{
-                status      = 'success'
-                projectId   = $ProjectId
-                planId      = $planId
-                backupSet   = [string]$backupSet.Name
-                applied     = $applyResult.Applied
-                overwritten = $applyResult.Applied
-                skipped     = @($selection.Excluded).Count
-                baseUpdated = $true
-            } | Out-Null
+            -Record $journalRecord | Out-Null
 
         foreach ($action in @($applyResult.AppliedActions)) {
             Add-RundotSyncJournalRecord `
                 -WorkspaceRoot $WorkspaceRoot `
                 -Event 'push-backup' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.CreatedActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-create' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.BinaryActions | Where-Object { [string]$_.Mode -eq 'replace' })) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-backup' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.BinaryActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-binary' `
+                -Record @{
+                    status    = 'success'
+                    projectId = $ProjectId
+                    planId    = $planId
+                    backupSet = [string]$backupSet.Name
+                    path      = [string]$action.Path
+                } | Out-Null
+        }
+
+        foreach ($action in @($applyResult.DeletedActions)) {
+            Add-RundotSyncJournalRecord `
+                -WorkspaceRoot $WorkspaceRoot `
+                -Event 'push-delete' `
                 -Record @{
                     status    = 'success'
                     projectId = $ProjectId
@@ -1100,6 +3175,8 @@ function Invoke-RundotSyncPush {
                     backupSet   = [string]$backupSet.Name
                     applied     = $applyResult.Applied
                     overwritten = $applyResult.Applied
+                    created     = $applyResult.Created
+                    deleted     = $applyResult.Deleted
                     skipped     = @($selection.Excluded).Count
                     baseUpdated = $false
                     reason      = 'Push applied remote writes, but the verified BASE update did not complete. The previous BASE remains authoritative.'
@@ -1123,11 +3200,17 @@ function Invoke-RundotSyncPush {
 
     return [pscustomobject]@{
         Applied        = [int]$applyResult.Applied
+        Created        = [int]$applyResult.Created
+        Deleted        = [int]$applyResult.Deleted
         Cancelled      = $false
-        BaseUpdated    = $true
+        BaseUpdated    = $baseUpdated
+        HadRefusals    = $hadRefusals
         PlanId         = $planId
         Selection      = $selection
         AppliedActions = @($applyResult.AppliedActions)
+        CreatedActions = @($applyResult.CreatedActions)
+        DeletedActions = @($applyResult.DeletedActions)
+        RefusedActions = @($refusedActions)
         BackupSet      = $backupSet
         BackupSetPath  = [string]$backupSet.Path
         BackupSetName  = [string]$backupSet.Name
@@ -1136,7 +3219,13 @@ function Invoke-RundotSyncPush {
             -Selection $selection `
             -AppliedActions $applyResult.AppliedActions `
             -Applied $applyResult.Applied `
-            -BaseUpdated $true `
+            -CreatedActions $applyResult.CreatedActions `
+            -Created $applyResult.Created `
+            -DeletedActions $applyResult.DeletedActions `
+            -Deleted $applyResult.Deleted `
+            -BinaryActions $applyResult.BinaryActions `
+            -Refused $refusedActions `
+            -BaseUpdated $baseUpdated `
             -PlanId $planId `
             -BackupRoot $backupRoot `
             -BackupSetPath ([string]$backupSet.Path))

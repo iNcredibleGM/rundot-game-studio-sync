@@ -1,5 +1,6 @@
 # Torn-read remote snapshot helpers.
-# Callers must load Paths.ps1, Hashing.ps1, Workspace.ps1, and RemoteApi.ps1 first.
+# Callers must load Paths.ps1, Hashing.ps1, Workspace.ps1, RemoteApi.ps1, and
+# Progress.ps1 first.
 #
 # Fingerprint validated /files identity. Never hash a raw or malformed payload.
 
@@ -274,12 +275,15 @@ function ConvertFrom-RemoteFileContent {
 
     if ($encoding -eq 'utf8') {
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        return $utf8NoBom.GetBytes([string]$content)
+        # The comma keeps an empty or single-byte payload as byte[]: PowerShell
+        # unrolls a one-element array on return, which would hand a bare Byte
+        # to SHA256.ComputeHash and raise an ambiguous-overload error.
+        return ,$utf8NoBom.GetBytes([string]$content)
     }
 
     if ($encoding -eq 'base64') {
         try {
-            return [Convert]::FromBase64String([string]$content)
+            return ,[Convert]::FromBase64String([string]$content)
         }
         catch {
             throw [System.InvalidOperationException]::new(
@@ -292,6 +296,32 @@ function ConvertFrom-RemoteFileContent {
     throw [System.InvalidOperationException]::new(
         "Unknown encoding '$encoding'."
     )
+}
+
+
+function Get-RemoteFileContentSha256 {
+    # The one hash of a decoded remote payload. Every route that verifies
+    # remote bytes goes through here, so the decode guard and the hex
+    # conversion cannot drift between the overwrite and delete paths.
+    #
+    # ConvertFrom-RemoteFileContent always returns byte[] (including empty and
+    # single-byte payloads), which matters because SHA256.ComputeHash raises an
+    # ambiguous-overload error on a bare Byte and returns $null for $null.
+    param(
+        [Parameter(Mandatory)]
+        $Response
+    )
+
+    $bytes = ConvertFrom-RemoteFileContent -Response $Response
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    return Convert-HashBytesToHex -Hash $hash
 }
 
 
@@ -368,16 +398,6 @@ function Write-RemoteSnapshotStagingFile {
     return $full
 }
 
-function Clear-RemoteSnapshotDownloadProgress {
-    param([string]$Activity)
-
-    if ([string]::IsNullOrEmpty($Activity)) {
-        return
-    }
-
-    Write-Progress -Activity $Activity -Completed -ErrorAction SilentlyContinue
-}
-
 function Get-RemoteSnapshotFileMap {
     param(
         $Manifest,
@@ -403,8 +423,26 @@ function Get-RemoteSnapshotFileMap {
         }
     }
 
+    $progressState = $null
     if ($ShowProgress) {
-        Write-Host ("Downloading {0} remote file(s)..." -f $total)
+        $progressState = New-RundotSyncProgressState -Activity $ProgressActivity -Total $total
+        Write-RundotSyncProgressLine -Text ("Downloading {0} remote file(s)..." -f $total)
+    }
+
+    # A remote file over Studio's read limit cannot be read back: GET /file
+    # returns 413 for its bytes. That is not a reason to fail the whole project
+    # — the path is still visible in /files with its size — so it is
+    # represented as unverifiable (path and size, no hash, no staged bytes)
+    # and the rest of the snapshot proceeds (#57). Plan reports it as
+    # `unverifiable`; Pull never downloads it; Push never rewrites it. Nothing
+    # is ever hashed or compared for it, so it can never be read as a clean
+    # match.
+    $oversizePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($row in $rows) {
+        $entrySize = Get-SyncEntrySizeValue -Entry $row.Entry
+        if (Test-SyncOversizeSize -Size $entrySize) {
+            [void]$oversizePaths.Add([string]$row.CanonicalPath)
+        }
     }
 
     try {
@@ -412,24 +450,35 @@ function Get-RemoteSnapshotFileMap {
         foreach ($row in $rows) {
             $index++
             if ($ShowProgress) {
-                $percent = 0
-                if ($total -gt 0) {
-                    $percent = [int][Math]::Min(
-                        100,
-                        [Math]::Floor(($index * 100.0) / $total)
-                    )
-                }
-
-                Write-Progress `
-                    -Activity $ProgressActivity `
-                    -Status ([string]$row.CanonicalPath) `
-                    -PercentComplete $percent `
-                    -CurrentOperation ("{0} of {1}" -f $index, $total)
+                Write-RundotSyncProgress `
+                    -State $progressState `
+                    -Index $index `
+                    -Path ([string]$row.CanonicalPath)
             }
 
             Assert-SyncPathRepresentable `
                 -WorkspaceRoot $StagingRoot `
                 -CanonicalPath $row.CanonicalPath
+
+            if ($oversizePaths.Contains([string]$row.CanonicalPath)) {
+                # Unverifiable: no read, no staged bytes, no hash. Size comes
+                # from the listing, which is the only identity the server
+                # exposes for such a file. The kind is a placeholder, not an
+                # observation: the classifier settles these paths before any
+                # kind comparison (#57).
+                $files[$row.CanonicalPath] = [pscustomobject]@{
+                    Sha256            = $null
+                    Size              = [int64](Get-SyncEntrySizeValue -Entry $row.Entry)
+                    LocalDetectedKind = 'binary'
+                    LineEnding        = $null
+                    HasBom            = $null
+                    RemoteKind        = 'binary'
+                    Encoding          = $null
+                    StagingPath       = $null
+                    Unverifiable      = $true
+                }
+                continue
+            }
 
             $originalPath = [string](Get-RemoteEntryProperty -Entry $row.Entry -Names @('path', 'Path'))
             $response = Get-RemoteProjectFile `
@@ -455,12 +504,15 @@ function Get-RemoteSnapshotFileMap {
                 RemoteKind        = ConvertTo-RemoteKind -Encoding $encoding
                 Encoding          = $encoding
                 StagingPath       = $stagingPath
+                Unverifiable      = $false
             }
         }
     }
     finally {
         if ($ShowProgress) {
-            Clear-RemoteSnapshotDownloadProgress -Activity $ProgressActivity
+            Complete-RundotSyncProgress `
+                -State $progressState `
+                -Text ("Downloaded {0} remote file(s)." -f $total)
         }
     }
 

@@ -14,11 +14,12 @@ machine** without guessing:
 - **Plan** / **Status** show what a sync would do, without writing
 - **Pull** applies clean remote-only changes, with a backup of everything it replaces
 - **Push** publishes clean local text overwrites to Studio after confirmation,
-  with a backup of every remote original it replaces
+  and applies confirmed remote deletes, with a backup of every remote original
+  it replaces or removes
 
-**Remote writes are narrow on purpose.** `Push` may overwrite existing utf8
-text files only. It never creates files, never uploads binaries, and never
-deletes anything on Studio. There is no `Apply` shortcut that skips the plan
+**Remote writes are narrow on purpose.** `Push` may overwrite utf8 text, create
+utf8 text, place binaries by the documented sequence, and delete a remote file
+whose local copy is gone. There is no `Apply` shortcut that skips the plan
 fingerprint gates.
 
 If all you want is a plain raw copy of a project, the original exporter
@@ -134,21 +135,19 @@ Before replacing anything it copies the original into
 type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
 backup.
 
-### 5. Push clean local text overwrites (when local should publish)
+### 5. Push local changes (when local should publish)
 
-Run `Push` **only after `Plan`** when the report shows a clean utf8 text
-overwrite (`BASE=A LOCAL=B REMOTE=A`) and that row is applicable. Skip this
-step when you have no local text change to publish.
-
-Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
-Push will check:
+Run `Push` **only after `Plan`** so `.rundot-sync/last-plan.json` records the
+fingerprints Push will check:
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push
 ```
 
-Type `yes` when Push lists the remote files it will overwrite. For unattended
-runs:
+Default `Push` publishes the clean rows and asks before each kind of write:
+one `yes` for text overwrites, a second for text creates, a third for binary
+places, and a fourth before removing any remote file. Accepting one kind never
+accepts another. For unattended runs:
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ForcePush
@@ -156,25 +155,86 @@ runs:
 
 `-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
 
-`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`). Text
-creates, binaries, conflicts, and deletions are reported and left alone. Before
-each overwrite it copies the previous remote bytes into
-`.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
-refuses the whole run and asks you to plan again.
+When Adopt (or any diverged tree) left many conflicts and remote-only files,
+use **local-wins** publish after `Plan` to make Studio match your tree in one
+confirmed set (not a merge):
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -LocalWins
+```
+
+`-LocalWins` prints one combined list and asks once. It publishes clean
+overwrites, text creates, binary creates and replaces, and confirmed remote
+deletes, plus the conflicts you confirm in that list. It never merges content.
+
+See [docs/push.md](docs/push.md) for what is included, refused, and how partial
+BASE updates work.
+
+`Push` publishes:
+
+- utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`) and text creates (`— A —`)
+- binary creates and replaces through the documented place-at-path sequence
+- confirmed remote deletes (`BASE=A LOCAL=— REMOTE=A`), including remote-only
+  paths under `-LocalWins`
+
+Conflicts are published only when `-LocalWins` names them; a conflict that is
+not confirmed stays untouched. Before each overwrite, replace, or delete it
+copies the previous remote bytes into `.rundot-sync/backups/<timestamp>/`. If
+anything changed since `Plan`, `Push` refuses the whole run and asks you to plan
+again.
 
 **Push will:**
 
-- After you type `yes` (or pass `-ForcePush` / `-ConfirmPush`), overwrite
-  existing utf8 text files whose remote bytes still match the plan
+- After you confirm (or pass `-ForcePush` / `-ConfirmPush`), overwrite existing
+  utf8 text files whose remote bytes still match the plan, and create new utf8
+  text files through the documented upload + move + `PUT` sequence
+- Place binary files at their project path through the documented upload +
+  move sequence, and verify an oversize **create** from the upload `ETag`
+- Ask for a separate `yes` before removing any remote file, and list every path
+  it would remove
 - Copy each remote original into `.rundot-sync/backups/<timestamp>/` before any
-  `PUT`
-- Move BASE only after every `PUT` echo-verifies
+  write or delete
+- Move BASE only after every write echo-verifies and every delete is proven
+  absent from `GET /files`
 
 **Push will not:**
 
-- Create files, upload binaries, delete or rename anything on Studio
-- Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
-  skipped; there is no automatic conflict resolution in this version
+- Rename anything on Studio (a rename is published as a create plus a delete
+  only when both sides are confirmed)
+- Delete a path under `.git`, `.gitignore`, `.rundot-sync`, or `.rundot`, or a
+  directory-shaped path
+- Publish a **binary replace** whose remote bytes exceed Studio's
+  2,000,000-byte read limit — the pre-overwrite backup and hash gate cannot read
+  them, so the path is refused (a binary **create** over the limit is published)
+- Merge divergent text — `-LocalWins` replaces remote bytes with local bytes,
+  and an unconfirmed `CONFLICT` is printed and skipped
+
+## Progress on large trees
+
+Every command that hashes your tree, downloads the remote snapshot, or
+publishes files prints plain progress lines that do not depend on
+`Write-Progress` (which some hosts hide):
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+Backing up 1 of 3: src/game/level-12.ts (applied 0, remaining 2)
+Publishing 2 of 3: src/game/level-13.ts (applied 1, remaining 1)
+```
+
+- Hashing and download print a start line, a throttled `count: path` line (at
+  most about once per second), and a final count.
+- Pull and Push name each file they back up or write, with applied versus
+  remaining counts.
+- The `Write-Progress` bar is still shown where the host supports it.
+
+Progress lines carry a canonical path and integer counts only. They never
+include file contents, access tokens, refresh tokens, or `Authorization`
+headers. Printing progress is best effort and never changes fail-closed
+behavior: a failed hash, backup, or write still aborts the run.
 
 ## Your workspace metadata
 
@@ -185,7 +245,7 @@ Sync state lives in `<LocalDir>\.rundot-sync\`:
   base-manifest.json   # BASE: path, size, and SHA-256 per tracked file
   last-plan.json       # the most recent Plan artifact
   journal.jsonl        # metadata-only record of pulls and pushes
-  backups/             # pre-overwrite copies; Pull stores local originals, Push stores previous remote bytes
+  backups/             # pre-overwrite and pre-delete copies; Pull stores local originals, Push stores previous remote bytes
   temp/                # torn-read staging, cleared after each run
 ```
 
@@ -194,9 +254,9 @@ These hold canonical paths, sizes, SHA-256 hashes, and counts. They never
 contain file contents, access tokens, or refresh tokens.
 
 **Full copies: `backups/<timestamp>/`.** This is the exception, and it matters.
-Before `Pull` overwrites a local file, or before `Push` overwrites a remote
-file, the tool copies the *entire original* into the backup set so you can
-restore it. **A backup set can therefore contain complete file contents.**
+Before `Pull` overwrites a local file, or before `Push` overwrites or deletes a
+remote file, the tool copies the *entire original* into the backup set so you
+can restore it. **A backup set can therefore contain complete file contents.**
 
 Both are sensitive, and for different reasons. `.rundot-sync` reveals the
 *names* of every file in your project, and a backup set may additionally hold
@@ -236,7 +296,7 @@ each keep their own independent BASE.
 | `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
 | `Status` | nothing | The same report, without saving an artifact |
 | `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
-| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan, with remote backups |
+| `Push` | REMOTE + BASE | Publish the confirmed local rows from the last plan (text overwrite, text create, binary place, remote delete), with remote backups |
 
 Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
 [Pull](docs/pull.md), [Push](docs/push.md), [BASE schema](docs/base-schema.md).
@@ -376,9 +436,10 @@ Deliberately out of scope, so nothing here does them by accident:
 
 - Applying local changes without a fresh `Plan` (`Apply`)
 - Automatic conflict resolution
-- Remote create, binary upload, rename, or delete
-- Binary upload or adopt
-- Deleting anything automatically, locally or remotely
+- Rename (`POST /move`) as a standalone operation — a rename is published only
+  as a confirmed create plus delete
+- Deleting anything automatically, locally or remotely — a remote delete is
+  applied only through a confirmed `Push`
 - `.rundotignore` custom patterns
 - Newline or encoding normalization
 - File watching, device IDs, or a shared multi-machine BASE
@@ -389,6 +450,80 @@ milestone is in [docs/acceptance.md](docs/acceptance.md).
 ## Contributing
 
 How to branch, open pull requests, and work on a milestone is in [CONTRIBUTING.md](CONTRIBUTING.md). Automated agents must also read [AGENTS.md](AGENTS.md).
+
+Run everything with one command:
+
+```powershell
+# Unit suite + offline acceptance gates (no network, no account)
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Also run the unattended live round-trip against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+`tests/Test-All.ps1` orchestrates `Run-Tests.ps1`, `Acceptance.ps1 -SkipLive`,
+and `Live-RoundTrip.ps1`, and prints one combined summary. The live round-trip
+makes its own Studio-side change, so it needs no manual step; it deletes the
+probe files it created from Studio on teardown. See
+[docs/acceptance.md](docs/acceptance.md).
+
+Set your disposable project id once instead of passing it every run:
+
+```powershell
+Copy-Item .rundot-test.local.example.json .rundot-test.local.json
+# edit .rundot-test.local.json and set "projectId"
+```
+
+`.rundot-test.local.json` is git-ignored and never committed.
+
+Run the whole test set in one shot:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project (live round-trip included)
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+Details and the gate map are in [docs/acceptance.md](docs/acceptance.md).
+
+To run every automated test at once (unit suite, offline acceptance gates, and an unattended live round-trip against a disposable project):
+
+```powershell
+# Offline only
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+See [docs/acceptance.md](docs/acceptance.md) for the gate map and what each phase covers.
+
+To run every check in one shot:
+
+```powershell
+# Offline: unit suite + offline acceptance gates
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+
+# Everything, against a DISPOSABLE project
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+The gate map and evidence for each gate are in [docs/acceptance.md](docs/acceptance.md).
+
+### Testing
+
+One command runs everything (unit suite, offline acceptance gates, and an
+unattended live round-trip when you pass a disposable project id):
+
+```powershell
+powershell -NoProfile -File .\tests\Test-All.ps1 -SkipLive
+powershell -NoProfile -File .\tests\Test-All.ps1 -ProjectId <id>
+```
+
+See [docs/acceptance.md](docs/acceptance.md) for what each phase covers and the
+individual entry points.
 
 ## Development note
 

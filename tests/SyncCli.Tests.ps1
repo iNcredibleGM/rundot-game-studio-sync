@@ -392,6 +392,9 @@ Assert-True `
 Assert-True `
     ($syncCliSource -match '\$ForcePush') `
     "the CLI should accept -ForcePush"
+Assert-True `
+    ($syncCliSource -match '\$LocalWins') `
+    "the CLI should accept -LocalWins"
 
 foreach ($requiredPushFunction in @(
     'Invoke-RundotSyncPush',
@@ -448,6 +451,9 @@ Assert-True `
     ($syncCliSource -match [regex]::Escape('-ForcePush applies to Push only')) `
     "the CLI should refuse -ForcePush outside Push"
 Assert-True `
+    ($syncCliSource -match [regex]::Escape('-LocalWins applies to Push only')) `
+    "the CLI should refuse -LocalWins outside Push"
+Assert-True `
     ($syncCliSource -match [regex]::Escape('[bool]$ForcePush -or [bool]$ConfirmPush')) `
     "the CLI should treat -ConfirmPush as a skip-prompt alias for Push"
 
@@ -460,6 +466,15 @@ Assert-True `
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushConfirmation')) `
     "the CLI should define Read-RundotSyncPushConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncLocalWinsConfirmation')) `
+    "the CLI should define Read-RundotSyncLocalWinsConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-LocalWins')) `
+    "the CLI should forward -LocalWins into the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('result.HadRefusals')) `
+    "the CLI should exit non-zero when local-wins refuses paths after confirmation"
 Assert-True `
     ($pushFunctionText -match [regex]::Escape('result.Cancelled')) `
     "the CLI should handle a cancelled Push confirmation"
@@ -479,3 +494,107 @@ $pushAuthClearCount = ([regex]::Matches($pushFunctionText, 'Authorization\s*=\s*
 Assert-True `
     ($pushAuthClearCount -ge 1) `
     "Invoke-SyncPushCommand should clear the Authorization header before exiting"
+
+
+# --------------------------------------------------------------------------
+# Push delete wiring: the documented DELETE route stays explicit and confirmed
+# --------------------------------------------------------------------------
+
+foreach ($requiredPushLibrary in @(
+    'RemoteDelete.ps1'
+    'RemoteUpload.ps1'
+    'RemoteMove.ps1'
+    'RemoteTextCreate.ps1'
+    'RemoteBinaryPlace.ps1'
+)) {
+    Assert-True `
+        ($syncCliSource -match [regex]::Escape($requiredPushLibrary)) `
+        "the CLI should load lib\$requiredPushLibrary"
+}
+
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushBinaryConfirmation')) `
+    "the CLI should define Read-RundotSyncPushBinaryConfirmation for Push"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushCreateConfirmation')) `
+    "the CLI should define Read-RundotSyncPushCreateConfirmation for Push creates"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmBinary')) `
+    "Push wiring should pass ConfirmBinary into Invoke-RundotSyncPush"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmCreate')) `
+    "the CLI should hand the create prompt to the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Read-RundotSyncPushDeleteConfirmation')) `
+    "the CLI should define Read-RundotSyncPushDeleteConfirmation for Push deletes"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('-ConfirmDelete')) `
+    "the CLI should hand the delete prompt to the engine"
+Assert-True `
+    ($pushFunctionText -match [regex]::Escape('Invoke-RundotSyncPush')) `
+    "the Push command should call the engine that owns the delete"
+
+# The delete confirmation must be its own deliberate prompt, not a silent
+# extension of the overwrite prompt.
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Push will CREATE')) `
+    "the create confirmation must say what will be created"
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Push will DELETE')) `
+    "the delete confirmation must say what will be removed"
+
+# The one file allowed to send DELETE must be the only one.
+Assert-True `
+    ($syncCliSource -notmatch "\.Method\s*=\s*['`"]DELETE['`"]") `
+    "the CLI must not send DELETE itself; lib/RemoteDelete.ps1 owns the route"
+Assert-True `
+    ($pushFunctionText -notmatch "\.Method\s*=\s*['`"]DELETE['`"]") `
+    "Invoke-SyncPushCommand must not send DELETE itself"
+
+
+# --------------------------------------------------------------------------
+# Progress wiring: the CLI loads the helper and asks every command for
+# host-visible hashing and download progress
+# --------------------------------------------------------------------------
+
+Assert-True `
+    ($syncCliSource -match [regex]::Escape('Progress.ps1')) `
+    "the CLI should load lib\Progress.ps1"
+
+foreach ($progressFunction in @(
+    'Invoke-SyncPlanCommand',
+    'Invoke-SyncPullCommand',
+    'Invoke-SyncPushCommand'
+)) {
+    $progressFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName $progressFunction
+    Assert-True `
+        (-not [string]::IsNullOrEmpty($progressFunctionText)) `
+        "the CLI must define $progressFunction"
+
+    Assert-True `
+        ($progressFunctionText -match [regex]::Escape('Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress')) `
+        "$progressFunction should request local hashing progress"
+
+    Assert-True `
+        ($progressFunctionText -match '(?s)Get-StableRemoteSnapshot.{0,240}-ShowProgress') `
+        "$progressFunction should request remote download progress"
+}
+
+$initProgressFunctionText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName 'Invoke-SyncInit'
+Assert-True `
+    (-not [string]::IsNullOrEmpty($initProgressFunctionText)) `
+    "the CLI must define Invoke-SyncInit"
+
+# Init Adopt hashes the existing tree; FromRemote downloads. The adopt
+# initializer must ask for hashing progress, and both snapshot calls in
+# lib/Init.ps1 already pass -ShowProgress.
+$initLibrarySource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\Init.ps1"))
+Assert-True `
+    ($initLibrarySource -match [regex]::Escape('Get-LocalManifest -WorkspaceRoot $LocalDir -ShowProgress')) `
+    "Init Adopt should request local hashing progress"
+
+$snapshotShowProgressCount = ([regex]::Matches($initLibrarySource, '-ShowProgress')).Count
+Assert-True `
+    ($snapshotShowProgressCount -ge 2) `
+    "both Init modes should request remote download progress"
+

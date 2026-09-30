@@ -13,12 +13,13 @@ or any input map. `Plan`/`Status` ([#9](https://github.com/iNcredibleGM/rundot-g
 compose it ([plan.md](plan.md)); `Pull` ([#10](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/10))
 filters its rows for applicable downloads, and `Push`
 ([#17](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/17))
-filters plan rows for applicable utf8 text overwrites ([push.md](push.md)).
+filters plan rows for applicable utf8 text overwrites and creates ([push.md](push.md)).
 
 `Applicable` is the classifier's own view of a path. `Plan` is stricter for
-publish work: only a utf8 text **overwrite** may stay `applicable: true` in the
-artifact. Text creates, binary uploads, and delete candidates are forced to
-`applicable: false` with explicit reasons ([plan.md](plan.md)). A plan is never
+publish work: utf8 text **overwrites** and **creates**, plus route-allowed
+remote deletes, may stay `applicable: true` in the artifact. Binaries and
+refused paths are forced to `applicable: false` with explicit reasons
+([plan.md](plan.md)). A plan is never
 permission to write: `Push` must still re-verify every fingerprint.
 
 ## Inputs
@@ -62,7 +63,7 @@ Hash comparison is ordinal and case-insensitive: the same bytes may be spelled
 
 ## Status vocabulary
 
-All ten statuses are literal strings exported as `$script:SyncStatus*`
+All eleven statuses are literal strings exported as `$script:SyncStatus*`
 constants so `Plan` renders one source of truth.
 
 | Status | Meaning | Applicable |
@@ -75,12 +76,23 @@ constants so `Plan` renders one source of truth.
 | `download` | REMOTE differs from BASE while LOCAL still matches BASE | yes |
 | `conflict` | no single safe direction | no |
 | `ignored` | out of sync scope by the default ignore set | no |
-| `deleteRemoteCandidate` | LOCAL gone, REMOTE still matches BASE | no |
+| `deleteRemoteCandidate` | LOCAL gone, REMOTE still matches BASE | yes, when the path is route-allowed |
 | `deleteLocalCandidate` | REMOTE gone, LOCAL still matches BASE | no |
+| `unverifiable` | REMOTE is over Studio's 2,000,000-byte read limit, so its bytes cannot be read or hashed | no |
 
-`Applicable` is about **this milestone**, not about correctness: this version
-can publish a utf8 text overwrite via `Push` and still never deletes, so delete
-candidates are classified but never actionable.
+`Applicable` is about **what a confirmed command may apply**, not about
+correctness: this version can publish a utf8 text overwrite, create a utf8 text
+file, and apply a route-allowed remote delete via `Push` ([text-create.md](text-create.md),
+[delete.md](delete.md), [binary-place.md](binary-place.md)). It never deletes a local file, so a
+`deleteLocalCandidate` is classified but never actionable. A reserved or
+directory-shaped delete candidate is classified but refused by the route rules.
+
+`unverifiable` is a no-op status like `unchanged`, but it is deliberately **not**
+a claim of agreement: it means the remote bytes exist (the listing reports a
+path and size) and cannot be read back, so the tool refuses to guess a direction.
+It is reported under its own `UNVERIFIABLE` heading, never folded into
+`UNCHANGED`, and is never applicable — `Pull` never downloads it and `Push` never
+rewrites it ([remote-snapshot.md](remote-snapshot.md), [binary-place.md](binary-place.md)).
 
 ## Decision table
 
@@ -105,16 +117,24 @@ side.
 | A | — | — | `settledAbsent` |
 
 `A / — / —` is `settledAbsent`: a deletion already agreed on by both sides is
-not a standing `DELETE`. Deletions are classification only; the delete verb is
-characterized in
-[delete-rename-protocol.md](delete-rename-protocol.md), and nothing in this
-milestone emits one.
+not a standing `DELETE`. A `deleteRemoteCandidate` is applied only by a
+confirmed `Push` ([delete.md](delete.md)); the delete verb is characterized in
+[delete-rename-protocol.md](delete-rename-protocol.md).
 
-A delete candidate carries the reason that constrains a future `Apply`:
+The table above assumes REMOTE is readable. When REMOTE exists and is over
+Studio's 2,000,000-byte read limit, the path is `unverifiable` **before** this
+table is consulted, whatever BASE and LOCAL say: its bytes cannot be read, so no
+row here can be proven. A declared hash on an oversize remote (from the listing
+or a previous BASE) is never treated as agreement, so such a path is never
+`unchanged`. An oversize remote's kind is a placeholder (`binary`), never an
+observation, so it is not compared for a kind change either — a text LOCAL
+against it is `unverifiable`, not a `conflict`.
+
+A delete candidate carries the reason that constrains a `Push` delete:
 
 ```text
-Reason   : Deletion is classification-only in this milestone.
-           No local or remote file is deleted.
+Reason   : Pull never deletes anything, locally or remotely.
+           A deletion candidate is reported here and applied only by a confirmed Push.
            Studio cannot make a delete conditional: there is no ETag or
            version field and If-Match is ignored, so a stale delete cannot be
            refused server-side.
@@ -161,25 +181,10 @@ the row becomes `conflict` with `KindChange = $true`. When the hashes are
 equal, the kind disagreement is only metadata: equal bytes win, so the row
 stays a no-op plus a `Warning`.
 
-**Binary upload candidates.** A binary upload keeps `Status = 'upload'` — it is
-never relabelled as a skip — but is marked `Applicable = $false`:
-
-```text
-Status   : upload
-Applicable: False
-Reason   : Remote binary replacement is not possible: the upload flow ignores
-           the requested path and a repeated name creates a sibling instead of
-           replacing.
-```
-
-Binary replacement was verified **impossible** in
-[#15](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/15): the
-upload flow ignores the requested path (a file always lands at
-`/uploads/{basename}`) and a repeated name creates a numeric-suffixed sibling
-rather than replacing the existing file ([binary-upload-protocol.md](binary-upload-protocol.md)).
-Every binary upload candidate is therefore conservative, including a brand-new
-`— / A / —` file, because publishing it would create a different path than the
-plan promised. Text uploads, by contrast, are `Applicable = $true`.
+**Binary upload candidates.** A binary upload keeps `Status = 'upload'` and is
+marked `Applicable = $true` at the classifier layer, same as text. Reserved
+paths, directory-shaped paths, empty files, and kind mismatches are refused in
+`Plan` and again in `Push` ([binary-place.md](binary-place.md)).
 
 ## Determinism and purity
 
@@ -200,7 +205,8 @@ plan promised. Text uploads, by contrast, are `Applicable = $true`.
   the snapshot retries and then aborts, so a partial map is never classified.
 - `Plan` must call `Assert-BaseOwnership` before reading BASE
   ([base-schema.md](base-schema.md)).
-- Why a delete candidate stays classification-only, and what the delete verb
-  actually does: [delete-rename-protocol.md](delete-rename-protocol.md).
+- Why a delete candidate is applied only by a confirmed `Push`, and what the
+  delete verb actually does: [delete.md](delete.md),
+  [delete-rename-protocol.md](delete-rename-protocol.md).
 
 Unit coverage lives in `tests/SyncEngine.Tests.ps1` and requires no network.

@@ -160,6 +160,33 @@ LOCAL and REMOTE agreement has not been proven, so every path is a guess.
 ownership-checked, so the flag can never accept a BASE belonging to a
 different project or folder.
 
+## Progress output
+
+Init hashes the whole local tree before it prints a report, and Adopt does
+that over an existing tree. On a large workspace that can look hung, so the
+commands print plain progress lines that do not depend on `Write-Progress`:
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+```
+
+- Local hashing prints a start line, then a throttled `count: path` line (at
+  most about once per second) and a final count.
+- Remote download prints a start line, a throttled `index of total: path`
+  line, and a final count.
+- The `Write-Progress` bar is still updated where the host shows it. The plain
+  lines are what make progress visible in hosts that do not.
+
+Progress output contains a canonical path and integer counts only. It never
+prints file contents, access tokens, refresh tokens, or `Authorization`
+headers. Printing progress is best effort and never changes fail-closed
+behavior: a failed hash or download still aborts, and a progress write can
+never mask that error.
+
 ## Limitation: API hash fields
 
 REMOTE is verified by byte-hashing staged and promoted files against the

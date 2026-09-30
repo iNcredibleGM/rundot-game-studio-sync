@@ -14,11 +14,13 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
 . (Join-Path $repoRoot "lib\Classifier.ps1")
 . (Join-Path $repoRoot "lib\Plan.ps1")
+. (Join-Path $repoRoot "lib\RemoteDelete.ps1")
 
 $syncPlanTestShaA = 'a' * 64
 $syncPlanTestShaB = 'b' * 64
@@ -400,7 +402,7 @@ try {
 
 
     # --------------------------------------------------------------------------
-    # Publish policy: only a utf8 text overwrite may be applicable
+    # Publish policy: utf8 text overwrite and text create may be applicable
     # --------------------------------------------------------------------------
 
     $guardBase = @{
@@ -413,7 +415,7 @@ try {
     $guardLocal = @{
         'src/text.ts'     = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB)
         'src/new.ts'      = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC)
-        'public/x.png'    = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary')
+        'public/x.png'    = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary' -Size 71)
         'src/dl.ts'       = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
         'src/localdel.ts' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaA)
     }
@@ -442,6 +444,36 @@ try {
 
     $guardOps = @($guardArtifact.operations)
 
+    # A second fixture for the two delete refusals the route rules own:
+    # a reserved root and a directory-shaped path. Both stay delete candidates
+    # at the classifier layer and both must be refused by the publish policy.
+    $reservedBase = @{
+        '.rundot/config' = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+        'src/dir'        = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA)
+    }
+    $reservedLocal = @{}
+    $reservedRemote = @{
+        '.rundot/config' = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA)
+        'src/dir'        = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA)
+        'src/dir/a.ts'   = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaB)
+    }
+
+    $reservedArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution (New-SyncPlanTestResolution `
+            -Base ([pscustomobject]@{
+                capturedAt = '2026-09-14T12:00:00.0000000Z'
+                files      = $reservedBase
+            }) `
+            -BasePresent $true `
+            -Untrusted $false) `
+        -Local $reservedLocal `
+        -Remote $reservedRemote `
+        -Snapshot $snapshot
+
+    $reservedOps = @($reservedArtifact.operations)
+
     $textUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/text.ts'
     Assert-Equal 'upload' $textUpload.status "the text upload row must keep its upload status"
     Assert-Equal $true $textUpload.remoteMutating "a text upload is remote-mutating"
@@ -450,19 +482,31 @@ try {
 
     $textCreate = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/new.ts'
     Assert-Equal 'upload' $textCreate.status "a new local text file must still display as upload"
-    Assert-Equal $false $textCreate.applicable "a text create must not be applicable"
-    Assert-Equal `
-        'PUT /file cannot create a new path; a missing remote file returns 404.' `
-        ([string]$textCreate.reason) `
-        "a text create must explain that PUT is overwrite-only"
+    Assert-Equal $true $textCreate.applicable "a clean utf8 text create must be applicable"
+    Assert-Null $textCreate.reason "a publishable text create must not carry a block reason"
+
+    $blockedCreateLocal = @{
+        '.rundot/blocked.txt' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC)
+    }
+    $blockedCreateArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $guardResolution `
+        -Local $blockedCreateLocal `
+        -Remote @{} `
+        -Snapshot $snapshot
+    $blockedCreateRow = Get-SyncPlanTestRowForPath `
+        -Rows @($blockedCreateArtifact.operations) `
+        -Path '.rundot/blocked.txt'
+    Assert-Equal $false $blockedCreateRow.applicable "a reserved-path text create must not be applicable"
+    Assert-True `
+        ([string]$blockedCreateRow.reason -match 'Reserved path') `
+        "a reserved-path text create must explain the refusal"
 
     $binaryUpload = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'public/x.png'
     Assert-Equal 'upload' $binaryUpload.status "a binary upload must still display as upload"
-    Assert-Equal $false $binaryUpload.applicable "a binary upload must not be applicable"
-    Assert-Equal `
-        'Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing.' `
-        ([string]$binaryUpload.reason) `
-        "a binary upload must keep the fixed replacement-impossible reason"
+    Assert-Equal $true $binaryUpload.applicable "a clean binary replace must be applicable"
+    Assert-Null $binaryUpload.reason "an applicable binary replace carries no reason"
 
     $download = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/dl.ts'
     Assert-Equal 'download' $download.status "a remote-only change keeps the download status"
@@ -472,11 +516,25 @@ try {
     $remoteDelete = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/gone.ts'
     Assert-Equal 'deleteRemoteCandidate' $remoteDelete.status "a remote deletion keeps its status"
     Assert-Equal $true $remoteDelete.remoteMutating "a remote delete candidate is remote-mutating"
-    Assert-Equal $false $remoteDelete.applicable "a remote delete candidate must not be applicable"
-    Assert-Equal `
-        'Push does not delete remote files.' `
-        ([string]$remoteDelete.reason) `
-        "a remote delete candidate must carry the Push refusal reason"
+    Assert-Equal $true $remoteDelete.applicable "a route-allowed remote delete must be applicable for Push"
+    Assert-Null $remoteDelete.reason "an applicable remote delete must not carry a block reason"
+
+    # A reserved path and a directory-shaped path are both refused by the
+    # route rules even though the classifier still calls them delete
+    # candidates. The reason names why, and neither is applicable.
+    $reservedDelete = Get-SyncPlanTestRowForPath -Rows $reservedOps -Path '.rundot/config'
+    Assert-Equal 'deleteRemoteCandidate' $reservedDelete.status "a reserved path is still a delete candidate"
+    Assert-Equal $false $reservedDelete.applicable "a reserved path must never be applicable for delete"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$reservedDelete.reason)) `
+        "a refused reserved delete must carry a reason"
+
+    $directoryDelete = Get-SyncPlanTestRowForPath -Rows $reservedOps -Path 'src/dir'
+    Assert-Equal 'deleteRemoteCandidate' $directoryDelete.status "a directory-shaped path is still a delete candidate"
+    Assert-Equal $false $directoryDelete.applicable "a directory-shaped path must never be applicable for delete"
+    Assert-True `
+        (-not [string]::IsNullOrEmpty([string]$directoryDelete.reason)) `
+        "a refused directory-shaped delete must carry a reason"
 
     $localDelete = Get-SyncPlanTestRowForPath -Rows $guardOps -Path 'src/localdel.ts'
     Assert-Equal 'deleteLocalCandidate' $localDelete.status "a local deletion keeps its status"
@@ -813,6 +871,56 @@ try {
         (($ignoredReport -split "`n" | Where-Object { $_ -match '^IGNORED$' }).Count -eq 1) `
         "ignored paths must produce an IGNORED section"
 
+    # An oversize remote path is unverifiable (#57): its own section, a
+    # summary count, and never folded into UNCHANGED even with
+    # -IncludeUnchanged.
+    $unverifiableRemote = New-SyncPlanTestRemoteEntry `
+        -Sha256 $null `
+        -Size ([int64]$SyncStudioMaxReadableFileSize + 1) `
+        -Kind 'binary' `
+        -Encoding 'base64'
+    $unverifiableRemoteMap = @{ 'public/huge.png' = $unverifiableRemote }
+    $unverifiableAnalysis = New-RundotSyncPlanAnalysis `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $resolution `
+        -Local @{} `
+        -Remote $unverifiableRemoteMap `
+        -Snapshot $snapshot `
+        -Command 'Plan' `
+        -PersistArtifact:$false
+    $unverifiableReport = [string]$unverifiableAnalysis.Report
+    Assert-True `
+        (($unverifiableReport -split "`n" | Where-Object { $_ -match '^UNVERIFIABLE$' }).Count -eq 1) `
+        "an oversize remote path must produce exactly one UNVERIFIABLE section"
+    Assert-True `
+        ($unverifiableReport -match '(?m)^\s*unverifiable:\s*1\s*$') `
+        "the SUMMARY must count the unverifiable path"
+    Assert-True `
+        ($unverifiableReport -match [regex]::Escape('public/huge.png')) `
+        "the UNVERIFIABLE section must name the path"
+    Assert-True `
+        (($unverifiableReport -split "`n" | Where-Object { $_ -match '^DOWNLOAD$' }).Count -eq 0) `
+        "an oversize remote path must not appear as a download"
+
+    $unverifiableVerbose = New-RundotSyncPlanAnalysis `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution $resolution `
+        -Local @{} `
+        -Remote $unverifiableRemoteMap `
+        -Snapshot $snapshot `
+        -Command 'Plan' `
+        -IncludeUnchanged `
+        -PersistArtifact:$false
+    $unverifiableVerboseReport = [string]$unverifiableVerbose.Report
+    Assert-True `
+        (($unverifiableVerboseReport -split "`n" | Where-Object { $_ -match '^UNCHANGED$' }).Count -eq 0) `
+        "an unverifiable path must never be folded into UNCHANGED"
+    Assert-True `
+        (($unverifiableVerboseReport -split "`n" | Where-Object { $_ -match '^UNVERIFIABLE$' }).Count -eq 1) `
+        "the unverifiable section must stand on its own"
+
     # Summary counts must equal the row counts.
     $summaryUploadLine = @($reportLines | Where-Object { $_ -match '^\s*upload:\s*(\d+)\s*$' })
     Assert-True ($summaryUploadLine.Count -eq 1) "the SUMMARY must report the upload count once"
@@ -973,6 +1081,79 @@ try {
     Assert-True `
         (([string]$diagAnalysis.Report) -match [regex]::Escape('bom-only.ts')) `
         "the DIAGNOSTIC section must name the affected path"
+
+    # --------------------------------------------------------------------------
+    # A binary over Studio's read limit at Plan (#51, revised by #54)
+    # --------------------------------------------------------------------------
+
+    # A CREATE over the limit is now PUBLISHABLE: the place sequence verifies it
+    # from the upload ETag instead of a GET /file read-back (#54). A REPLACE
+    # stays refused, because the pre-overwrite backup and the expectedRemoteHash
+    # gate both need the existing remote bytes.
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeCreateLocal = @{
+        'public/huge.png' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary' -Size ($oversizeLimit + 1))
+        'public/small.png' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaC -Kind 'binary' -Size 71)
+    }
+    $oversizeCreateArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution (New-SyncPlanTestResolution `
+            -Base ([pscustomobject]@{
+                capturedAt = '2026-09-14T12:00:00.0000000Z'
+                files      = @{}
+            }) `
+            -BasePresent $true `
+            -Untrusted $false) `
+        -Local $oversizeCreateLocal `
+        -Remote @{} `
+        -Snapshot $snapshot
+    $oversizeCreateOps = @($oversizeCreateArtifact.operations)
+
+    $hugeCreateRow = Get-SyncPlanTestRowForPath -Rows $oversizeCreateOps -Path 'public/huge.png'
+    Assert-Equal $true $hugeCreateRow.applicable "an oversized binary create must stay applicable (#54)"
+    Assert-Null $hugeCreateRow.reason "an oversized binary create must not carry a block reason (#54)"
+
+    $smallCreateRow = Get-SyncPlanTestRowForPath -Rows $oversizeCreateOps -Path 'public/small.png'
+    Assert-Equal $true $smallCreateRow.applicable "a binary create under the limit must stay applicable"
+    Assert-Null $smallCreateRow.reason "a publishable binary create must not carry a block reason"
+
+    # A REPLACE over the limit stays refused: it is the delete-then-place path
+    # #51 reported, and its existing remote bytes cannot be read.
+    $oversizeReplaceBase = @{
+        'public/x.png' = (New-SyncPlanTestBaseEntry -Sha256 $syncPlanTestShaA -Kind 'binary')
+    }
+    $oversizeReplaceLocal = @{
+        'public/x.png' = (New-SyncPlanTestLocalEntry -Sha256 $syncPlanTestShaB -Kind 'binary' -Size ($oversizeLimit + 1))
+    }
+    $oversizeReplaceRemote = @{
+        'public/x.png' = (New-SyncPlanTestRemoteEntry -Sha256 $syncPlanTestShaA -Kind 'binary' -Encoding 'base64')
+    }
+    $oversizeReplaceArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $artifactWorkspace `
+        -ProjectId 'proj-test-1' `
+        -Resolution (New-SyncPlanTestResolution `
+            -Base ([pscustomobject]@{
+                capturedAt = '2026-09-14T12:00:00.0000000Z'
+                files      = $oversizeReplaceBase
+            }) `
+            -BasePresent $true `
+            -Untrusted $false) `
+        -Local $oversizeReplaceLocal `
+        -Remote $oversizeReplaceRemote `
+        -Snapshot $snapshot
+
+    $hugeReplaceRow = Get-SyncPlanTestRowForPath `
+        -Rows @($oversizeReplaceArtifact.operations) `
+        -Path 'public/x.png'
+    Assert-Equal 'upload' $hugeReplaceRow.status "an oversized binary replace must still display as upload"
+    Assert-Equal $false $hugeReplaceRow.applicable "an oversized binary replace must not be applicable"
+    Assert-True `
+        (([string]$hugeReplaceRow.reason) -match 'read limit') `
+        "an oversized binary replace must explain the read limit"
+    Assert-True `
+        (([string]$hugeReplaceRow.reason) -match [regex]::Escape([string]$oversizeLimit)) `
+        "the oversized replace refusal must name the limit"
 }
 finally {
     if (Test-Path -LiteralPath $syncPlanTestRoot) {

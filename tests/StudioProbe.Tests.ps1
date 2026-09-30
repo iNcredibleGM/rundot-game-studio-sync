@@ -266,6 +266,22 @@ Assert-True (
     $applyBody -match 'needsManual'
 ) "rename-devtools-apply must report a path it could not delete rather than forcing it"
 
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioRunTextCreateAll'
+) "the #37 text create investigation must be runnable with one command"
+
+Assert-True (
+    $probeText -match 'function Invoke-ScenarioTextCreateDevToolsApply'
+) "the DevTools text-create capture must have a recording scenario"
+
+Assert-True (
+    $probeText -match '\.rundot-sync/\*'
+) "Assert-ProbeDeleteTarget must allow stamped cleanup under /.rundot-sync/"
+
+Assert-True (
+    $probeText -match 'function Get-ProbeDevToolsCaptureRoutes'
+) "text-create and rename captures must share a route extractor"
+
 # ---------------------------------------------------------------------------
 # Every declared scenario must be dispatchable, and every scenario must also
 # appear in the dry-run plan. A scenario that is in the ValidateSet but not the
@@ -311,7 +327,7 @@ Assert-Equal 0 $undispatched.Count (
 
 # The runner functions are the documented entry points; they must exist and be
 # reachable from the dispatch switch.
-foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all')) {
+foreach ($runnerName in @('run-text-all', 'run-binary-all', 'run-delete-rename-all', 'run-text-create-all', 'run-binary-place-all')) {
     Assert-True (
         $dispatchMatch.Success -and
         $dispatchMatch.Groups[1].Value -match [regex]::Escape("'$runnerName'")
@@ -402,7 +418,9 @@ if (Test-Path $libRoot) {
     )
 }
 
-$reachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe|upload-adopt|upload-url'
+$probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
+$uploadReachabilityPattern = '(?i)upload-adopt|upload-url'
+$allowedUploadRelative = 'lib/RemoteUpload.ps1'
 
 foreach ($productPath in $productPaths) {
     if (-not (Test-Path $productPath)) {
@@ -410,8 +428,13 @@ foreach ($productPath in $productPaths) {
     }
 
     $relative = $productPath.Substring($repoRoot.Length).TrimStart("\", "/")
+    $normalizedRelative = $relative -replace '\\', '/'
     $text = Get-Content -Path $productPath -Raw
-    $matches = [regex]::Matches($text, $reachabilityPattern)
+    $matches = [regex]::Matches($text, $probeReachabilityPattern)
+
+    if ($normalizedRelative -ne $allowedUploadRelative) {
+        $matches += [regex]::Matches($text, $uploadReachabilityPattern)
+    }
 
     Assert-Equal 0 $matches.Count (
         "product file $relative must not reference the probe or Studio upload endpoints"

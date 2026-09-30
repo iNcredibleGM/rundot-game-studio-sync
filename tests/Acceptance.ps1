@@ -8,7 +8,10 @@
 #
 # Offline gates need no network and no account. Live Pull gates pause for a
 # Studio-side edit. Live Push gates reuse the Gate 2 local edit after Pull and
-# publish it with documented PUT /file (no extra Studio pause).
+# publish utf8 text with documented PUT /file. Gates 14-15 script-write a
+# binary under sync-acceptance/ and exercise the place sequence; gate 15 uses
+# Push -LocalWins for the replace, so the local-wins binary replace path is a
+# live gate (#51).
 #
 # This script never prints or persists tokens, auth files, or file contents.
 # It is named Acceptance.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
@@ -38,6 +41,7 @@ $testRunner = Join-Path $PSScriptRoot "Run-Tests.ps1"
 . (Join-Path $repoRoot "lib\Paths.ps1")
 . (Join-Path $repoRoot "lib\Ignore.ps1")
 . (Join-Path $repoRoot "lib\Hashing.ps1")
+. (Join-Path $repoRoot "lib\Progress.ps1")
 . (Join-Path $repoRoot "lib\Workspace.ps1")
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\Backup.ps1")
@@ -111,10 +115,16 @@ function Write-AcceptanceGateMap {
     Write-Host "  11   Push without force refuses non-interactively                [live]"
     Write-Host "  12   Push -ForcePush applies with remote backup + BASE           [live]"
     Write-Host "  13   Push journals success and push-backup without secrets       [live]"
+    Write-Host "  14   Binary create via place sequence (-ForcePush)                 [live]"
+    Write-Host "  15   Binary replace via Push -LocalWins with remote backup          [live]"
+    Write-Host "  16   Host-visible progress (hashing, download, publish)            [live]"
+    Write-Host "  17   Oversize remote file is unverifiable, not a project abort     [live]"
+    Write-Host "  18   Confirmed Push deletes one remote file, backup + journal      [live]"
     Write-Host ""
     Write-Host "Init is setup inside gate 2 when BASE is missing; it is not a numbered gate."
     Write-Host "Numbers 5-10 were defined for the Pull milestone; 11-13 extend Push without"
-    Write-Host "renumbering earlier gates."
+    Write-Host "renumbering earlier gates. Gates 14-18 run in tests/Live-RoundTrip.ps1,"
+    Write-Host "not in this harness."
     Write-Host ""
     Write-Host "Execution order in this run (not the same as the numbers above):"
     Write-Host "  Offline: 1, 5, 7a, 7b, 8, 10"
@@ -184,8 +194,113 @@ function Test-PushDeclinedWithoutMutation {
     return (
         ($PushResult.Output -match 'Push cancelled') -or
         ($PushResult.Output -match 'Confirm the overwrite') -or
+        ($PushResult.Output -match 'Confirm the binary place') -or
+        ($PushResult.Output -match 'binary file\(s\) would be created or replaced') -or
         ($PushResult.Output -match 'Refusing to push')
     )
+}
+
+function Get-AcceptancePlanArtifactOperation {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath
+    )
+
+    $artifactPath = Join-Path (Get-RundotSyncRoot -WorkspaceRoot $WorkspaceRoot) 'last-plan.json'
+    if (-not (Test-Path -LiteralPath $artifactPath)) {
+        return $null
+    }
+
+    $artifact = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json
+    foreach ($operation in @($artifact.operations)) {
+        if ([string]::Equals([string]$operation.path, $CanonicalPath, [System.StringComparison]::Ordinal)) {
+            return $operation
+        }
+    }
+
+    return $null
+}
+
+function Remove-AcceptanceStrayLocalCreates {
+    # Earlier live runs can leave unpublished files under sync-acceptance/.
+    # Those are extra upload rows, so gate 2 no longer sees exactly one edit
+    # and gate 14 no longer sees only its own create.
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot
+    )
+
+    $folder = Join-Path $WorkspaceRoot 'sync-acceptance'
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+        return 0
+    }
+
+    $base = Read-BaseManifest -WorkspaceRoot $WorkspaceRoot
+    $baseFiles = $null
+    if ($null -ne $base) {
+        $filesProperty = $base.PSObject.Properties['files']
+        if ($null -ne $filesProperty) {
+            $baseFiles = $filesProperty.Value
+        }
+    }
+
+    $removed = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue)) {
+        $canonical = ConvertTo-CanonicalSyncPathFromLocal `
+            -WorkspaceRoot $WorkspaceRoot `
+            -FullPath $file.FullName
+
+        $inBase = $false
+        if ($null -ne $baseFiles) {
+            if ($baseFiles -is [System.Collections.IDictionary]) {
+                $inBase = $baseFiles.Contains($canonical)
+            }
+            else {
+                $inBase = $null -ne $baseFiles.PSObject.Properties[$canonical]
+            }
+        }
+
+        if (-not $inBase) {
+            Remove-Item -LiteralPath $file.FullName -Force
+            $removed++
+        }
+    }
+
+    return $removed
+}
+
+function Get-PushBinaryRows {
+    param([string]$Output)
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $lines = $Output -split "`n"
+    $inSection = $false
+
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd("`r")
+
+        if ($trimmed -eq 'BINARY') {
+            $inSection = $true
+            continue
+        }
+
+        if (-not $inSection) { continue }
+
+        if ($trimmed -match '^\s+(.+?)\s+\(binary (create|replace)\)\s*$') {
+            $rows.Add([pscustomobject]@{
+                Path = $matches[1].Trim()
+                Mode = $matches[2]
+            })
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $trimmed -notmatch '^\s') { break }
+    }
+
+    return $rows.ToArray()
 }
 
 function Get-PlanSummaryCount {
@@ -482,9 +597,10 @@ else {
             $planNoBaseResult.ExitCode, $refusalMentionsBase, $refusalPointsAtInit, (Test-Path -LiteralPath $planArtifactPath))
 }
 
-# Gate 10: mutation grep (documented PUT /file only in lib/RemoteWrite.ps1)
+# Gate 10: mutation grep (documented PUT /file in lib/RemoteWrite.ps1 and
+# documented DELETE /file in lib/RemoteDelete.ps1)
 Write-Host ""
-Write-Host "Gate 10: mutation grep allows only documented PUT /file"
+Write-Host "Gate 10: mutation grep allows only documented PUT /file and DELETE /file"
 $productFiles = @()
 foreach ($candidate in @($syncCli, (Join-Path $repoRoot "game-studio-export.ps1"))) {
     if (Test-Path -LiteralPath $candidate) { $productFiles += Get-Item $candidate }
@@ -501,7 +617,13 @@ $httpMovePattern = '(?i)/move\b|projects/\{[^}]+\}/move'
 $setFunctionPattern = '(?im)^\s*function\s+Set-'
 $removeFunctionPattern = '(?im)^\s*function\s+Remove-'
 $probeReachabilityPattern = '(?i)StudioProbe|tools[\\/]StudioProbe'
-$allowedPutRelative = 'lib/RemoteWrite.ps1'
+$allowedUploadRelative = 'lib/RemoteUpload.ps1'
+$allowedPutRelatives = @(
+    'lib/RemoteWrite.ps1'
+    'lib/RemoteUpload.ps1'
+)
+$allowedDeleteRelative = 'lib/RemoteDelete.ps1'
+$allowedMoveRelative = 'lib/RemoteMove.ps1'
 
 $mutationHits = New-Object 'System.Collections.Generic.List[string]'
 foreach ($file in $productFiles) {
@@ -509,22 +631,28 @@ foreach ($file in $productFiles) {
     $relative = $file.FullName.Substring($repoRoot.Length).TrimStart("\", "/")
     $normalizedRelative = $relative -replace '\\', '/'
 
-    foreach ($match in [regex]::Matches($text, $uploadPattern)) {
-        [void]$mutationHits.Add("${relative}: Studio upload endpoint '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedUploadRelative) {
+        foreach ($match in [regex]::Matches($text, $uploadPattern)) {
+            [void]$mutationHits.Add("${relative}: Studio upload endpoint '$($match.Value)'")
+        }
     }
 
-    if ($normalizedRelative -ne $allowedPutRelative) {
+    if ($allowedPutRelatives -notcontains $normalizedRelative) {
         foreach ($match in [regex]::Matches($text, $httpPutPattern)) {
             [void]$mutationHits.Add("${relative}: HTTP PUT '$($match.Value)'")
         }
     }
 
-    foreach ($match in [regex]::Matches($text, $httpDeletePattern)) {
-        [void]$mutationHits.Add("${relative}: HTTP DELETE '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedDeleteRelative) {
+        foreach ($match in [regex]::Matches($text, $httpDeletePattern)) {
+            [void]$mutationHits.Add("${relative}: HTTP DELETE '$($match.Value)'")
+        }
     }
 
-    foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
-        [void]$mutationHits.Add("${relative}: Studio move endpoint '$($match.Value)'")
+    if ($normalizedRelative -ne $allowedMoveRelative) {
+        foreach ($match in [regex]::Matches($text, $httpMovePattern)) {
+            [void]$mutationHits.Add("${relative}: Studio move endpoint '$($match.Value)'")
+        }
     }
 
     foreach ($match in [regex]::Matches($text, $probeReachabilityPattern)) {
@@ -543,11 +671,11 @@ foreach ($file in $productFiles) {
 }
 
 if ($mutationHits.Count -eq 0) {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "PASS" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented Studio write routes" -Status "PASS" `
         -Detail ("scanned {0} product file(s)" -f $productFiles.Count)
 }
 else {
-    Add-GateResult -Gate "10. Mutation grep allows only documented PUT /file" -Status "FAIL" `
+    Add-GateResult -Gate "10. Mutation grep allows only documented Studio write routes" -Status "FAIL" `
         -Detail ($mutationHits -join "; ")
 }
 
@@ -564,9 +692,11 @@ if ($SkipLive) {
     Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" -Detail "-SkipLive"
     Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "SKIP" -Detail "-SkipLive"
+    Add-GateResult -Gate "15. Binary replace via Push -LocalWins with remote backup" -Status "SKIP" -Detail "-SkipLive"
 }
 elseif ([string]::IsNullOrEmpty($ProjectId)) {
-    Add-GateResult -Gate "2-4, 6, 9, 11-13 live gates" -Status "SKIP" -Detail "no -ProjectId supplied; rerun with -ProjectId <id>"
+    Add-GateResult -Gate "2-4, 6, 9, 11-15 live gates" -Status "SKIP" -Detail "no -ProjectId supplied; rerun with -ProjectId <id>"
 }
 else {
     if ([string]::IsNullOrEmpty($LocalDir)) {
@@ -586,7 +716,7 @@ else {
 
     Write-Phase "Live gates"
     Write-Host ""
-    Write-Host "Live execution order: gate 2 (+9), 3, 6, 4, then 11-13."
+    Write-Host "Live execution order: gate 2 (+9), 3, 6, 4, then 11-13, then 14-15 (binary)."
     Write-Host "Init runs automatically before gate 2 when BASE is missing."
     Write-Host ""
     Write-Host "Project:   $ProjectId"
@@ -616,6 +746,8 @@ else {
             Add-GateResult -Gate "11. Push without force refuses in a non-interactive run" -Status "SKIP" -Detail "Init failed"
             Add-GateResult -Gate "12. Push -ForcePush applies with remote backup and BASE update" -Status "SKIP" -Detail "Init failed"
             Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "SKIP" -Detail "Init failed"
+            Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "SKIP" -Detail "Init failed"
+            Add-GateResult -Gate "15. Binary replace with remote backup" -Status "SKIP" -Detail "Init failed"
         }
     }
 
@@ -629,6 +761,13 @@ else {
         Write-Host "press Enter. This script does not edit your files for you, so the"
         Write-Host "change under test is unambiguously yours."
         Write-Host ""
+
+        $strayCreates = Remove-AcceptanceStrayLocalCreates -WorkspaceRoot $LocalDir
+        if ($strayCreates -gt 0) {
+            Write-Host "Removed $strayCreates unpublished file(s) left under sync-acceptance/ by an earlier acceptance run."
+            Write-Host ""
+        }
+
         [void](Read-Host "Press Enter once the edit is saved")
 
         $planOne = Invoke-SyncCli -CliArgs @(
@@ -1091,6 +1230,241 @@ else {
                                 Add-GateResult -Gate "13. Push journals success and push-backup without secrets" -Status "FAIL" `
                                     -Detail ("push success={0}, push-backup={1}, journal safe={2}" -f `
                                         $successPushRecords.Count, $pushBackupRecords.Count, $journalSafe)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # Gates 14-15: binary place (script creates the file; no Studio pause).
+        Write-Host ""
+        Write-Host "--------------------------------------------------"
+        Write-Host "GATES 14-15: binary create and replace"
+        Write-Host "--------------------------------------------------"
+        Write-Host "Adding a small binary under sync-acceptance/, then Plan and Push."
+        Write-Host "Finish gates 2-13 first so the workspace has no other pending uploads."
+        Write-Host ""
+
+        $binaryCanonical = 'sync-acceptance/acceptance-' + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.bin'
+        $binaryFull = ConvertTo-LocalFullPath -WorkspaceRoot $LocalDir -CanonicalPath $binaryCanonical
+        $binaryParent = Split-Path -Parent $binaryFull
+        if (-not (Test-Path -LiteralPath $binaryParent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $binaryParent | Out-Null
+        }
+
+        # Must not be valid UTF-8. ASCII classifies as utf8 and never becomes a binary place.
+        $createBytes = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01)
+        [System.IO.File]::WriteAllBytes($binaryFull, $createBytes)
+        $createIdentity = Get-LocalFileIdentity -LiteralPath $binaryFull
+
+        $planBinaryCreate = Invoke-SyncCli -CliArgs @(
+            '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+        )
+
+        $binaryPlanOk = $false
+        $binaryPlanDetail = $null
+
+        if ($planBinaryCreate.ExitCode -ne 0) {
+            $binaryPlanDetail = ("Plan failed with exit {0}" -f $planBinaryCreate.ExitCode)
+        }
+        else {
+            $uploadSummary = Get-PlanSummaryCount -Output $planBinaryCreate.Output -StatusName 'upload'
+            $uploadRowsBin = Get-PlanSectionRowCount -Output $planBinaryCreate.Output -Header 'UPLOAD'
+            $planOp = Get-AcceptancePlanArtifactOperation -WorkspaceRoot $LocalDir -CanonicalPath $binaryCanonical
+
+            $binaryPlanOk = ($uploadSummary -eq 1 -and $uploadRowsBin -eq 1) `
+                -and ($null -ne $planOp) `
+                -and [bool]$planOp.applicable `
+                -and ([string]$planOp.kind -eq 'binary') `
+                -and [string]::IsNullOrEmpty([string]$planOp.expectedRemoteHash)
+
+            if (-not $binaryPlanOk) {
+                $binaryPlanDetail = (
+                    "upload summary={0}, UPLOAD rows={1}, applicable={2}, kind={3}" -f `
+                        $uploadSummary, $uploadRowsBin, $planOp.applicable, $planOp.kind
+                )
+            }
+        }
+
+        if (-not $binaryPlanOk) {
+            Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "FAIL" `
+                -Detail ("plan check failed: {0}" -f $binaryPlanDetail)
+            Add-GateResult -Gate "15. Binary replace with remote backup" -Status "SKIP" `
+                -Detail "gate 14 plan check failed"
+        }
+        else {
+            $baseBeforeBinaryDecline = Read-BaseManifest -WorkspaceRoot $LocalDir
+            $baseCapturedBeforeBinaryDecline = $null
+            if ($null -ne $baseBeforeBinaryDecline) {
+                $baseCapturedBeforeBinaryDecline = [string]$baseBeforeBinaryDecline.capturedAt
+            }
+
+            Write-Host "Gate 14a: Push without force (binary must refuse non-interactively)"
+            $declineBinaryPush = Invoke-SyncCli -NonInteractive -CliArgs @(
+                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push'
+            )
+
+            $declineBinaryOk = Test-PushDeclinedWithoutMutation -PushResult $declineBinaryPush
+            $baseAfterBinaryDecline = Read-BaseManifest -WorkspaceRoot $LocalDir
+            $baseUnchangedBinaryDecline = ($null -ne $baseAfterBinaryDecline) -and (
+                [string]$baseAfterBinaryDecline.capturedAt -eq $baseCapturedBeforeBinaryDecline
+            )
+
+            $planBinaryForce = Invoke-SyncCli -CliArgs @(
+                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+            )
+
+            if ($planBinaryForce.ExitCode -ne 0) {
+                Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "FAIL" `
+                    -Detail ("re-Plan before ForcePush failed with exit {0}" -f $planBinaryForce.ExitCode)
+                Add-GateResult -Gate "15. Binary replace with remote backup" -Status "SKIP" `
+                    -Detail "gate 14 create failed"
+            }
+            else {
+                Write-Host "Gate 14b: Push -ForcePush (binary create)"
+                $binaryCreatePush = Invoke-SyncCli -CliArgs @(
+                    '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-ForcePush'
+                )
+
+                $binaryRows = @(Get-PushBinaryRows -Output $binaryCreatePush.Output)
+                $baseUpdatedBin = [regex]::IsMatch($binaryCreatePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+                $createdCount = Get-PlanSummaryCount -Output $binaryCreatePush.Output -StatusName 'created'
+
+                $journalAfterBinaryCreate = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                $pushBinaryRecords = @($journalAfterBinaryCreate | Where-Object {
+                    [string]$_.event -eq 'push-binary' -and [string]$_.path -eq $binaryCanonical
+                })
+
+                $baseAfterCreate = Read-BaseManifest -WorkspaceRoot $LocalDir
+                $baseHasBinary = $false
+                if ($null -ne $baseAfterCreate -and $null -ne $baseAfterCreate.files) {
+                    $entry = $baseAfterCreate.files.PSObject.Properties[$binaryCanonical]
+                    if ($null -ne $entry) {
+                        $baseHasBinary = [string]$entry.Value.sha256 -eq [string]$createIdentity.Sha256
+                    }
+                }
+
+                $createOk = ($binaryCreatePush.ExitCode -eq 0) `
+                    -and $declineBinaryOk -and $baseUnchangedBinaryDecline `
+                    -and ($binaryRows.Count -eq 1) -and ([string]$binaryRows[0].Mode -eq 'create') `
+                    -and $baseUpdatedBin -and ($null -ne $createdCount -and $createdCount -ge 1) `
+                    -and ($pushBinaryRecords.Count -ge 1) -and $baseHasBinary
+
+                if ($createOk) {
+                    Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "PASS" `
+                        -Detail ("path={0}; decline ok; journal push-binary present" -f $binaryCanonical)
+                }
+                else {
+                    Add-GateResult -Gate "14. Binary create via documented place sequence" -Status "FAIL" `
+                        -Detail ("exit={0}, decline={1}, BASE unchanged on decline={2}, BINARY rows={3}, BASE has file={4}, push-binary={5}" -f `
+                            $binaryCreatePush.ExitCode, $declineBinaryOk, $baseUnchangedBinaryDecline, `
+                            $binaryRows.Count, $baseHasBinary, $pushBinaryRecords.Count)
+                    Add-GateResult -Gate "15. Binary replace with remote backup" -Status "SKIP" `
+                        -Detail "gate 14 create failed"
+                }
+
+                if ($createOk) {
+                    $replaceBytes = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x02)
+                    [System.IO.File]::WriteAllBytes($binaryFull, $replaceBytes)
+                    $replaceIdentity = Get-LocalFileIdentity -LiteralPath $binaryFull
+
+                    $planBinaryReplace = Invoke-SyncCli -CliArgs @(
+                        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+                    )
+
+                    if ($planBinaryReplace.ExitCode -ne 0) {
+                        Add-GateResult -Gate "15. Binary replace with remote backup" -Status "FAIL" `
+                            -Detail ("Plan after local edit failed with exit {0}" -f $planBinaryReplace.ExitCode)
+                    }
+                    else {
+                        $planOpReplace = Get-AcceptancePlanArtifactOperation `
+                            -WorkspaceRoot $LocalDir `
+                            -CanonicalPath $binaryCanonical
+
+                        $replacePlanOk = ($null -ne $planOpReplace) `
+                            -and [bool]$planOpReplace.applicable `
+                            -and (-not [string]::IsNullOrEmpty([string]$planOpReplace.expectedRemoteHash))
+
+                        if (-not $replacePlanOk) {
+                            Add-GateResult -Gate "15. Binary replace with remote backup" -Status "FAIL" `
+                                -Detail "plan row is not an applicable binary replace"
+                        }
+                        else {
+                            $baseBeforeReplace = Read-BaseManifest -WorkspaceRoot $LocalDir
+                            $baseCapturedBeforeReplace = $null
+                            if ($null -ne $baseBeforeReplace) {
+                                $baseCapturedBeforeReplace = [string]$baseBeforeReplace.capturedAt
+                            }
+
+                            Write-Host "Gate 15: Push -LocalWins -ForcePush (binary replace)"
+                            $binaryReplacePush = Invoke-SyncCli -CliArgs @(
+                                '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-LocalWins', '-ForcePush'
+                            )
+
+                            $replaceRows = @(Get-PushBinaryRows -Output $binaryReplacePush.Output)
+                            $baseUpdatedReplace = [regex]::IsMatch($binaryReplacePush.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+
+                            $thisRunLine = [regex]::Match($binaryReplacePush.Output, '(?m)^\s*this run:\s+(.+?)\s*$')
+                            $thisRunSetReplace = $null
+                            if ($thisRunLine.Success) {
+                                $thisRunSetReplace = $thisRunLine.Groups[1].Value.Trim().TrimEnd('\')
+                            }
+
+                            $backupVerified = $false
+                            $backupDetail = 'no backup set'
+                            if (-not [string]::IsNullOrEmpty($thisRunSetReplace) -and (Test-Path -LiteralPath $thisRunSetReplace)) {
+                                $backupFile = Join-Path $thisRunSetReplace ($binaryCanonical.Replace('/', '\'))
+                                if (Test-Path -LiteralPath $backupFile) {
+                                    $backupIdentity = Get-LocalFileIdentity -LiteralPath $backupFile
+                                    $backupVerified = (
+                                        [string]$backupIdentity.Sha256 -eq [string]$createIdentity.Sha256
+                                    ) -and (
+                                        -not ([string]$backupIdentity.Sha256 -eq [string]$replaceIdentity.Sha256)
+                                    )
+                                    $backupDetail = "backup sha matches pre-replace remote"
+                                }
+                                else {
+                                    $backupDetail = 'backup file missing in this run set'
+                                }
+                            }
+
+                            $baseAfterReplace = Read-BaseManifest -WorkspaceRoot $LocalDir
+                            $baseShaOk = $false
+                            if ($null -ne $baseAfterReplace -and $null -ne $baseAfterReplace.files) {
+                                $entry = $baseAfterReplace.files.PSObject.Properties[$binaryCanonical]
+                                if ($null -ne $entry) {
+                                    $baseShaOk = [string]$entry.Value.sha256 -eq [string]$replaceIdentity.Sha256
+                                }
+                            }
+
+                            $baseMovedReplace = ($baseUpdatedReplace -and $null -ne $baseAfterReplace -and (
+                                [string]$baseAfterReplace.capturedAt -ne $baseCapturedBeforeReplace
+                            ))
+
+                            $journalReplace = @(Read-RundotSyncJournal -WorkspaceRoot $LocalDir)
+                            $pushBackupBin = @($journalReplace | Where-Object {
+                                [string]$_.event -eq 'push-backup' -and [string]$_.path -eq $binaryCanonical
+                            })
+                            $pushBinaryBin = @($journalReplace | Where-Object {
+                                [string]$_.event -eq 'push-binary' -and [string]$_.path -eq $binaryCanonical
+                            })
+
+                            $replaceOk = ($binaryReplacePush.ExitCode -eq 0) `
+                                -and ($replaceRows.Count -eq 1) -and ([string]$replaceRows[0].Mode -eq 'replace') `
+                                -and $baseUpdatedReplace -and $baseMovedReplace -and $baseShaOk `
+                                -and $backupVerified `
+                                -and ($pushBackupBin.Count -ge 1) -and ($pushBinaryBin.Count -ge 1)
+
+                            if ($replaceOk) {
+                                Add-GateResult -Gate "15. Binary replace with remote backup" -Status "PASS" `
+                                    -Detail ("path={0}; {1}; push-backup and push-binary journaled" -f $binaryCanonical, $backupDetail)
+                            }
+                            else {
+                                Add-GateResult -Gate "15. Binary replace with remote backup" -Status "FAIL" `
+                                    -Detail ("exit={0}, BINARY replace row={1}, backup ok={2} ({3}), BASE sha ok={4}, journal backup={5}, journal binary={6}" -f `
+                                        $binaryReplacePush.ExitCode, $replaceRows.Count, $backupVerified, $backupDetail, `
+                                        $baseShaOk, $pushBackupBin.Count, $pushBinaryBin.Count)
                             }
                         }
                     }

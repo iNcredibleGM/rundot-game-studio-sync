@@ -294,6 +294,158 @@ finally {
 
 
 # --------------------------------------------------------------------------
+# Studio read limit and the oversized-payload refusal (#51)
+# --------------------------------------------------------------------------
+
+# GET /file refuses a payload over the observed limit with 413, so a binary
+# over it can be placed but never read back or verified. The size helpers must
+# agree on the boundary and read both map shapes.
+$hashingLimit = Get-SyncStudioMaxReadableFileSize
+Assert-True ($hashingLimit -gt 0) "the Studio read limit must be a positive byte count"
+Assert-True (-not (Test-SyncOversizeSize -Size ($hashingLimit - 1))) "one byte under the limit must not be oversize"
+Assert-True (-not (Test-SyncOversizeSize -Size $hashingLimit)) "exactly the limit must not be oversize"
+Assert-True (Test-SyncOversizeSize -Size ($hashingLimit + 1)) "one byte over the limit must be oversize"
+
+Assert-Equal `
+    ([int64]5) `
+    (Get-SyncEntrySizeValue -Entry ([pscustomobject]@{ Size = 5 })) `
+    "a PascalCase size must be read"
+Assert-Equal `
+    ([int64]7) `
+    (Get-SyncEntrySizeValue -Entry @{ size = 7 }) `
+    "a lowercase size in a hashtable must be read"
+Assert-Equal `
+    ([int64]0) `
+    (Get-SyncEntrySizeValue -Entry $null) `
+    "a missing entry must report zero size"
+Assert-Equal `
+    ([int64]0) `
+    (Get-SyncEntrySizeValue -Entry ([pscustomobject]@{ Sha256 = 'x' })) `
+    "an entry without a size must report zero"
+
+Assert-True `
+    (Test-SyncOversizeEntry -Entry ([pscustomobject]@{ Size = ($hashingLimit + 1) })) `
+    "an oversized entry must be detected"
+Assert-True `
+    (-not (Test-SyncOversizeEntry -Entry ([pscustomobject]@{ Size = 1 }))) `
+    "a small entry must not be oversize"
+
+$hashingReason = Get-SyncOversizeRefusalReason -Size ($hashingLimit + 1)
+Assert-True `
+    ($hashingReason -match [regex]::Escape([string]($hashingLimit + 1))) `
+    "the refusal reason must name the payload size"
+Assert-True `
+    ($hashingReason -match [regex]::Escape([string]$hashingLimit)) `
+    "the refusal reason must name the read limit"
+Assert-True `
+    ($hashingReason -match '413') `
+    "the refusal reason must name the 413 the user would otherwise see"
+
+# A REPLACE over the limit is refused for a different reason than a create,
+# because the pre-overwrite backup and expectedRemoteHash gate need the existing
+# remote bytes (#54).
+$hashingReplaceReason = Get-SyncOversizeReplaceRefusalReason -Size ($hashingLimit + 1)
+Assert-True `
+    ($hashingReplaceReason -match [regex]::Escape([string]($hashingLimit + 1))) `
+    "the replace refusal must name the payload size"
+Assert-True `
+    ($hashingReplaceReason -match 'replacement') `
+    "the replace refusal must say it is a replacement"
+Assert-True `
+    ($hashingReplaceReason -match 'expectedRemoteHash') `
+    "the replace refusal must name the gate that needs the remote bytes"
+
+
+# --------------------------------------------------------------------------
+# Upload ETag identity for a file that cannot be read back (#54)
+# --------------------------------------------------------------------------
+
+# The presigned PUT's ETag is the MD5 of the stored bytes. It is the only byte
+# identity available above the read limit, so the normalization and the
+# plain-digest guard are load-bearing: a multipart ETag is not a digest of the
+# whole object and must never be compared as one.
+Assert-Equal `
+    'd41d8cd98f00b204e9800998ecf8427e' `
+    (Get-SyncMd5HexFromEtag -Etag '"d41d8cd98f00b204e9800998ecf8427e"') `
+    "a quoted ETag must normalize to a bare digest"
+Assert-Equal `
+    'd41d8cd98f00b204e9800998ecf8427e' `
+    (Get-SyncMd5HexFromEtag -Etag 'W/"D41D8CD98F00B204E9800998ECF8427E"') `
+    "a weak, uppercase ETag must normalize to a bare lowercase digest"
+Assert-Null (Get-SyncMd5HexFromEtag -Etag '') "an empty ETag must normalize to null"
+
+Assert-True `
+    (Test-SyncPlainMd5Digest -Digest 'd41d8cd98f00b204e9800998ecf8427e') `
+    "a 32-hex digest must be accepted as a plain MD5"
+Assert-True `
+    (-not (Test-SyncPlainMd5Digest -Digest 'd41d8cd98f00b204e9800998ecf8427e-3')) `
+    "a multipart ETag must NOT be accepted as a plain MD5"
+Assert-True `
+    (-not (Test-SyncPlainMd5Digest -Digest 'd41d8cd98f00b204e9800998ecf8427')) `
+    "a short digest must NOT be accepted as a plain MD5"
+Assert-True `
+    (-not (Test-SyncPlainMd5Digest -Digest '')) `
+    "an empty digest must NOT be accepted as a plain MD5"
+
+# The payload MD5 must match an independently computed digest.
+$hashingMd5Root = Join-Path $env:TEMP ("rundot-md5-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $hashingMd5Root | Out-Null
+try {
+    $hashingMd5File = Join-Path $hashingMd5Root 'payload.bin'
+    $hashingMd5Bytes = [byte[]]@(1, 2, 3, 4, 5)
+    [System.IO.File]::WriteAllBytes($hashingMd5File, $hashingMd5Bytes)
+
+    $expectedMd5 = [System.BitConverter]::ToString(
+        ([System.Security.Cryptography.MD5]::Create()).ComputeHash($hashingMd5Bytes)
+    ).Replace('-', '').ToLowerInvariant()
+
+    Assert-Equal `
+        $expectedMd5 `
+        (Get-SyncMd5HexFromBytes -Bytes $hashingMd5Bytes) `
+        "the payload MD5 must match an independent digest"
+
+    # A matching plain ETag verifies; a non-plain one is refused rather than
+    # compared, and a mismatched one is refused too.
+    Assert-Equal `
+        $expectedMd5 `
+        (Assert-SyncEtagMatchesLocalMd5 `
+            -Etag ('"' + $expectedMd5 + '"') `
+            -LocalMd5Hex $expectedMd5 `
+            -CanonicalPath 'public/huge.png') `
+        "a matching plain ETag must verify the placed bytes"
+
+    $etagMismatchThrew = $false
+    try {
+        Assert-SyncEtagMatchesLocalMd5 `
+            -Etag '"00000000000000000000000000000000"' `
+            -LocalMd5Hex $expectedMd5 `
+            -CanonicalPath 'public/huge.png' | Out-Null
+    }
+    catch {
+        $etagMismatchThrew = $true
+    }
+    Assert-True $etagMismatchThrew "a mismatched ETag must be refused"
+
+    $etagMultipartThrew = $false
+    try {
+        Assert-SyncEtagMatchesLocalMd5 `
+            -Etag ('"' + $expectedMd5 + '-4"') `
+            -LocalMd5Hex $expectedMd5 `
+            -CanonicalPath 'public/huge.png' | Out-Null
+    }
+    catch {
+        $etagMultipartThrew = $true
+    }
+    Assert-True $etagMultipartThrew "a multipart ETag must be refused, never compared"
+}
+finally {
+    if (Test-Path -LiteralPath $hashingMd5Root) {
+        Remove-Item -LiteralPath $hashingMd5Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# --------------------------------------------------------------------------
 # Production hasher must not load whole files into strings or byte[]
 # --------------------------------------------------------------------------
 

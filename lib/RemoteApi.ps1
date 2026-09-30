@@ -1,4 +1,10 @@
-# GET-only RUN Game Studio HTTP helpers.
+# RUN Game Studio HTTP helpers, and the shared request plumbing every route
+# uses.
+#
+# This file itself performs no mutation: it builds requests and wraps
+# responses. The one write route (PUT) lives in RemoteWrite.ps1 and the one
+# delete route (DELETE) lives in RemoteDelete.ps1, both of which use
+# Add-RemoteRequestHeaders from here.
 #
 # Do not add Set-* or Remove-* remote functions. Do not add Studio write
 # methods or upload helpers.
@@ -169,6 +175,34 @@ function Convert-WebExceptionToRemoteHttpException {
 }
 
 
+# Apply caller headers to a request. Accept is a typed property on
+# HttpWebRequest and throws if assigned through the generic Headers
+# collection, so it is set explicitly; every other header goes through the
+# collection. Shared by the GET, PUT, and DELETE request builders so the
+# rule cannot drift between routes.
+function Add-RemoteRequestHeaders {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.HttpWebRequest]$Request,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+
+    foreach ($key in $Headers.Keys) {
+        switch -Regex ($key) {
+            '^Accept$' {
+                $Request.Accept = [string]$Headers[$key]
+                continue
+            }
+            default {
+                $Request.Headers[$key] = [string]$Headers[$key]
+            }
+        }
+    }
+}
+
+
 # Read an HTTP response as raw bytes and decode it explicitly as UTF-8.
 #
 # Windows PowerShell 5.1 can decode response bodies with the wrong character
@@ -186,17 +220,7 @@ function Invoke-Utf8TextGet {
     $request = [System.Net.HttpWebRequest]::Create($Uri)
     $request.Method = "GET"
 
-    foreach ($key in $Headers.Keys) {
-        switch -Regex ($key) {
-            '^Accept$' {
-                $request.Accept = [string]$Headers[$key]
-                continue
-            }
-            default {
-                $request.Headers[$key] = [string]$Headers[$key]
-            }
-        }
-    }
+    Add-RemoteRequestHeaders -Request $request -Headers $Headers
 
     try {
         $httpResponse = $request.GetResponse()

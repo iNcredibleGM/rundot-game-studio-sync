@@ -1,12 +1,15 @@
 # Safe Push
 
-`Push` is the only command in this milestone that writes to REMOTE. It consumes
-the last `Plan` artifact, re-verifies every fingerprint, and publishes only
-clean utf8 text overwrites via documented `PUT /file`.
+`Push` is the only command that writes to REMOTE. It consumes the last `Plan`
+artifact, re-verifies every fingerprint, and applies four classifications:
+a clean utf8 text overwrite via documented `PUT /file`, a utf8 text create via
+the documented upload + move + `PUT /file` place sequence, a binary create or
+replace via the documented upload + move place sequence, and a
+`deleteRemoteCandidate` via documented `DELETE /file`.
 
-`Push` never changes LOCAL files, never creates remote files, never uploads
-binaries, and never deletes anything ([classifier.md](classifier.md),
-[text-write-protocol.md](text-write-protocol.md)).
+`Push` never changes LOCAL files
+([classifier.md](classifier.md), [text-write-protocol.md](text-write-protocol.md),
+[text-create.md](text-create.md), [binary-place.md](binary-place.md), [delete.md](delete.md)).
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Plan
@@ -28,68 +31,193 @@ binaries, and never deletes anything ([classifier.md](classifier.md),
 6. **Fingerprint gates.** The engine compares the artifact to the live BASE,
    LOCAL manifest hash, and REMOTE manifest hashes. Any drift refuses the
    whole run.
-7. **Select.** Only applicable `upload` rows that are still clean utf8 text
-   overwrites may be published. Every other plan row is reported in `SKIPPED`
-   with a reason.
+7. **Select.** An applicable `upload` row that is still a clean utf8 text
+   overwrite or create, or an applicable `deleteRemoteCandidate` row that is
+   still a clean remote delete, may be published. Every other plan row is
+   reported in `SKIPPED` with a reason.
 8. **Confirm.** If any publishable row remains, Push prints the remote
-   overwrite list and requires the whole word `yes` before continuing.
-9. **Back up.** Every remote original that will be replaced is copied into a
-   backup set first. A backup failure aborts the push before any `PUT`.
-10. **Apply.** For each selected path: re-hash LOCAL, `GET` remote, verify
-    `expectedRemoteHash`, `PUT` utf8 text, echo-verify the response hash.
-11. **Update BASE.** After every `PUT` succeeds, BASE is overlaid additively
-    with the published local identity.
-12. **Journal and prune.** A metadata-only record is appended, then old backup
+   overwrite list, then the text create list, then the binary place list, then
+   the delete list, and requires the whole word `yes` for each. All
+   confirmations are collected before any backup or mutation.
+9. **Back up.** Every remote original that will be replaced **or deleted** is
+   copied into a backup set first. A backup failure aborts the push before any
+   `PUT` or `DELETE`.
+10. **Apply.** For each selected overwrite: re-hash LOCAL, `GET` remote, verify
+    `expectedRemoteHash`, `PUT` utf8 text, echo-verify the response hash. For
+    each selected create: prove the path is absent, run the upload + move +
+    `PUT /file` sequence, echo-verify. For each selected delete: re-read remote
+    and verify `expectedRemoteHash`, `DELETE`, then prove the path is absent
+    from `GET /files`.
+11. **Update BASE.** After every write, create, and delete succeeds, BASE is overlaid
+    additively with the published local identities, and each deleted path is
+    **dropped** from BASE.
+12. **Journal and prune.** Metadata-only records are appended, then old backup
     sets are pruned best-effort.
+
+## Progress output
+
+Push hashes the local tree, downloads the remote snapshot, then backs up and
+writes each selected path. It prints plain progress lines that do not depend
+on `Write-Progress`:
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+Backing up 1 of 3: src/game/level-12.ts (applied 0, remaining 2)
+Publishing 2 of 3: src/game/level-13.ts (applied 1, remaining 1)
+```
+
+- Hashing and download are throttled (at most about once per second) with a
+  start line and a final count.
+- Each backed-up and published path is named, with applied versus remaining
+  counts. Publishing covers text overwrites, text creates, binary places, and
+  deletes; the phase is labelled `Backing up` before any mutation and
+  `Publishing` as each write is applied.
+- The `Write-Progress` bar is still updated where the host shows it.
+
+Progress output contains a canonical path and integer counts only. It never
+prints file contents, access tokens, refresh tokens, or `Authorization`
+headers. A progress write is best effort and never changes fail-closed
+behavior: a failed hash, backup, or write still aborts the mutating step, and
+`-LocalWins` still records a refused path and continues with the rest.
 
 ## Allowed automatic remote writes
 
-Exactly one classification may be published:
+Three classifications may be published:
 
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
-| A | B | A | `upload` (utf8 text) | applies |
+| A | B | A | `upload` (utf8 text overwrite) | applies |
+| — | A | — | `upload` (utf8 text create) | applies |
+| A | — | A | `deleteRemoteCandidate` | applies |
 
 `BASE=A LOCAL=B REMOTE=A` means LOCAL moved on while REMOTE still matched the
 last verified shared state. REMOTE owns no change, so nothing is lost on Studio.
+
+`BASE=A LOCAL=— REMOTE=A` means LOCAL no longer has the path while REMOTE still
+matches the last verified shared state. Removing it destroys nothing that was
+not already gone locally. A delete is applied with the documented `DELETE /file`
+route and its own client-side guard; see [delete.md](delete.md).
 
 ## Must not publish
 
 | BASE | LOCAL | REMOTE | Status | Push |
 | --- | --- | --- | --- | --- |
-| — | A | — | `upload` (text create) | skipped: no create route |
-| — | A | — | `upload` (binary) | skipped: binary blocked |
+| — | A | — | `upload` (text create) | applies |
+| — | A | — | `upload` (binary create) | applies |
+| A | B | A | `upload` (binary replace) | applies |
 | A | A | B | `download` | skipped: Push never downloads |
 | A | B | C | `conflict` | skipped: no safe direction |
 | A | B | B | `synchronized-change` | skipped: both sides already agree |
-| A | — | A | `deleteRemoteCandidate` | skipped: Push does not delete |
+| A | — | A | `deleteRemoteCandidate` (reserved or directory-shaped path) | skipped: route refuses it |
 | any | any | any | `ignored` | skipped: out of sync scope |
+| any | any | oversize REMOTE | `unverifiable` | skipped: remote bytes cannot be read (#57) |
 | text ↔ binary | | | `conflict` | skipped: `KindChange` |
 
 Every skipped path is printed with its status and a reason. A skipped path is
 never a silent no-op.
 
-The plan artifact may mark only utf8 text overwrites as `applicable: true`
-([plan.md](plan.md)). Even when a row is applicable in the artifact, Push
-re-classifies it live and refuses the whole run if it is no longer a clean
-upload.
+The plan artifact may mark utf8 text overwrites, utf8 text creates, and
+route-allowed remote deletes as `applicable: true` ([plan.md](plan.md)). Even when a row is
+applicable in the artifact, Push re-classifies it live and refuses the whole run
+if it is no longer the clean action it was planned as.
+
+## Delete
+
+A `deleteRemoteCandidate` row is applied by `Push` through the documented
+`DELETE /file` route. A delete is not part of the default "clean rows" set: it
+gets its own confirmation, its own backup, and its own absence proof. The full
+contract is in [delete.md](delete.md).
+
+A confirmed delete is the one case where `-LocalWins` publishes a path LOCAL
+does not have. It removes only a path whose LOCAL copy is already gone and whose
+REMOTE bytes still match the plan; a path that no longer matches the plan is
+refused rather than deleted.
 
 ## Confirmation and `-ForcePush`
 
 If any remote text file would be overwritten, Push prints the count and the
-paths, and requires the whole word `yes` before continuing. Anything else
-cancels: no `PUT` runs, no backup set is created, and BASE does not move.
+paths, and requires the whole word `yes` before continuing. If any remote text
+file would be created, Push prints a separate list and requires `yes` again. If
+any remote file would be deleted, Push prints a third list and requires `yes`:
+accepting an overwrite never accepts a create or delete. Anything declined cancels the
+run: no `PUT` or `DELETE` runs, no backup set is created, BASE does not move,
+and no journal record is written.
 
-`-ForcePush` skips the prompt. It never skips a backup, and it never bypasses
-the concurrent-edit guard below. Force is not a way to disable safety; it is a
-way to run unattended.
+`-ForcePush` skips both prompts. It never skips a backup, and it never bypasses
+the concurrent-edit guard, the live hash guard, or the path-shape refusal.
+Force is not a way to disable safety; it is a way to run unattended.
 
 `-ConfirmPush` is a skip-prompt alias for `-ForcePush`, kept so existing
 examples still work.
 
-With overwrites to make and neither `-ForcePush` nor `-ConfirmPush` nor a
-console to confirm on, Push **fails closed**: it aborts rather than writing
-without consent.
+With overwrites or deletes to make and neither `-ForcePush` nor `-ConfirmPush`
+nor a console to confirm on, Push **fails closed**: it aborts rather than
+mutating without consent.
+
+## Local-wins publish (`-LocalWins`)
+
+Default `Push` still refuses `conflict` rows. When an Adopted tree already
+disagrees with Studio, `Plan` may list many `upload` and `conflict` rows with
+nothing applicable. `-LocalWins` is a separate publish mode that makes Studio
+match LOCAL for every path you confirm in one list. Local bytes replace remote
+bytes. It is not a content merge.
+
+```powershell
+.\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins
+.\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Push -LocalWins -ForcePush
+```
+
+Before any write, Push prints up to four groups (empty groups are omitted):
+
+1. **Text overwrites** — clean utf8 overwrites and utf8 conflicts where REMOTE
+   already has a file
+2. **Text creates** — local-only utf8 paths and utf8 conflicts where REMOTE is
+   absent
+3. **Binary create or replace** — documented place-at-path rows
+4. **Remote deletes** — `deleteRemoteCandidate`, remote-only `download` rows
+   (LOCAL absent), and conflicts where LOCAL is gone but REMOTE remains
+
+One `yes` confirms that whole set. Declining, or a non-interactive run without
+`-ForcePush`, changes nothing: no backup set, no writes, no journal, BASE
+untouched.
+
+`-ForcePush` / `-ConfirmPush` skip only the prompt. They never skip backups or
+live hash checks.
+
+Paths that stay out of the list are never published: `download` where LOCAL
+still matches BASE (`A / A / B`), `deleteLocalCandidate`, `KindChange`, ignored
+paths, reserved or directory-shaped routes, empty binaries, binaries **replaced**
+over Studio's 2,000,000-byte read limit, and any row whose live status no longer
+matches the plan artifact.
+
+A binary **replace** over the read limit needs its existing remote bytes for the
+pre-overwrite backup and the `expectedRemoteHash` gate, and `GET /file` cannot
+return them, so it is never published; `-LocalWins` excludes it with the
+read-limit reason and continues with the rest, while default `Push` refuses the
+whole run. A binary **create** over the limit *is* published: the place sequence
+verifies it from the presigned upload `ETag` instead of a read-back (#54,
+[binary-place.md](binary-place.md)).
+
+A text file over Studio's 2,000,000-character editor limit is refused at the
+`PUT` itself. That refusal leaves the previous remote content intact, so
+`-LocalWins` records a `REFUSED` row and continues rather than corrupting the
+path ([text-write-protocol.md](text-write-protocol.md)).
+
+Immediately before each write, Push re-checks the live remote hash against the
+plan row. On `-LocalWins`, a drift on one path refuses that path and continues
+with the rest. It does not clobber using a guessed hash. Default `Push` still
+aborts the whole run on drift.
+
+Every remote original is backed up before overwrite or delete. A backup failure
+aborts before any write.
+
+BASE updates only for paths that verified. A partial failure leaves previous
+BASE entries for paths that did not verify. The report lists `REFUSED` paths
+separately from pre-confirm `SKIPPED` rows.
 
 ### Concurrent-edit guard
 
@@ -202,12 +330,16 @@ remains and that BASE was not updated.
 | Missing BASE | Refuse before authentication; `-AllowNoBase` is rejected |
 | Missing `last-plan.json` | Refuse before authentication |
 | Expired or stale plan fingerprints | Refuse before any `PUT` |
+| Plan expired mid-run on a large publish | Refuse the remaining actions with `this plan has expired`; re-run `Plan`, then `Push` again (a 20-minute artifact cannot cover a 268-binary publish) |
 | Applicable row no longer a clean upload | Refuse the whole run |
 | Overwrite declined | Abort, no `PUT`, no backup set, no journal record |
 | Overwrite with no confirmation possible | Fail closed, no `PUT` |
 | Backup failure | Abort before any `PUT`; old BASE |
 | Local file changed since the scan | Refuse before that `PUT` |
 | Remote hash mismatch on `GET` | Refuse before that `PUT` |
+| Local binary **replace** over the 2,000,000-byte read limit | Refuse before any `DELETE` or upload; default `Push` aborts, `-LocalWins` excludes the path |
+| Local binary **create** over the read limit | Published and verified from the upload `ETag` (#54) |
+| Text over Studio's 2,000,000-character editor limit | Refuse before that `PUT`; the previous remote content is intact ([text-write-protocol.md](text-write-protocol.md)); default `Push` aborts, `-LocalWins` records a `REFUSED` row and continues |
 | `PUT` or echo verify failure | Abort; BASE unchanged; backup set kept |
 | BASE update fails | Journaled as failed; old BASE remains authoritative |
 | Retention failure | Ignored; a successful push is never failed by pruning |

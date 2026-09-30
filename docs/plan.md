@@ -30,25 +30,64 @@ runs the identical engine and persists nothing.
 6. **Report.** The plan report prints to the console. Only `Plan` writes the
    artifact. Snapshot staging is then cleared.
 
+## Progress output
+
+Plan and Status hash the whole local tree and download the remote snapshot, so
+a large workspace prints plain progress lines that do not depend on
+`Write-Progress`:
+
+```text
+Hashing local files: C:\work\project
+Hashed 412 local file(s).
+Downloading 412 remote file(s)...
+Downloading remote project: 37 of 412: src/game/level-12.ts
+Downloaded 412 remote file(s).
+```
+
+Local hashing and remote download each print a start line, a throttled
+`count: path` line (at most about once per second), and a final count. The
+`Write-Progress` bar is still updated where the host shows it.
+
+Progress output contains a canonical path and integer counts only. It never
+prints file contents, access tokens, refresh tokens, or `Authorization`
+headers. A progress write is best effort and never changes fail-closed
+behavior: an unreadable local file or a failed download still aborts the run.
+
 ## No plan is permission to write
 
 `Push` consumes this artifact and re-verifies every fingerprint before
 writing. A plan is still only a point-in-time observation: it never grants
 permission to skip those checks, bypass confirmation, or skip remote backups.
 
-The plan layer marks only one remote-mutating row as applicable:
+The plan layer marks three remote-mutating rows as applicable:
 
 | Status | Applicable | Why |
 | --- | --- | --- |
 | `upload` (text overwrite) | yes | `BASE=A LOCAL=B REMOTE=A` with utf8 kind and a present `expectedRemoteHash`. `Push` may publish via `PUT /file`. |
-| `upload` (text create) | no | `PUT /file` is overwrite-only; a missing remote path returns `404`. |
-| `upload` (binary) | no | Remote binary replacement is not possible: the upload flow ignores the requested path and a repeated name creates a sibling instead of replacing. |
-| `deleteRemoteCandidate` | no | `Push` does not delete remote files. |
+| `upload` (text create) | yes, unless refused | `BASE=— LOCAL=A REMOTE=—` with utf8 kind when the path is not reserved and not directory-shaped. `Push` may publish via the documented place sequence ([text-create.md](text-create.md)). |
+| `upload` (binary create) | yes, unless refused | `BASE=— LOCAL=A REMOTE=—` with binary kind, positive size, and path not reserved or directory-shaped. Over Studio's 2,000,000-byte read limit it stays applicable and is verified from the upload `ETag` (#54, [binary-place.md](binary-place.md)). |
+| `upload` (binary replace) | yes, unless refused | `BASE=A LOCAL=B REMOTE=A` with binary kind on both sides, positive size, path not reserved or directory-shaped, and size at or under Studio's 2,000,000-byte read limit. An oversize replace is refused, because its existing remote bytes cannot be read for the pre-overwrite backup and the `expectedRemoteHash` gate. |
+| `deleteRemoteCandidate` | yes, unless refused | `BASE=A LOCAL=— REMOTE=A` with a present `expectedRemoteHash`, when the path is neither a reserved root nor directory-shaped. `Push` may apply it via `DELETE /file` ([delete.md](delete.md)). |
+| `deleteRemoteCandidate` (reserved or directory-shaped) | no | The route rules refuse the path, so it can never reach a `DELETE`. |
 | `download` | yes | `Pull` applies remote-only changes with backups ([pull.md](pull.md)). |
 
 Every blocked remote-mutating row carries an explicit reason. The
-[classifier](classifier.md) still marks text overwrites as applicable; the
-plan layer refuses text creates, all binaries, and every delete candidate.
+[classifier](classifier.md) still marks text uploads as applicable; the plan
+layer refuses binaries, reserved or directory-shaped creates, and every refused
+delete path.
+
+A binary **replace** over Studio's 2,000,000-byte read limit is marked
+`applicable: false` with a reason naming the size and the limit, because
+`GET /file` returns 413 above it and the existing remote bytes cannot be read for
+the backup or the `expectedRemoteHash` gate. An oversize binary **create** stays
+applicable and is verified from the upload `ETag` (#54)
+([binary-place.md](binary-place.md), [remote-snapshot.md](remote-snapshot.md)).
+
+A path whose REMOTE is over the read limit is reported as `unverifiable`, never
+`unchanged` and never applicable: the remote bytes were never read, so Plan will
+not claim the path is in sync ([classifier.md](classifier.md),
+[remote-snapshot.md](remote-snapshot.md)). It appears under `UNVERIFIABLE` and is
+counted in the `SUMMARY`.
 
 ## Console layout
 
@@ -57,9 +96,12 @@ Sections appear only when they have rows:
 - `UPLOAD` — local changes a future push would publish
 - `DOWNLOAD` — remote-only changes
 - `CONFLICT` — no single safe direction
-- `STAGED DELETES` — `deleteRemoteCandidate` / `deleteLocalCandidate`,
-  classification only
+- `STAGED DELETES` — `deleteRemoteCandidate` / `deleteLocalCandidate`; a
+  `deleteRemoteCandidate` may be applied by a confirmed `Push`, a
+  `deleteLocalCandidate` is reported only
 - `IGNORED` — out of sync scope by the default ignore set
+- `UNVERIFIABLE` — REMOTE is over Studio's read limit, so its bytes cannot be
+  read or hashed; never in sync, never downloaded, never rewritten
 - `UNSUPPORTED` — text ↔ binary kind changes
 - `DIAGNOSTIC` — see below
 - `SUMMARY` — a count per status, the union total, and the applicable total
