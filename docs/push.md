@@ -125,6 +125,18 @@ route-allowed remote deletes as `applicable: true` ([plan.md](plan.md)). Even wh
 applicable in the artifact, Push re-classifies it live and refuses the whole run
 if it is no longer the clean action it was planned as.
 
+## Delete
+
+A `deleteRemoteCandidate` row is applied by `Push` through the documented
+`DELETE /file` route. A delete is not part of the default "clean rows" set: it
+gets its own confirmation, its own backup, and its own absence proof. The full
+contract is in [delete.md](delete.md).
+
+A confirmed delete is the one case where `-LocalWins` publishes a path LOCAL
+does not have. It removes only a path whose LOCAL copy is already gone and whose
+REMOTE bytes still match the plan; a path that no longer matches the plan is
+refused rather than deleted.
+
 ## Confirmation and `-ForcePush`
 
 If any remote text file would be overwritten, Push prints the count and the
@@ -318,6 +330,7 @@ remains and that BASE was not updated.
 | Missing BASE | Refuse before authentication; `-AllowNoBase` is rejected |
 | Missing `last-plan.json` | Refuse before authentication |
 | Expired or stale plan fingerprints | Refuse before any `PUT` |
+| Plan expired mid-run on a large publish | Refuse the remaining actions with `this plan has expired`; re-run `Plan`, then `Push` again (a 20-minute artifact cannot cover a 268-binary publish) |
 | Applicable row no longer a clean upload | Refuse the whole run |
 | Overwrite declined | Abort, no `PUT`, no backup set, no journal record |
 | Overwrite with no confirmation possible | Fail closed, no `PUT` |

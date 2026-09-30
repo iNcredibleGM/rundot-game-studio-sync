@@ -1,4 +1,4 @@
-# Automatic live round-trip: setup -> up -> down -> restore -> teardown.
+# Automatic live round-trip: setup -> up -> down -> restore -> delete -> teardown.
 #
 #   powershell -NoProfile -File .\tests\Live-RoundTrip.ps1 -ProjectId <id>
 #
@@ -12,9 +12,14 @@
 #   * cleanup                  -> Invoke-RemoteDeleteFile (DELETE /file)
 #
 # The product creates its own probe files through the CLI (`Push` text create),
-# so no new Studio write route is introduced. Everything the run makes lives
-# under one GUID probe folder, so teardown deletes exactly what it created and
-# proves the paths are gone.
+# and removes one through the CLI (`Push -ForcePush` delete), so no new Studio
+# write route is introduced. Everything the run makes lives under one GUID probe
+# folder, so teardown deletes exactly what it created and proves the paths are
+# gone.
+#
+# Phases: setup -> up (create, overwrite) -> down (pull) -> restore from backup
+# -> push-backup evidence -> delete (confirmed remote delete + backup + journal)
+# -> binary create/replace -> fail-closed -> teardown.
 #
 # Named Live-RoundTrip.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
 # pick it up: it needs a real account and network.
@@ -627,6 +632,97 @@ if (-not $script:Aborted) {
 
     Add-Step -Name 'Push backup holds the previous remote bytes' `
         -Status $(if ($pushBackupOk) { 'PASS' } else { 'FAIL' }) -Detail $pushBackupDetail
+
+    # -----------------------------------------------------------------------
+    # DELETE: a confirmed Push removes one remote file (#39)
+    #
+    # Probe B was created and overwritten in the UP phase, so BASE, LOCAL, and
+    # REMOTE all agree on it. Removing the LOCAL copy leaves a clean
+    # deleteRemoteCandidate (BASE=A, LOCAL=-, REMOTE=A). Default Push must fail
+    # closed non-interactively; Push -ForcePush applies the documented
+    # DELETE /file route, backs up the previous remote bytes, drops the path
+    # from BASE, and proves it absent from GET /files.
+    # -----------------------------------------------------------------------
+
+    Write-Phase 'Delete (Push: remote delete)'
+
+    $probeBFull = ConvertTo-LocalFullPath -WorkspaceRoot $LocalDir -CanonicalPath $probeB
+    $probeBRemoteSha = (Get-ProbeSha -CanonicalPath $probeB)
+    Remove-Item -LiteralPath $probeBFull -Force
+
+    $planDelete = Invoke-SyncCli -CliArgs @(
+        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Plan'
+    )
+    [void](Assert-ProgressLines -Output $planDelete.Output -Label 'Plan (delete)' -RequireHashing)
+
+    $deleteRows = Get-PlanCount -Output $planDelete.Output -StatusName 'deleteRemoteCandidate'
+    Add-Step -Name 'Plan sees the removed local file as a delete candidate' `
+        -Status $(if ($deleteRows -ge 1) { 'PASS' } else { 'FAIL' }) `
+        -Detail ("deleteRemoteCandidate rows = {0}" -f $deleteRows)
+
+    # A non-interactive default Push has no console to confirm on, so it must
+    # refuse before any DELETE.
+    $deleteDeclined = Invoke-SyncCli -NonInteractive -CliArgs @(
+        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push'
+    )
+    $deleteStillListed = @(Get-RemoteListedFilePaths `
+        -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers) -contains $probeB
+    $declineOk = ($deleteDeclined.ExitCode -ne 0) -and $deleteStillListed
+    Add-Step -Name 'Push without force refused the delete (file still listed)' `
+        -Status $(if ($declineOk) { 'PASS' } else { 'FAIL' }) `
+        -Detail ("exit={0}, still listed={1}" -f $deleteDeclined.ExitCode, $deleteStillListed)
+
+    # The real delete. Push re-reads remote, verifies expectedRemoteHash,
+    # backs up the previous remote bytes, sends DELETE, then proves absence.
+    $pushDelete = Invoke-SyncCli -CliArgs @(
+        '-ProjectId', $ProjectId, '-LocalDir', $LocalDir, '-Command', 'Push', '-ForcePush'
+    )
+    [void](Assert-ProgressLines -Output $pushDelete.Output -Label 'Push (delete)' -RequirePublish -RequireHashing)
+
+    $deletedCount = Get-PlanCount -Output $pushDelete.Output -StatusName 'deleted'
+    $deleteBaseUpdated = [regex]::IsMatch($pushDelete.Output, '(?m)^\s*BASE updated:\s+true\s*$')
+    $deleteListedAfter = @(Get-RemoteListedFilePaths `
+        -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Headers $headers) -contains $probeB
+    $deleteOk = ($pushDelete.ExitCode -eq 0) -and ($deletedCount -ge 1) `
+        -and $deleteBaseUpdated -and (-not $deleteListedAfter)
+    Add-Step -Name 'Push -ForcePush deleted the remote file and proved it absent' `
+        -Status $(if ($deleteOk) { 'PASS' } else { 'FAIL' }) `
+        -Detail ("exit={0}, deleted={1}, BASE updated={2}, still listed={3}" -f `
+            $pushDelete.ExitCode, $deletedCount, $deleteBaseUpdated, $deleteListedAfter)
+
+    # The delete backup must hold the pre-delete remote bytes, which are the
+    # overwrite bytes the UP phase published for probe B.
+    $deleteBackupSetPath = Get-ReportBackupSetPath -Output $pushDelete.Output
+    $deleteBackupOk = $false
+    $deleteBackupDetail = 'no backup set path found in the Push output'
+    if (-not [string]::IsNullOrEmpty($deleteBackupSetPath) -and (Test-Path -LiteralPath $deleteBackupSetPath)) {
+        $deleteBackupFile = Join-Path $deleteBackupSetPath ($probeB.Replace('/', '\'))
+        if (Test-Path -LiteralPath $deleteBackupFile -PathType Leaf) {
+            $deleteBackupSha = (Get-LocalFileIdentity -LiteralPath $deleteBackupFile).Sha256
+            $deleteBackupOk = [string]::Equals($deleteBackupSha, $probeBRemoteSha, [System.StringComparison]::Ordinal)
+            $deleteBackupDetail = "backup sha={0}, pre-delete remote sha={1}" -f `
+                $deleteBackupSha.Substring(0, 8), $probeBRemoteSha.Substring(0, 8)
+        }
+        else {
+            $deleteBackupDetail = "backup file missing: $deleteBackupFile"
+        }
+    }
+    Add-Step -Name 'Delete backup holds the pre-delete remote bytes' `
+        -Status $(if ($deleteBackupOk) { 'PASS' } else { 'FAIL' }) -Detail $deleteBackupDetail
+
+    # The journal must record the delete as metadata only, with no secrets.
+    $deleteJournalOk = $false
+    $deleteJournalDetail = 'no push-delete record found'
+    $journalPath = Join-Path $LocalDir '.rundot-sync\journal.jsonl'
+    if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        $journalText = [System.IO.File]::ReadAllText($journalPath)
+        $hasDeleteRecord = $journalText -match ('"event":"push-delete".*?"path":"' + [regex]::Escape($probeB) + '"')
+        $hasSecret = $journalText -match '(?i)(bearer |refresh_token|client_secret|api[_-]?key|"content")'
+        $deleteJournalOk = $hasDeleteRecord -and (-not $hasSecret)
+        $deleteJournalDetail = "push-delete record={0}, secret pattern={1}" -f $hasDeleteRecord, $hasSecret
+    }
+    Add-Step -Name 'Journal records push-delete without secrets' `
+        -Status $(if ($deleteJournalOk) { 'PASS' } else { 'FAIL' }) -Detail $deleteJournalDetail
 
     # -----------------------------------------------------------------------
     # Fail-closed with progress on: a locked local file still aborts Plan
