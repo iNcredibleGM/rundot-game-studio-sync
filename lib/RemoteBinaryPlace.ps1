@@ -146,6 +146,11 @@ function Get-RemoteBinaryPlaceVerifiedRemoteResponse {
 }
 
 function Assert-RemoteBinaryPlaceStepGate {
+    # Re-verified immediately before every mutating step of a place. $LiveLocalManifest
+    # is the local manifest the caller already computed for this run; when it is
+    # supplied the gate fingerprints it instead of re-hashing the whole workspace
+    # (#59). The per-file drift check below still re-reads the one file being
+    # published, so a file that changed mid-run is still refused.
     param(
         [Parameter(Mandatory)]
         $Artifact,
@@ -180,7 +185,10 @@ function Assert-RemoteBinaryPlaceStepGate {
         [Parameter(Mandatory)]
         [hashtable]$Headers,
 
-        [scriptblock]$GetRemoteFile = $null
+        [scriptblock]$GetRemoteFile = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     if ($null -eq $Artifact) {
@@ -244,7 +252,14 @@ function Assert-RemoteBinaryPlaceStepGate {
         )
     }
 
-    $liveLocal = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+    $liveLocal = $LiveLocalManifest
+    if ($null -eq $liveLocal) {
+        # No manifest was supplied, so this gate has to re-read the tree. Callers
+        # inside a Push run pass the run's manifest so this happens once per run,
+        # not once per step (#59).
+        $liveLocal = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot
+    }
+
     $liveLocalHash = Get-SyncLocalManifestFingerprint -Local $liveLocal
     if (
         -not [string]::Equals(
@@ -448,7 +463,10 @@ function Invoke-RemoteBinaryPlaceSequence {
 
         [scriptblock]$GetRemoteFile = $null,
 
-        [scriptblock]$GetRemoteFileList = $null
+        [scriptblock]$GetRemoteFileList = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     $localFullPath = ConvertTo-LocalFullPath `
@@ -481,7 +499,8 @@ function Invoke-RemoteBinaryPlaceSequence {
             -StudioOrigin $StudioOrigin `
             -ProjectIdForRemote $ProjectId `
             -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile
+            -GetRemoteFile $GetRemoteFile `
+            -LiveLocalManifest $LiveLocalManifest
 
         $uploadUrlResponse = Invoke-RemoteUploadUrl `
             -StudioOrigin $StudioOrigin `
@@ -500,7 +519,8 @@ function Invoke-RemoteBinaryPlaceSequence {
             -StudioOrigin $StudioOrigin `
             -ProjectIdForRemote $ProjectId `
             -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile
+            -GetRemoteFile $GetRemoteFile `
+            -LiveLocalManifest $LiveLocalManifest
 
         $minted = Get-RemoteUploadUrlResponseFields -Response $uploadUrlResponse
 
@@ -532,7 +552,8 @@ function Invoke-RemoteBinaryPlaceSequence {
             -StudioOrigin $StudioOrigin `
             -ProjectIdForRemote $ProjectId `
             -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile
+            -GetRemoteFile $GetRemoteFile `
+            -LiveLocalManifest $LiveLocalManifest
 
         $adoptResponse = Invoke-RemoteUploadAdopt `
             -StudioOrigin $StudioOrigin `
@@ -566,7 +587,8 @@ function Invoke-RemoteBinaryPlaceSequence {
             -StudioOrigin $StudioOrigin `
             -ProjectIdForRemote $ProjectId `
             -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile
+            -GetRemoteFile $GetRemoteFile `
+            -LiveLocalManifest $LiveLocalManifest
 
         try {
             $moveResponse = Invoke-RemoteMove `
@@ -734,7 +756,10 @@ function Invoke-RemoteBinaryPlace {
 
         [scriptblock]$GetRemoteFile = $null,
 
-        [scriptblock]$GetRemoteFileList = $null
+        [scriptblock]$GetRemoteFileList = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     Assert-SyncPathRepresentable -WorkspaceRoot $WorkspaceRoot -CanonicalPath $CanonicalPath
@@ -768,7 +793,8 @@ function Invoke-RemoteBinaryPlace {
             -StudioOrigin $StudioOrigin `
             -ProjectIdForRemote $ProjectId `
             -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile
+            -GetRemoteFile $GetRemoteFile `
+            -LiveLocalManifest $LiveLocalManifest
 
         Invoke-RemoteDeleteFile `
             -StudioOrigin $StudioOrigin `
@@ -817,5 +843,6 @@ function Invoke-RemoteBinaryPlace {
         -StudioOrigin $StudioOrigin `
         -Headers $Headers `
         -GetRemoteFile $GetRemoteFile `
-        -GetRemoteFileList $GetRemoteFileList
+        -GetRemoteFileList $GetRemoteFileList `
+        -LiveLocalManifest $LiveLocalManifest
 }

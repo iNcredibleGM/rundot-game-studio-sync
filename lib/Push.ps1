@@ -1542,7 +1542,10 @@ function Invoke-RundotSyncPushBinaryAction {
 
         [scriptblock]$GetRemoteFileList = $null,
 
-        [scriptblock]$InvokeBinaryPlace = $null
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     $path = [string]$Action.Path
@@ -1550,7 +1553,7 @@ function Invoke-RundotSyncPushBinaryAction {
 
     if ($null -eq $InvokeBinaryPlace) {
         $InvokeBinaryPlace = {
-            param($Ws, $Canonical, $Sha, $PlaceMode, $ExpectedRemote, $Art, $Res, $Origin, $Id, $Hdr, $GetFile, $GetList)
+            param($Ws, $Canonical, $Sha, $PlaceMode, $ExpectedRemote, $Art, $Res, $Origin, $Id, $Hdr, $GetFile, $GetList, $LiveLocal)
             Invoke-RemoteBinaryPlace `
                 -WorkspaceRoot $Ws `
                 -CanonicalPath $Canonical `
@@ -1563,7 +1566,8 @@ function Invoke-RundotSyncPushBinaryAction {
                 -StudioOrigin $Origin `
                 -Headers $Hdr `
                 -GetRemoteFile $GetFile `
-                -GetRemoteFileList $GetList
+                -GetRemoteFileList $GetList `
+                -LiveLocalManifest $LiveLocal
         }
     }
 
@@ -1584,7 +1588,8 @@ function Invoke-RundotSyncPushBinaryAction {
         $ProjectId `
         $Headers `
         $GetRemoteFile `
-        $GetRemoteFileList
+        $GetRemoteFileList `
+        $LiveLocalManifest
 }
 
 function Invoke-RundotSyncDeleteAction {
@@ -1739,7 +1744,10 @@ function Invoke-RundotSyncPushApply {
 
         [scriptblock]$InvokeTextCreate = $null,
 
-        [scriptblock]$InvokeBinaryPlace = $null
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     $actionRows = @($Actions)
@@ -1977,7 +1985,8 @@ function Invoke-RundotSyncPushApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -GetRemoteFileList $GetRemoteFileList `
-                -InvokeBinaryPlace $InvokeBinaryPlace
+                -InvokeBinaryPlace $InvokeBinaryPlace `
+                -LiveLocalManifest $LiveLocalManifest
 
             [void]$binaryActionsDone.Add($action)
             [void]$binaryLocals.Add($binaryLocal)
@@ -2129,7 +2138,10 @@ function Invoke-RundotSyncLocalWinsApply {
 
         [scriptblock]$InvokeTextCreate = $null,
 
-        [scriptblock]$InvokeBinaryPlace = $null
+        [scriptblock]$InvokeBinaryPlace = $null,
+
+        [AllowNull()]
+        $LiveLocalManifest = $null
     )
 
     $actionRows = @($Actions)
@@ -2383,7 +2395,8 @@ function Invoke-RundotSyncLocalWinsApply {
                 -Headers $Headers `
                 -GetRemoteFile $GetRemoteFile `
                 -GetRemoteFileList $GetRemoteFileList `
-                -InvokeBinaryPlace $InvokeBinaryPlace
+                -InvokeBinaryPlace $InvokeBinaryPlace `
+                -LiveLocalManifest $LiveLocalManifest
 
             [void]$binaryActionsDone.Add($action)
             [void]$binaryLocals.Add($binaryLocal)
@@ -2957,7 +2970,8 @@ function Invoke-RundotSyncPush {
                 -GetRemoteFile $GetRemoteFile `
                 -PutRemoteFile $PutRemoteFile `
                 -DeleteRemoteFile $DeleteRemoteFile `
-                -GetRemoteFileList $GetRemoteFileList
+                -GetRemoteFileList $GetRemoteFileList `
+                -LiveLocalManifest $Local
             $refusedActions = @($applyResult.Refused)
             $hadRefusals = ($refusedActions.Count -gt 0)
         }
@@ -2977,7 +2991,8 @@ function Invoke-RundotSyncPush {
                 -GetRemoteFile $GetRemoteFile `
                 -PutRemoteFile $PutRemoteFile `
                 -DeleteRemoteFile $DeleteRemoteFile `
-                -GetRemoteFileList $GetRemoteFileList
+                -GetRemoteFileList $GetRemoteFileList `
+                -LiveLocalManifest $Local
         }
     }
     catch {
