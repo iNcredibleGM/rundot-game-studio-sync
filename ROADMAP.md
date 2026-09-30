@@ -113,7 +113,7 @@ Milestone: [v0.3.0 - Publish the local tree](https://github.com/iNcredibleGM/run
 
 Done when a stranger, on a disposable project, can confirm one publish that overwrites one utf8 text file, creates one text file or shows a clear refusal, deletes one remote-only file, places one binary or shows a clear refusal, and leaves every unconfirmed conflict untouched.
 
-Cut integration branch `v0.3.0` from `main` after v0.2.0 ships. Do not land these issues on `v0.2.0` or on `main` before that.
+Shipped on `main`.
 
 ## After v0.3.0
 
