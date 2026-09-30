@@ -110,3 +110,161 @@ $nestedFailure = New-RemotePlaceAfterMoveFailure `
 Assert-True `
     ($nestedFailure.Message -match 'encoding mismatch') `
     "the innermost cause must be surfaced"
+
+
+# ---------------------------------------------------------------------------
+# The step gate reuses the run's local manifest instead of re-hashing (#59)
+# ---------------------------------------------------------------------------
+#
+# A place calls the step gate four times. Each gate must fingerprint the
+# manifest the run already computed rather than re-hashing the whole workspace,
+# or a large publish cannot fit the plan TTL. This counts the full-manifest
+# computations by wrapping Get-LocalManifest around the gate.
+
+$manifestReuseRoot = Join-Path $env:TEMP ("rundot-place-manifest-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $manifestReuseRoot | Out-Null
+
+try {
+    $reuseProjectId = 'proj-place-manifest'
+    $reuseOrigin = 'https://example.invalid'
+    $reusePath = 'public/logo.png'
+    $reuseBytes = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03)
+    $reuseLocalPath = Join-Path $manifestReuseRoot $reusePath.Replace('/', '\')
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reuseLocalPath) | Out-Null
+    [System.IO.File]::WriteAllBytes($reuseLocalPath, $reuseBytes)
+
+    $reuseLocalSha = Get-FileSha256Hex -LiteralPath $reuseLocalPath
+    $reuseLocalMap = @{
+        $reusePath = [pscustomobject]@{
+            Sha256            = $reuseLocalSha
+            Size              = $reuseBytes.Length
+            LocalDetectedKind = 'binary'
+            LineEnding        = $null
+            HasBom            = $null
+        }
+    }
+
+    $reuseResolution = [pscustomobject]@{
+        Base        = [pscustomobject]@{ capturedAt = '2026-09-14T12:00:00.0000000Z'; files = @{} }
+        BasePresent = $true
+        Untrusted   = $false
+    }
+    $reuseSnapshot = [pscustomobject]@{
+        RemoteManifestHashBefore = ('b' * 64)
+        RemoteManifestHashAfter  = ('b' * 64)
+    }
+
+    $reuseArtifact = New-RundotSyncPlanArtifact `
+        -WorkspaceRoot $manifestReuseRoot `
+        -ProjectId $reuseProjectId `
+        -Resolution $reuseResolution `
+        -Local $reuseLocalMap `
+        -Remote @{} `
+        -Snapshot $reuseSnapshot
+
+    # The run's manifest, exactly as Push computes it once.
+    $runManifest = Get-LocalManifest -WorkspaceRoot $manifestReuseRoot
+
+    # The destination is absent: the gate's create check expects a 404.
+    $reuseGetRemote = {
+        param($Origin, $Id, $ApiPath, $Hdr)
+        $notFound = [System.InvalidOperationException]::new("Remote request failed with HTTP 404 for '$ApiPath'.")
+        $notFound.Data['HttpStatusCode'] = 404
+        throw $notFound
+    }
+
+    # Count full-manifest computations by wrapping Get-LocalManifest. The
+    # wrapper must call the captured original, not the name, or it recurses.
+    $script:ManifestReuseCount = 0
+    $originalGetLocalManifest = ${function:Get-LocalManifest}
+    $manifestReuseWrapper = {
+        param($WorkspaceRoot, [switch]$ShowProgress)
+        $script:ManifestReuseCount++
+        return (& $originalGetLocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress:$ShowProgress)
+    }
+
+    try {
+        Set-Item -Path 'function:Get-LocalManifest' -Value $manifestReuseWrapper
+
+        # Four gates, the same count one place performs, all given the run's
+        # manifest: none may re-hash the workspace.
+        foreach ($step in 1..4) {
+            Assert-RemoteBinaryPlaceStepGate `
+                -Artifact $reuseArtifact `
+                -Resolution $reuseResolution `
+                -WorkspaceRoot $manifestReuseRoot `
+                -ProjectId $reuseProjectId `
+                -CanonicalPath $reusePath `
+                -LocalSha256 $reuseLocalSha `
+                -RemoteCheck 'create' `
+                -StudioOrigin $reuseOrigin `
+                -ProjectIdForRemote $reuseProjectId `
+                -Headers @{} `
+                -GetRemoteFile $reuseGetRemote `
+                -LiveLocalManifest $runManifest
+        }
+
+        Assert-Equal 0 $script:ManifestReuseCount `
+            "four gates given the run's manifest must not re-hash the workspace at all (#59)"
+
+        # Without a supplied manifest the gate must still hash once, so a direct
+        # caller outside a Push run keeps its check rather than silently passing.
+        Assert-RemoteBinaryPlaceStepGate `
+            -Artifact $reuseArtifact `
+            -Resolution $reuseResolution `
+            -WorkspaceRoot $manifestReuseRoot `
+            -ProjectId $reuseProjectId `
+            -CanonicalPath $reusePath `
+            -LocalSha256 $reuseLocalSha `
+            -RemoteCheck 'create' `
+            -StudioOrigin $reuseOrigin `
+            -ProjectIdForRemote $reuseProjectId `
+            -Headers @{} `
+            -GetRemoteFile $reuseGetRemote
+
+        Assert-Equal 1 $script:ManifestReuseCount `
+            "a gate with no supplied manifest must still hash the workspace once"
+
+        # A stale supplied manifest must still be refused: reuse must not weaken
+        # the LOCAL-changed check.
+        $staleManifest = @{
+            $reusePath = [pscustomobject]@{
+                Sha256            = ('0' * 64)
+                Size              = $reuseBytes.Length
+                LocalDetectedKind = 'binary'
+                LineEnding        = $null
+                HasBom            = $null
+            }
+        }
+
+        $staleThrew = $false
+        try {
+            Assert-RemoteBinaryPlaceStepGate `
+                -Artifact $reuseArtifact `
+                -Resolution $reuseResolution `
+                -WorkspaceRoot $manifestReuseRoot `
+                -ProjectId $reuseProjectId `
+                -CanonicalPath $reusePath `
+                -LocalSha256 $reuseLocalSha `
+                -RemoteCheck 'create' `
+                -StudioOrigin $reuseOrigin `
+                -ProjectIdForRemote $reuseProjectId `
+                -Headers @{} `
+                -GetRemoteFile $reuseGetRemote `
+                -LiveLocalManifest $staleManifest
+        }
+        catch {
+            $staleThrew = $true
+        }
+
+        Assert-True $staleThrew "a supplied manifest that does not match the plan must still refuse"
+    }
+    finally {
+        Set-Item -Path 'function:Get-LocalManifest' -Value $originalGetLocalManifest
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $manifestReuseRoot) {
+        Remove-Item -LiteralPath $manifestReuseRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
