@@ -135,21 +135,19 @@ Before replacing anything it copies the original into
 type `yes`. `-ForcePull` skips the prompt for unattended runs but never skips a
 backup.
 
-### 5. Push clean local text overwrites (when local should publish)
+### 5. Push local changes (when local should publish)
 
-Run `Push` **only after `Plan`** when the report shows a clean utf8 text
-overwrite (`BASE=A LOCAL=B REMOTE=A`) and that row is applicable. Skip this
-step when you have no local text change to publish.
-
-Run `Plan` first so `.rundot-sync/last-plan.json` records the fingerprints
-Push will check:
+Run `Push` **only after `Plan`** so `.rundot-sync/last-plan.json` records the
+fingerprints Push will check:
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push
 ```
 
-Type `yes` when Push lists the remote files it will overwrite. For unattended
-runs:
+Default `Push` publishes the clean rows and asks before each kind of write:
+one `yes` for text overwrites, a second for text creates, a third for binary
+places, and a fourth before removing any remote file. Accepting one kind never
+accepts another. For unattended runs:
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -ForcePush
@@ -157,41 +155,59 @@ runs:
 
 `-ConfirmPush` is the same skip-prompt alias as `-ForcePush`.
 
-When Adopt left many conflicts and remote-only files, use **local-wins** publish
-after `Plan` to make Studio match your tree in one confirmed set (not a merge):
+When Adopt (or any diverged tree) left many conflicts and remote-only files,
+use **local-wins** publish after `Plan` to make Studio match your tree in one
+confirmed set (not a merge):
 
 ```powershell
 .\game-studio-sync.ps1 -ProjectId "YOUR_PROJECT_ID" -LocalDir ".\dev" -Command Push -LocalWins
 ```
 
+`-LocalWins` prints one combined list and asks once. It publishes clean
+overwrites, text creates, binary creates and replaces, and confirmed remote
+deletes, plus the conflicts you confirm in that list. It never merges content.
+
 See [docs/push.md](docs/push.md) for what is included, refused, and how partial
 BASE updates work.
 
-`Push` publishes only utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`) and
-applies confirmed remote deletes (`BASE=A LOCAL=— REMOTE=A`). Text creates,
-binaries, conflicts, and local deletions are reported and left alone. Before
-each overwrite or delete it copies the previous remote bytes into
-`.rundot-sync/backups/<timestamp>/`. If anything changed since `Plan`, Push
-refuses the whole run and asks you to plan again.
+`Push` publishes:
+
+- utf8 text overwrites (`BASE=A LOCAL=B REMOTE=A`) and text creates (`— A —`)
+- binary creates and replaces through the documented place-at-path sequence
+- confirmed remote deletes (`BASE=A LOCAL=— REMOTE=A`), including remote-only
+  paths under `-LocalWins`
+
+Conflicts are published only when `-LocalWins` names them; a conflict that is
+not confirmed stays untouched. Before each overwrite, replace, or delete it
+copies the previous remote bytes into `.rundot-sync/backups/<timestamp>/`. If
+anything changed since `Plan`, `Push` refuses the whole run and asks you to plan
+again.
 
 **Push will:**
 
-- After you type `yes` (or pass `-ForcePush` / `-ConfirmPush`), overwrite
-  existing utf8 text files whose remote bytes still match the plan
-- Ask for a second, separate `yes` before removing any remote file, and list
-  every path it would remove
+- After you confirm (or pass `-ForcePush` / `-ConfirmPush`), overwrite existing
+  utf8 text files whose remote bytes still match the plan, and create new utf8
+  text files through the documented upload + move + `PUT` sequence
+- Place binary files at their project path through the documented upload +
+  move sequence, and verify an oversize **create** from the upload `ETag`
+- Ask for a separate `yes` before removing any remote file, and list every path
+  it would remove
 - Copy each remote original into `.rundot-sync/backups/<timestamp>/` before any
-  `PUT` or `DELETE`
-- Move BASE only after every `PUT` echo-verifies and every delete is proven
+  write or delete
+- Move BASE only after every write echo-verifies and every delete is proven
   absent from `GET /files`
 
 **Push will not:**
 
-- Create files, upload binaries, or rename anything on Studio
+- Rename anything on Studio (a rename is published as a create plus a delete
+  only when both sides are confirmed)
 - Delete a path under `.git`, `.gitignore`, `.rundot-sync`, or `.rundot`, or a
   directory-shaped path
-- Merge divergent text or resolve a `CONFLICT` — conflicts are printed and
-  skipped; there is no automatic conflict resolution in this version
+- Publish a **binary replace** whose remote bytes exceed Studio's
+  2,000,000-byte read limit — the pre-overwrite backup and hash gate cannot read
+  them, so the path is refused (a binary **create** over the limit is published)
+- Merge divergent text — `-LocalWins` replaces remote bytes with local bytes,
+  and an unconfirmed `CONFLICT` is printed and skipped
 
 ## Progress on large trees
 
@@ -280,7 +296,7 @@ each keep their own independent BASE.
 | `Plan` | `.rundot-sync/last-plan.json` | Dry-run report of what a future sync would consider |
 | `Status` | nothing | The same report, without saving an artifact |
 | `Pull` | LOCAL + BASE | Apply clean remote-only changes, with backups |
-| `Push` | REMOTE + BASE | Publish clean local text overwrites from the last plan, with remote backups |
+| `Push` | REMOTE + BASE | Publish the confirmed local rows from the last plan (text overwrite, text create, binary place, remote delete), with remote backups |
 
 Full contracts: [Init](docs/init.md), [Plan / Status](docs/plan.md),
 [Pull](docs/pull.md), [Push](docs/push.md), [BASE schema](docs/base-schema.md).
@@ -420,9 +436,10 @@ Deliberately out of scope, so nothing here does them by accident:
 
 - Applying local changes without a fresh `Plan` (`Apply`)
 - Automatic conflict resolution
-- Remote create, binary upload, rename, or delete
-- Binary upload or adopt
-- Deleting anything automatically, locally or remotely
+- Rename (`POST /move`) as a standalone operation — a rename is published only
+  as a confirmed create plus delete
+- Deleting anything automatically, locally or remotely — a remote delete is
+  applied only through a confirmed `Push`
 - `.rundotignore` custom patterns
 - Newline or encoding normalization
 - File watching, device IDs, or a shared multi-machine BASE

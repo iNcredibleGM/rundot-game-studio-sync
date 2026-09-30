@@ -1,7 +1,9 @@
-# Acceptance: v0.1.3 pull, v0.2.0 Push, and v0.3.0 binary place
+# Acceptance: v0.1.3 pull, v0.2.0 Push, and v0.3.0 publish
 
-This is the acceptance record for the safe pull planner, the Push write routes,
-and binary place. It maps each public gate to the evidence that proves it.
+This is the acceptance record for the safe pull planner, the Push write routes
+(text overwrite, text create, binary place, and remote delete), and the
+confirmed local-wins publish. It maps each public gate to the evidence that
+proves it.
 
 Two kinds of evidence appear below:
 
@@ -191,6 +193,8 @@ not a license to leave workspace state lying around.
 | 14 | Binary create via documented place sequence | `tests/Acceptance.ps1` gate 14 + live check | Both |
 | 15 | Binary replace with remote backup | `tests/Acceptance.ps1` gate 15 + live check | Both |
 | 16 | Host-visible progress for hashing, download, and publish | `tests/Progress.Tests.ps1`, `tests/Manifest.Tests.ps1`, `tests/Snapshot.Tests.ps1` + `tests/Live-RoundTrip.ps1` | Both |
+| 17 | An oversize remote file is unverifiable, not a project-wide abort | `tests/Snapshot.Tests.ps1`, `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` + live check | Both |
+| 18 | A confirmed Push deletes one remote file with a backup and no secret in the journal | `tests/Push.Tests.ps1`, `tests/RemoteDelete.Tests.ps1`, `tests/Journal.Tests.ps1` + `tests/Live-RoundTrip.ps1` | Both |
 
 ### 1. Test suite green
 
@@ -465,6 +469,94 @@ untouched, and a `Push` of other paths in the same run still applies. The
 [#57](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/57) bug was
 observed exactly here: two 2,254,917-byte PNGs placed by an earlier `Push` made
 every later `Plan`/`Push` fail until they were captured as unverifiable.
+
+### 18. A confirmed Push deletes one remote file, with a backup and no secret in the journal
+
+| Property | Evidence |
+| --- | --- |
+| A removed local file plans as `deleteRemoteCandidate` (`BASE=A LOCAL=— REMOTE=A`) | `tests/SyncEngine.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+| A non-interactive default `Push` refuses before any `DELETE` | `tests/Push.Tests.ps1`, live check |
+| `Push -ForcePush` sends the documented `DELETE /file` and proves the path absent from `GET /files` | `tests/RemoteDelete.Tests.ps1`, `tests/Push.Tests.ps1`, live check |
+| The pre-delete remote bytes are backed up before the `DELETE` | `tests/Push.Tests.ps1`, `tests/Backup.Tests.ps1`, live check |
+| The deleted path is dropped from BASE | `tests/Push.Tests.ps1`, live check |
+| The journal records `push-delete` with metadata only | `tests/Journal.Tests.ps1`, `tests/Push.Tests.ps1`, live check |
+| A reserved or directory-shaped path is refused before any request | `tests/RemoteDelete.Tests.ps1` |
+| A `404` is success only when the path is absent from `GET /files` | `tests/RemoteDelete.Tests.ps1`, `tests/Push.Tests.ps1` |
+
+**Live check:** `tests/Live-RoundTrip.ps1` publishes probe B in its UP phase,
+removes the local copy, and confirms the delete end to end. `Plan` reports one
+`deleteRemoteCandidate`; a non-interactive default `Push` exits non-zero and the
+file is still listed; `Push -ForcePush` reports `deleted ≥ 1`, moves BASE, and
+the file is gone from `GET /files`. The delete backup holds the pre-delete
+remote bytes, and `journal.jsonl` carries a `push-delete` record for the path
+with no credential or `"content"` pattern.
+
+The production publish recorded below exercised the same route for real: the
+remote tree was a subset of LOCAL, so it had zero delete candidates, and the
+gate is proven by the live round-trip plus the unit coverage instead.
+
+## Production publish acceptance (v0.3.0, #44)
+
+The gate above is proven on a disposable project. This section records the
+**real** publish that closed the milestone: a diverged local tree was published
+to a live Studio project through the documented routes only.
+
+The tree was a 931-file `dev` folder that was a complete superset of the live
+project. Its own `.gitignore` excluded 70 paths (~946 MB) that the tool's fixed
+ignore set still treated as candidates, including a `.env.local` secret; those
+were moved out of the tree before the run rather than uploaded. That gap is the
+reason for the follow-up in [ROADMAP.md](../ROADMAP.md) on honoring a present
+`.gitignore`.
+
+`Init -InitMode Adopt` recorded the proven matches. `Plan` on the 931-file tree
+reported 550 `synchronized-addition`, 56 `unchanged`, 268 binary `upload`, 55
+`conflict`, and 2 `unverifiable`, with zero `deleteRemoteCandidate` — the remote
+tree was a subset, so `-LocalWins` deleted nothing.
+
+Publishing ran as `Push -ForcePush` for the clean utf8 rows, then
+`Push -LocalWins` for the creates, binaries, and confirmed conflicts. A
+20-minute plan TTL means one artifact cannot cover a 268-binary publish: the
+first run published 191 actions and refused the remaining 132 with
+`this plan has expired`, so the run re-planned and resumed. Re-planning resolved
+every expiry refusal, and no path was refused for any reason other than the
+2,000,000-character editor limit noted below.
+
+Final `Plan` after the publish:
+
+```text
+total: 931
+upload: 0
+download: 0
+conflict: 1
+deleteRemoteCandidate: 0
+deleteLocalCandidate: 0
+ignored: 0
+unchanged: 373
+synchronized-addition: 550
+unverifiable: 7
+applicable: 0
+```
+
+The single remaining `conflict` is `docs/plaque-attack/STATUS.md`, whose text
+exceeds Studio's 2,000,000-character editor limit, so the documented `PUT`
+refuses it before writing. The 7 `unverifiable` paths are binaries over the
+2,000,000-byte read limit; each was published as a **create** and verified from
+the presigned upload `ETag` ([binary-place.md](binary-place.md)), and a later
+`Plan` cannot read them back, so they are reported `UNVERIFIABLE` rather than
+`UNCHANGED` (gate 17).
+
+| What the record shows | Where |
+| --- | --- |
+| Text overwrites and creates published through `PUT /file` and the create sequence | `.rundot-sync/journal.jsonl`, `push` records |
+| 270 binary places, including oversize creates, through the place sequence | `journal.jsonl`, `push-binary` records |
+| 54 remote originals backed up before overwrite or delete | `journal.jsonl`, `push-backup` records |
+| Backup sets on disk for every overwritten remote original | `.rundot-sync/backups/<timestamp>/` |
+| No tokens, refresh tokens, or file contents in the journal | `journal.jsonl` secret scan |
+| No unconfirmed conflict clobbered | the single remaining `conflict` above |
+
+The publish is the acceptance evidence that a stranger can do the same on a
+disposable project: `Init` → `Plan` → confirmed `Push`, with Studio matching the
+confirmed paths, backups on disk, and every unconfirmed path untouched.
 
 ## What this record deliberately does not claim
 
