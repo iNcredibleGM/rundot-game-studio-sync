@@ -76,6 +76,20 @@ Only a `deleteRemoteCandidate` row the plan marked `applicable` may be applied.
 `Push` re-classifies it live and refuses the whole run if it is no longer a
 clean delete.
 
+### Deletes under `-LocalWins`
+
+Default `Push` applies only `deleteRemoteCandidate`. `Push -LocalWins` also
+turns a remote-only path into a delete: a row whose LOCAL copy is absent while
+REMOTE still has the file, where the plan would otherwise call it a `download`
+or a `conflict`. Those paths are printed in the same remote-delete group as the
+`deleteRemoteCandidate` rows and are confirmed by the same single `yes`.
+
+Every guard still applies to a `-LocalWins` delete: the live remote hash is
+re-read and compared to the plan row, the previous remote bytes are backed up
+before the `DELETE`, the path is proven absent from `GET /files`, and a reserved
+or directory-shaped path is refused. `-LocalWins` changes **which** remote-only
+paths are offered for deletion; it never weakens the check before one is sent.
+
 ## Refused paths
 
 Two path shapes are refused before any request. Neither is a server-side
