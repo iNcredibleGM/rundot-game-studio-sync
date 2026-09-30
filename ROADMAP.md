@@ -115,7 +115,19 @@ Done when a stranger, on a disposable project, can confirm one publish that over
 
 Shipped on `main`.
 
-## After v0.3.0
+## v0.3.1 - Honor .gitignore
+
+Patch on v0.3.0. The v0.3.0 production publish showed the fixed ignore set still treating gitignored paths as sync candidates — 70 paths (~946 MB) in an 18,642-file tree, including a `.env.local` secret ([#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)). This version honors a present **root** `.gitignore` during local sync inventory so those paths are not upload candidates.
+
+**Scope is deliberately narrow:** `.gitignore` is an **additive floor** over the fixed built-in set — it never re-includes or overrides a built-in entry. No negation (`!pattern`) and no nested per-directory files. The ignore set stays deterministic and reported, a parse failure fails closed, and an ignore rule must never manufacture a `deleteRemoteCandidate`. No new Studio write route.
+
+Milestone: [v0.3.1 - Honor .gitignore](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/5)
+
+1. Honor a present `.gitignore` during local sync inventory — [#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)
+
+Deferred to a later milestone: nested `.gitignore` files, negation / re-include semantics, full anchoring and `**` pattern semantics, and the built-in-vs-`.gitignore` precedence question beyond "additive floor".
+
+## After v0.3.1
 
 - browser bootstrap / bookmarklet helper
 - official `rundot` CLI refresh-token handling beyond the current fresh-access-token path
