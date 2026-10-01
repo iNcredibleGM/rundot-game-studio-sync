@@ -40,6 +40,12 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 
 Tests must not require Pester to be installed.
 
+## File and function length
+
+Product PowerShell is budgeted at **500 lines per file** and **150 lines per function**. A file or function over budget is a refactoring target, not a place to add more.
+
+`tests/FileLength.Tests.ps1` enforces the budget as a ratchet: anything already over budget is frozen in that test's allowlist at its current size, so it may shrink but never grow, and it must be removed from the allowlist once it drops under budget. Add new code to a focused file that fits the budget, or split the file you are touching.
+
 ## Safety
 
 - Never print, log, or commit access tokens, refresh tokens, or auth files (`%APPDATA%\.rundot\`).
