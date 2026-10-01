@@ -4,8 +4,9 @@ Sync compares files by one canonical path form. Every remote and local path
 must pass safety validation. Identity ambiguity hard-fails the run. Partial
 trees look like deletions, so unsafe paths are never skipped.
 
-This matcher is the documented default set. There is no `.rundotignore`
-parser in this milestone.
+This matcher is the documented default set. There is still no `.rundotignore`
+parser in this version, but a present **root** `.gitignore` is honored as an
+additive floor (#64) — see "Root `.gitignore`" below.
 
 ## Canonical form
 
@@ -68,6 +69,32 @@ anywhere. Globs and exact names match the final component only.
 | `*.bak` | glob on final component |
 
 `out.ts` does not match `out/`.
+
+### Root `.gitignore`
+
+A `.gitignore` at the workspace root is read once per run and added to the set
+above as an **additive floor** (#64). It can only add ignores; it can never
+re-include or override a built-in entry, so a `!.git/` line cannot make `.git/`
+a candidate. Rules are matched with git's own shape:
+
+- a truly slashless rule (`*.log`, `secrets`) matches any segment at any depth,
+  which also covers a directory of that name and its contents
+- a rule with a leading or internal slash (`/root-only.txt`, `logs/debug.log`)
+  is anchored to the workspace root, and a longer path means the rule matched
+  an ancestor directory, so its contents are ignored too
+- `\` is normalized to `/`, and a trailing `/` is stripped
+
+**Negation is not obeyed.** A `!pattern` line is recorded and reported in the
+run output, but it does not re-include anything in this version. A rule that
+cannot be parsed (an empty segment, `.`/`..`, or a rule that names no path)
+**fails the run closed** rather than being skipped. Each run reports how many
+rules it added, so the ignore set is never a silent skip.
+
+Because the ignore check runs before the three-way decision table, a path
+hidden only by a `.gitignore` rule is `ignored`: it is never an upload
+candidate, and a remote path that a local rule hides is never turned into a
+`deleteRemoteCandidate`. `.gitignore` is not in the built-in set, so it is
+itself still inventoried. Nested per-directory `.gitignore` files are not read.
 
 These ignores apply to local inventory for later Plan/Pull. Export still
 downloads remote files even when their names match this set, and the raw
