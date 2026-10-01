@@ -147,6 +147,57 @@ Assert-True `
     ($null -eq (Get-SyncDeletePathRefusalReason -CanonicalPath 'src/a.ts' -RemotePaths @('src/a.ts'))) `
     "an ordinary leaf path must have no refusal reason"
 
+# The precomputed ancestor set must agree with the per-row scan on leaves, a
+# real ancestor directory, and a sibling prefix (#69).
+$ancestorSet = Get-SyncRemoteAncestorDirectories -RemotePaths @('src/dir/a.ts', 'top.ts')
+Assert-True `
+    ($ancestorSet.Contains('src')) `
+    "the ancestor set must include an intermediate directory"
+Assert-True `
+    ($ancestorSet.Contains('src/dir')) `
+    "the ancestor set must include the immediate parent directory"
+Assert-True `
+    (-not $ancestorSet.Contains('src/dir/a.ts')) `
+    "a leaf file must never be in the ancestor set"
+Assert-True `
+    (-not $ancestorSet.Contains('top.ts')) `
+    "a top-level leaf must never be in the ancestor set"
+Assert-True `
+    (-not $ancestorSet.Contains('src/dir2')) `
+    "a sibling prefix must not be in the ancestor set"
+
+Assert-True `
+    (Test-SyncDeletePathDirectoryShaped `
+        -CanonicalPath 'src/dir' `
+        -AncestorDirectories $ancestorSet) `
+    "the set-based check must agree on a real ancestor directory"
+Assert-True `
+    (-not (Test-SyncDeletePathDirectoryShaped `
+        -CanonicalPath 'src/dir/a.ts' `
+        -AncestorDirectories $ancestorSet)) `
+    "the set-based check must agree on a leaf"
+Assert-True `
+    (-not (Test-SyncDeletePathDirectoryShaped `
+        -CanonicalPath 'src/dir2' `
+        -AncestorDirectories $ancestorSet)) `
+    "the set-based check must agree on a sibling prefix"
+
+# An empty remote list yields an empty set that refuses nothing.
+$emptyAncestors = Get-SyncRemoteAncestorDirectories -RemotePaths @()
+Assert-True `
+    (-not (Test-SyncDeletePathDirectoryShaped `
+        -CanonicalPath 'src/dir' `
+        -AncestorDirectories $emptyAncestors)) `
+    "an empty ancestor set must not refuse a path"
+
+# The ancestor comparison stays ordinal, matching the scan it replaces: a
+# case-differing candidate is not the same directory.
+Assert-True `
+    (-not (Test-SyncDeletePathDirectoryShaped `
+        -CanonicalPath 'SRC/DIR' `
+        -RemotePaths @('src/dir/a.ts'))) `
+    "the directory-shaped check must stay case-sensitive"
+
 
 # --------------------------------------------------------------------------
 # Absence proof
