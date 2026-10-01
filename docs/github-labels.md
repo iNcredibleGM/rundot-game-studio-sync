@@ -22,6 +22,7 @@ Add one **type** label and one **area** label. Add `safety` if data loss is poss
 | `feature` | `#1D76DB` | New user-facing or product behavior |
 | `docs` | `#0075CA` | README, ROADMAP, protocol notes, process docs |
 | `tests` | `#0E8A16` | Test runner, fixtures, coverage gaps |
+| `perf` | `#7057FF` | Faster with no behavior change |
 | `chore` | `#C5DEF5` | Refactor/extract with no user-facing change |
 
 ## Area
