@@ -329,6 +329,22 @@ like project files that were deleted:
 There is **no `.rundotignore`** in this version. The list above is fixed and
 documented in [docs/path-safety.md](docs/path-safety.md).
 
+### Root `.gitignore`
+
+A `.gitignore` at the workspace root is also honored, as an **additive floor**
+over the fixed list above ([#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)).
+It can only **add** ignores — it can never re-include or override a built-in
+entry, so a `!.git/` line cannot make `.git/` a candidate. This version does
+not obey negation (`!pattern`); a negation line is reported in the run output
+but ignored, and nested per-directory `.gitignore` files are not read.
+
+Each run reports how many rules it added, so the ignore set is never a silent
+skip. A `.gitignore` that cannot be parsed fails the whole run closed rather
+than being skipped, and a gitignored path is classified `ignored` — it never
+becomes an upload candidate and never turns a remote file into a
+`deleteRemoteCandidate`. `.gitignore` itself is not in the built-in set, so it
+is still inventoried.
+
 One important asymmetry: the **raw exporter does not apply these ignores**. It
 downloads everything Studio lists. The ignore set applies to the local
 inventory that `Plan` and `Pull` compare.
@@ -440,7 +456,10 @@ Deliberately out of scope, so nothing here does them by accident:
   as a confirmed create plus delete
 - Deleting anything automatically, locally or remotely — a remote delete is
   applied only through a confirmed `Push`
-- `.rundotignore` custom patterns
+- `.rundotignore` custom patterns (a root `.gitignore` **is** honored, as an
+  additive floor; see [Default ignores](#default-ignores))
+- Nested per-directory `.gitignore` files, `.gitignore` negation, and the full
+  anchoring/`**` pattern surface
 - Newline or encoding normalization
 - File watching, device IDs, or a shared multi-machine BASE
 

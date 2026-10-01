@@ -279,6 +279,9 @@ function Invoke-SyncPlanCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -448,6 +451,9 @@ function Invoke-SyncPullCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -829,6 +835,9 @@ function Invoke-SyncPushCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -982,6 +991,9 @@ function Invoke-SyncInit {
             Write-Host ""
             Write-Host $result.Report
             Write-Host ""
+            foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+                Write-Host $ignoreNoticeLine
+            }
             Write-Host "Attached sync metadata to the existing tree."
             Write-Host "  Paths recorded in BASE: $($result.BaseFileCount)"
             Write-Host "  Unresolved paths:       $($result.UnresolvedCount)"

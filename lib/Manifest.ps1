@@ -65,9 +65,20 @@ function Get-LocalManifest {
         [switch]$ShowProgress
     )
 
+    $root = Get-NormalizedWorkspaceRoot -WorkspaceRoot $WorkspaceRoot
+
+    # Root .gitignore layer (#64). Read and publish the ignore set BEFORE any
+    # tree walk, so the safety assertion and the inventory agree, and so the
+    # classification that follows this call uses the same set. A parse failure
+    # throws here, failing the run closed instead of skipping a rule silently.
+    # The context is intentionally NOT cleared here: the caller classifies
+    # against the same set, and a later Get-LocalManifest (or $null text)
+    # replaces it.
+    $gitIgnoreText = Read-SyncRootGitIgnoreText -WorkspaceRoot $root
+    [void](Set-SyncIgnoreContext -Text $gitIgnoreText)
+
     Assert-LocalWorkspaceTreeSafe -WorkspaceRoot $WorkspaceRoot
 
-    $root = Get-NormalizedWorkspaceRoot -WorkspaceRoot $WorkspaceRoot
     $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
 
     $progressState = $null

@@ -564,7 +564,8 @@ confirmed paths, backups on disk, and every unconfirmed path untouched.
 - No automatic local deletion. `deleteLocalCandidate` leaves the file in place.
   A remote delete happens only through a confirmed `Push` delete
   ([delete.md](delete.md)).
-- No `.rundotignore`. The default ignore set is fixed and documented.
+- No `.rundotignore`. The built-in ignore set is fixed, plus a present root
+  `.gitignore` honored as an additive floor (#64).
 - No newline or encoding normalization; text is preserved byte-for-byte.
 - No FileSystemWatcher, device IDs, or multi-machine BASE. One initialized
   workspace belongs to one project and one folder.
