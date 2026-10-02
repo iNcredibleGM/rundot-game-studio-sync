@@ -512,7 +512,7 @@ function Get-RemoteSnapshotFileMap {
         if ($ShowProgress) {
             Complete-RundotSyncProgress `
                 -State $progressState `
-                -Text ("Downloaded {0} remote file(s)." -f $total)
+                -Text ("Downloaded {0} remote file(s)." -f ($total - $oversizePaths.Count))
         }
     }
 

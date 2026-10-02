@@ -103,9 +103,10 @@ caller to move into `LocalDir`.
 
 `Init -InitMode FromRemote` consumes it by **renaming** each top-level
 staging entry into `LocalDir`, then clears this staging tree once BASE is
-written ([init.md](init.md)). The rename is same-volume, so there is no
-partial-copy window; a rename that fails midway is rolled back into staging
-and no BASE is written.
+written ([init.md](init.md)). Only verifiable paths are promoted; unverifiable
+paths are reported and left out of BASE instead of failing Init. The rename is
+same-volume, so there is no partial-copy window; a rename that fails midway is
+rolled back into staging and no BASE is written.
 
 Returned file entries are hashes and diagnostics only (`Sha256`, `Size`,
 `LocalDetectedKind`, `LineEnding`, `HasBom`, `RemoteKind`, `Encoding`,

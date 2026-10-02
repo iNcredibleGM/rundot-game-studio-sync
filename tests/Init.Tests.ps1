@@ -241,8 +241,28 @@ function New-FakeSnapshotEntry {
         [string]$Kind,
         [string]$Encoding,
         $LineEnding = $null,
-        $HasBom = $null
+        $HasBom = $null,
+        [switch]$Unverifiable
     )
+
+    if ($Unverifiable) {
+        $limit = Get-SyncStudioMaxReadableFileSize
+        if ($Size -le $limit) {
+            $Size = $limit + 1
+        }
+
+        return [pscustomobject]@{
+            Sha256            = $null
+            Size              = $Size
+            LocalDetectedKind = 'binary'
+            LineEnding        = $null
+            HasBom            = $null
+            RemoteKind        = 'binary'
+            Encoding          = $null
+            StagingPath       = $null
+            Unverifiable      = $true
+        }
+    }
 
     return [pscustomobject]@{
         Sha256            = $Sha256
@@ -923,6 +943,231 @@ try {
         (Read-BaseManifest -WorkspaceRoot $gitDirCollide) `
         "a .git collision must not write BASE"
 
+    # ----------------------------------------------------------------------
+    # Unverifiable remote entries (#82): oversized paths are not staged
+    # ----------------------------------------------------------------------
+
+    $oversizeLimit = Get-SyncStudioMaxReadableFileSize
+    $oversizeCanonical = 'public/characters/hero/spellCasting.fbx'
+
+    # #82 regression: stable snapshot + full FromRemote (not Import alone).
+    # Before the fix, Init threw after download:
+    #   Remote snapshot listed 'public/characters/hero/spellCasting.fbx', but it
+    #   is missing from staging.
+    $issue82Dir = Join-Path $fromRemoteRoot "issue-82-fromremote"
+    $issue82Manifest = New-FakeRemoteManifest -Files @(
+        (New-FakeRemoteListEntry @{
+            path     = 'src/a.ts'
+            type     = 'file'
+            size     = 2
+            encoding = 'utf8'
+        }),
+        (New-FakeRemoteListEntry @{
+            path     = $oversizeCanonical
+            type     = 'file'
+            size     = ($oversizeLimit + 1)
+            encoding = 'base64'
+            kind     = 'binary'
+        })
+    )
+    Reset-FakeRemote `
+        -Lists @($issue82Manifest, $issue82Manifest) `
+        -Files @{
+            'src/a.ts' = [pscustomobject]@{ encoding = 'utf8'; content = 'ab' }
+        }
+
+    $issue82Thrown = $null
+    $issue82Result = $null
+    try {
+        $issue82Result = Initialize-RundotSyncFromRemote `
+            -LocalDir $issue82Dir `
+            -ProjectId 'proj-test-1' `
+            -StudioOrigin 'https://example.test' `
+            -Headers $initHeaders
+    }
+    catch {
+        $issue82Thrown = $_.Exception
+    }
+
+    Assert-True ($null -eq $issue82Thrown) `
+        "#82: FromRemote must finish when the remote listing includes an oversize file"
+    if ($null -ne $issue82Thrown) {
+        Assert-True `
+            ($issue82Thrown.Message -notmatch 'missing from staging') `
+            "#82: the oversize path must not be treated as a missing staged file"
+    }
+    Assert-Equal 1 $script:FileCallCount `
+        "#82: GET /file must run only for the readable file, never for the oversize path"
+    Assert-Equal 1 $issue82Result.FileCount `
+        "#82: only the readable file counts as verified and promoted"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $issue82Dir "src\a.ts")) `
+        "#82: the readable file must be promoted"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $issue82Dir "public\characters\hero\spellCasting.fbx"))) `
+        "#82: the oversize file must not be promoted locally"
+
+    $issue82Base = Read-BaseManifest -WorkspaceRoot $issue82Dir
+    Assert-True ($null -ne $issue82Base) "#82: Init must still write BASE for the readable tree"
+    Assert-True ($null -ne $issue82Base.files.'src/a.ts') "#82: BASE must record the promoted file"
+    Assert-True ($null -eq $issue82Base.files.$oversizeCanonical) "#82: BASE must omit the oversize path"
+
+    $mixedDir = Join-Path $fromRemoteRoot "unverifiable-mixed"
+    $mixedStaging = New-FakeStagingRoot -LocalDir $mixedDir
+    New-Item -ItemType Directory -Path (Join-Path $mixedStaging "src") -Force | Out-Null
+    $mixedReadable = Join-Path $mixedStaging "src\a.ts"
+    [System.IO.File]::WriteAllBytes($mixedReadable, [byte[]](0x61, 0x62))
+    $mixedSnapshot = New-FakeSnapshot -StagingRoot $mixedStaging -Files @{
+        'src/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $mixedReadable `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $mixedReadable) `
+            -Size 2 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+        $oversizeCanonical = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimit + 1) `
+            -StagingPath $null -Sha256 $null -Kind 'binary' -Encoding 'base64'
+    }
+
+    $mixedResult = Import-RundotRemoteSnapshot `
+        -LocalDir $mixedDir `
+        -ProjectId 'proj-test-1' `
+        -Snapshot $mixedSnapshot
+
+    Assert-Equal 1 $mixedResult.FileCount "only verifiable files count toward FileCount"
+    Assert-Equal 1 @($mixedResult.Unverifiable).Count "one unverifiable path should be reported"
+    Assert-Equal $oversizeCanonical $mixedResult.Unverifiable[0].Path "the unverifiable path should be named"
+    Assert-Equal ($oversizeLimit + 1) ([int64]$mixedResult.Unverifiable[0].Size) "the unverifiable path should carry listed size"
+
+    $mixedBase = Read-BaseManifest -WorkspaceRoot $mixedDir
+    Assert-True ($null -ne $mixedBase) "a mixed snapshot must still write BASE for verifiable files"
+    Assert-True ($null -ne $mixedBase.files.'src/a.ts') "BASE must include the promoted file"
+    Assert-True ($null -eq $mixedBase.files.$oversizeCanonical) "BASE must not include an unverifiable path"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $mixedDir "public\characters\hero\spellCasting.fbx"))) `
+        "an unverifiable file must not be promoted"
+
+    $mixedSummary = [string]::Join("`n", @(Get-RundotSyncInitFromRemoteSummaryLines `
+        -FileCount $mixedResult.FileCount `
+        -Unverifiable $mixedResult.Unverifiable))
+    Assert-True ($mixedSummary -match [regex]::Escape($oversizeCanonical)) "the summary should name the unverifiable path"
+    Assert-True ($mixedSummary -match '(?i)not downloaded') "the summary should say the path was not downloaded"
+    Assert-True ($mixedSummary -match '(?i)not tracked in BASE') "the summary should say the path is not in BASE"
+
+    $smuggledDir = Join-Path $fromRemoteRoot "unverifiable-smuggled"
+    $smuggledStaging = New-FakeStagingRoot -LocalDir $smuggledDir
+    New-Item -ItemType Directory -Path (Join-Path $smuggledStaging "src") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $smuggledStaging "public\characters\hero") -Force | Out-Null
+    $smuggledReadable = Join-Path $smuggledStaging "src\a.ts"
+    [System.IO.File]::WriteAllBytes($smuggledReadable, [byte[]](0x61))
+    $smuggledOversize = Join-Path $smuggledStaging "public\characters\hero\spellCasting.fbx"
+    [System.IO.File]::WriteAllBytes($smuggledOversize, [byte[]](0xFF))
+    $smuggledSnapshot = New-FakeSnapshot -StagingRoot $smuggledStaging -Files @{
+        'src/a.ts' = New-FakeSnapshotEntry `
+            -StagingPath $smuggledReadable `
+            -Sha256 (Get-FileSha256Hex -LiteralPath $smuggledReadable) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+        $oversizeCanonical = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimit + 1) `
+            -StagingPath $null -Sha256 $null -Kind 'binary' -Encoding 'base64'
+    }
+
+    $smuggledThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $smuggledDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $smuggledSnapshot | Out-Null
+    }
+    catch {
+        $smuggledThrown = $_.Exception
+    }
+    Assert-True ($null -ne $smuggledThrown) "staging bytes for an unverifiable path must abort"
+    if ($null -ne $smuggledThrown) {
+        Assert-True `
+            ($smuggledThrown.Message -match '(?i)unverifiable') `
+            "smuggled oversize bytes should not use the ordinary missing-from-staging message"
+        Assert-True `
+            ($smuggledThrown.Message -notmatch 'missing from staging') `
+            "smuggled oversize bytes should not use the ordinary missing-from-staging message"
+    }
+    Assert-Null (Read-BaseManifest -WorkspaceRoot $smuggledDir) "smuggled oversize bytes must not write BASE"
+
+    $missingVerifiableDir = Join-Path $fromRemoteRoot "verifiable-missing"
+    $missingVerifiableStaging = New-FakeStagingRoot -LocalDir $missingVerifiableDir
+    $missingVerifiableSnapshot = New-FakeSnapshot -StagingRoot $missingVerifiableStaging -Files @{
+        'src/missing.ts' = New-FakeSnapshotEntry `
+            -StagingPath (Join-Path $missingVerifiableStaging 'src\missing.ts') `
+            -Sha256 ('0' * 64) `
+            -Size 1 `
+            -Kind 'utf8' `
+            -Encoding 'utf8'
+    }
+
+    Assert-Throws {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $missingVerifiableDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $missingVerifiableSnapshot
+    } "a verifiable path missing from staging must still abort"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $missingVerifiableDir) `
+        "a verifiable missing path must not write BASE"
+
+    $onlyUnverifiableDir = Join-Path $fromRemoteRoot "only-unverifiable"
+    $onlyUnverifiableStaging = New-FakeStagingRoot -LocalDir $onlyUnverifiableDir
+    $onlyUnverifiableSnapshot = New-FakeSnapshot -StagingRoot $onlyUnverifiableStaging -Files @{
+        $oversizeCanonical = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimit + 1) `
+            -StagingPath $null -Sha256 $null -Kind 'binary' -Encoding 'base64'
+    }
+
+    $onlyUnverifiableResult = Import-RundotRemoteSnapshot `
+        -LocalDir $onlyUnverifiableDir `
+        -ProjectId 'proj-test-1' `
+        -Snapshot $onlyUnverifiableSnapshot
+
+    Assert-Equal 0 $onlyUnverifiableResult.FileCount "only-unverifiable init must promote nothing"
+    $onlyUnverifiableBase = Read-BaseManifest -WorkspaceRoot $onlyUnverifiableDir
+    Assert-True ($null -ne $onlyUnverifiableBase) "only-unverifiable init must still write BASE"
+    Assert-Equal `
+        0 `
+        @($onlyUnverifiableBase.files.PSObject.Properties).Count `
+        "only-unverifiable BASE must have zero entries"
+
+    $oversizeIgnoreDir = Join-Path $fromRemoteRoot "unverifiable-gitignore-collision"
+    New-Item -ItemType Directory -Path $oversizeIgnoreDir -Force | Out-Null
+    $localIgnoreBytes = [byte[]](0x4B)
+    [System.IO.File]::WriteAllBytes((Join-Path $oversizeIgnoreDir ".gitignore"), $localIgnoreBytes)
+    $oversizeIgnoreStaging = New-FakeStagingRoot -LocalDir $oversizeIgnoreDir
+    $oversizeIgnoreSnapshot = New-FakeSnapshot -StagingRoot $oversizeIgnoreStaging -Files @{
+        '.gitignore' = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimit + 1) `
+            -StagingPath $null -Sha256 $null -Kind 'utf8' -Encoding 'utf8'
+    }
+
+    $oversizeIgnoreThrown = $null
+    try {
+        Import-RundotRemoteSnapshot `
+            -LocalDir $oversizeIgnoreDir `
+            -ProjectId 'proj-test-1' `
+            -Snapshot $oversizeIgnoreSnapshot | Out-Null
+    }
+    catch {
+        $oversizeIgnoreThrown = $_.Exception
+    }
+    Assert-True ($null -ne $oversizeIgnoreThrown) "an unverifiable retained-metadata path must refuse"
+    if ($null -ne $oversizeIgnoreThrown) {
+        Assert-True `
+            ($oversizeIgnoreThrown.Message -match '(?i)metadata') `
+            "the refusal should explain retained metadata would be overwritten"
+    }
+    Assert-Equal `
+        $localIgnoreBytes `
+        ([System.IO.File]::ReadAllBytes((Join-Path $oversizeIgnoreDir ".gitignore"))) `
+        "an unverifiable metadata collision must not overwrite the existing .gitignore"
+    Assert-Null `
+        (Read-BaseManifest -WorkspaceRoot $oversizeIgnoreDir) `
+        "an unverifiable metadata collision must not write BASE"
+
     # A malformed snapshot must be rejected before any promotion.
     $badSnapshotDir = Join-Path $fromRemoteRoot "bad-snapshot"
     Assert-RundotSyncInitDestination -LocalDir $badSnapshotDir
@@ -1105,6 +1350,91 @@ try {
         if ([string]$row.Status -eq 'Identical') { $baseCandidateCount++ }
     }
     Assert-Equal 1 $baseCandidateCount "only Identical rows may become BASE entries"
+
+    # ----------------------------------------------------------------------
+    # Adopt: unverifiable remote entries (#82)
+    # ----------------------------------------------------------------------
+
+    $oversizeLimitAdopt = Get-SyncStudioMaxReadableFileSize
+    $oversizeAdoptPath = 'public/characters/hero/spellCasting.fbx'
+
+    $unverifiableLocalDir = Join-Path $adoptRoot "unverifiable-local"
+    New-Item -ItemType Directory -Path (Join-Path $unverifiableLocalDir "public\characters\hero") -Force | Out-Null
+    $unverifiableLocalFile = Join-Path $unverifiableLocalDir "public\characters\hero\spellCasting.fbx"
+    [System.IO.File]::WriteAllBytes($unverifiableLocalFile, [byte[]](0xFB, 0x58))
+    $unverifiableLocalBytes = [System.IO.File]::ReadAllBytes($unverifiableLocalFile)
+
+    $unverifiableLocalManifest = @{
+        $oversizeAdoptPath = New-FakeLocalManifestEntry -LiteralPath $unverifiableLocalFile -Kind 'binary'
+    }
+    $unverifiableRemoteOnly = @{
+        $oversizeAdoptPath = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimitAdopt + 1) `
+            -StagingPath $null -Sha256 $null -Kind 'binary' -Encoding 'base64'
+        'dist/bundle.js' = New-FakeSnapshotEntry -Unverifiable -Size ($oversizeLimitAdopt + 2) `
+            -StagingPath $null -Sha256 $null -Kind 'binary' -Encoding 'base64'
+    }
+
+    $unverifiableLocalComparisons = @(
+        Get-RundotSyncAdoptComparisons `
+            -LocalManifest $unverifiableLocalManifest `
+            -Snapshot (New-FakeSnapshot -StagingRoot (Join-Path $adoptRoot "uv-staging-local") -Files $unverifiableRemoteOnly)
+    )
+
+    Assert-Equal `
+        'Unverifiable' `
+        (Get-AdoptStatusFor -Comparisons $unverifiableLocalComparisons -Path $oversizeAdoptPath) `
+        "a local copy of an unverifiable remote must not classify as Conflict"
+    Assert-Equal `
+        'IgnoredRemote' `
+        (Get-AdoptStatusFor -Comparisons $unverifiableLocalComparisons -Path 'dist/bundle.js') `
+        "ignore must win over unverifiable on the remote-only side"
+
+    $unverifiableRemoteOnlyManifest = @{}
+    $unverifiableRemoteOnlyComparisons = @(
+        Get-RundotSyncAdoptComparisons `
+            -LocalManifest $unverifiableRemoteOnlyManifest `
+            -Snapshot (New-FakeSnapshot -StagingRoot (Join-Path $adoptRoot "uv-staging-remote") -Files @{
+                $oversizeAdoptPath = $unverifiableRemoteOnly[$oversizeAdoptPath]
+            })
+    )
+    Assert-Equal `
+        'Unverifiable' `
+        (Get-AdoptStatusFor -Comparisons $unverifiableRemoteOnlyComparisons -Path $oversizeAdoptPath) `
+        "a remote-only unverifiable path must not classify as RemoteOnly"
+
+    $adoptOversizeDir = Join-Path $adoptRoot "adopt-oversize-local"
+    New-Item -ItemType Directory -Path (Join-Path $adoptOversizeDir "public\characters\hero") -Force | Out-Null
+    $adoptOversizeFile = Join-Path $adoptOversizeDir "public\characters\hero\spellCasting.fbx"
+    [System.IO.File]::WriteAllBytes($adoptOversizeFile, $unverifiableLocalBytes)
+    $adoptOversizeManifest = New-FakeRemoteManifest -Files @(
+        (New-FakeRemoteListEntry @{
+            path     = $oversizeAdoptPath
+            type     = 'file'
+            size     = ($oversizeLimitAdopt + 1)
+            encoding = 'base64'
+            kind     = 'binary'
+        })
+    )
+    Reset-FakeRemote -Lists @($adoptOversizeManifest, $adoptOversizeManifest) -Files @{}
+
+    $adoptOversizeResult = Initialize-RundotSyncByAdopt `
+        -LocalDir $adoptOversizeDir `
+        -ProjectId 'proj-test-1' `
+        -StudioOrigin 'https://example.test' `
+        -Headers $initHeaders
+
+    Assert-Equal 0 $adoptOversizeResult.BaseFileCount "an unverifiable path must not enter BASE on Adopt"
+    Assert-Equal `
+        $unverifiableLocalBytes `
+        ([System.IO.File]::ReadAllBytes($adoptOversizeFile)) `
+        "Adopt must not modify a local copy of an unverifiable remote path"
+    $adoptOversizeReport = [string]$adoptOversizeResult.Report
+    Assert-True ($adoptOversizeReport -match '(?i)unverifiable') "the Adopt report should label unverifiable paths"
+    Assert-True ($adoptOversizeReport -match [regex]::Escape($oversizeAdoptPath)) "the Adopt report should name the unverifiable path"
+    Assert-True ($adoptOversizeReport -match [string]($oversizeLimitAdopt + 1)) "the Adopt report should show listed size"
+    Assert-True `
+        ($adoptOversizeReport -notmatch '(?i)bearer|test-token') `
+        "the Adopt report must never contain tokens"
 
     # ----------------------------------------------------------------------
     # End-to-end Adopt against a real tree

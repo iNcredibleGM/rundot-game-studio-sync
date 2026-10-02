@@ -19,7 +19,8 @@
 #
 # Phases: setup -> up (create, overwrite) -> down (pull) -> restore from backup
 # -> push-backup evidence -> delete (confirmed remote delete + backup + journal)
-# -> binary create/replace -> fail-closed -> teardown.
+# -> binary create/replace -> Init #82 with oversize on Studio -> fail-closed
+# -> teardown.
 #
 # Named Live-RoundTrip.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
 # pick it up: it needs a real account and network.
@@ -963,6 +964,79 @@ if (-not $script:Aborted) {
                 -Detail ("no REFUSED row in the report; exit={0}, binary rows={1}, listed={2}, listed size={3}" -f `
                     $oversizePush.ExitCode, $oversizeRows.Count, $oversizeListed, $oversizeListedSize)
         }
+    }
+
+    # ---------------------------------------------------------------------
+    # Init FromRemote with an oversize file already on Studio (#82). The
+    # reporter's failure was Init aborting after a successful snapshot when
+    # spellCasting.fbx (or any >2 MB file) was listed but never staged.
+    # ---------------------------------------------------------------------
+    if ($oversizeOk) {
+        $init82Dir = Join-Path $scratchRoot 'init-82-oversize-remote'
+        if (Test-Path -LiteralPath $init82Dir) {
+            Remove-Item -LiteralPath $init82Dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Force -Path $init82Dir | Out-Null
+
+        $init82Result = Invoke-SyncCli -CliArgs @(
+            '-ProjectId', $ProjectId, '-LocalDir', $init82Dir,
+            '-Command', 'Init', '-InitMode', 'FromRemote'
+        )
+        $init82Output = [string]$init82Result.Output
+        $init82BasePath = Join-Path $init82Dir '.rundot-sync\base-manifest.json'
+        $init82OversizeLocal = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $init82Dir `
+            -CanonicalPath $oversizeCanonical
+
+        $init82Base = $null
+        $init82BaseHasOversize = $false
+        if (Test-Path -LiteralPath $init82BasePath) {
+            $init82Base = Read-BaseManifest -WorkspaceRoot $init82Dir
+            if ($null -ne $init82Base -and $null -ne $init82Base.files) {
+                foreach ($prop in @($init82Base.files.PSObject.Properties)) {
+                    if ([string]$prop.Name -eq $oversizeCanonical) {
+                        $init82BaseHasOversize = $true
+                    }
+                }
+            }
+        }
+
+        $init82Ok = ($init82Result.ExitCode -eq 0) `
+            -and ($null -ne $init82Base) `
+            -and ($init82Output -notmatch 'missing from staging') `
+            -and ($init82Output -match '(?i)not downloaded') `
+            -and ($init82Output -match '(?i)not tracked in BASE') `
+            -and ($init82Output -match [regex]::Escape($oversizeCanonical)) `
+            -and (-not (Test-Path -LiteralPath $init82OversizeLocal)) `
+            -and (-not $init82BaseHasOversize)
+
+        Add-Step -Name 'Init FromRemote into fresh dir with oversize on Studio (#82)' `
+            -Status $(if ($init82Ok) { 'PASS' } else { 'FAIL' }) `
+            -Detail ("exit={0}, BASE={1}, oversize local={2}, oversize in BASE={3}" -f `
+                $init82Result.ExitCode, `
+                ($(if ($null -ne $init82Base) { 'yes' } else { 'no' })), `
+                (Test-Path -LiteralPath $init82OversizeLocal), `
+                $init82BaseHasOversize)
+
+        $plan82Result = Invoke-SyncCli -CliArgs @(
+            '-ProjectId', $ProjectId, '-LocalDir', $init82Dir, '-Command', 'Plan'
+        )
+        $plan82Unverifiable = Get-PlanCount -Output $plan82Result.Output -StatusName 'unverifiable'
+        $plan82Ok = ($plan82Result.ExitCode -eq 0) `
+            -and ($plan82Unverifiable -ge 1) `
+            -and ($plan82Result.Output -match [regex]::Escape($oversizeCanonical))
+
+        Add-Step -Name 'Plan on #82 workspace lists oversize as unverifiable (#57)' `
+            -Status $(if ($plan82Ok) { 'PASS' } else { 'FAIL' }) `
+            -Detail ("exit={0}, unverifiable={1}" -f $plan82Result.ExitCode, $plan82Unverifiable)
+    }
+    else {
+        Add-Step -Name 'Init FromRemote into fresh dir with oversize on Studio (#82)' `
+            -Status 'SKIP' `
+            -Detail 'oversize create did not succeed'
+        Add-Step -Name 'Plan on #82 workspace lists oversize as unverifiable (#57)' `
+            -Status 'SKIP' `
+            -Detail 'oversize create did not succeed'
     }
 }
 

@@ -19,7 +19,8 @@ Three commands write BASE: `Init` creates it, `Pull` overlays it after verified
 local writes, and `Push` overlays it after verified remote writes
 ([init.md](init.md), [pull.md](pull.md), [push.md](push.md)).
 
-- `Init -InitMode FromRemote` records every verified remote file.
+- `Init -InitMode FromRemote` records every verified remote file that was
+  promoted. Unverifiable paths (over Studio's read limit) are omitted.
 - `Init -InitMode Adopt` records only paths whose content hash matched
   exactly on LOCAL and REMOTE, so an Adopted BASE may be a partial one. A
   differing, local-only, or remote-only path is unresolved and never becomes
