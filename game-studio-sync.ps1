@@ -96,6 +96,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Auth.ps1")
 . (Join-Path $PSScriptRoot "lib\Snapshot.ps1")
 . (Join-Path $PSScriptRoot "lib\Classifier.ps1")
+. (Join-Path $PSScriptRoot "lib\Format.ps1")
 . (Join-Path $PSScriptRoot "lib\Plan.ps1")
 . (Join-Path $PSScriptRoot "lib\Backup.ps1")
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
@@ -108,7 +109,6 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\RemoteBinaryPlace.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
-
 
 # ============================================================================
 # Utility

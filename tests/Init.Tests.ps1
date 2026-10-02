@@ -19,6 +19,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\RemoteApi.ps1")
 . (Join-Path $repoRoot "lib\Snapshot.ps1")
+. (Join-Path $repoRoot "lib\Format.ps1")
 . (Join-Path $repoRoot "lib\Init.ps1")
 
 $script:FakeListCalls = 0

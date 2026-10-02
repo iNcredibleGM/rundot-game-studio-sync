@@ -80,6 +80,7 @@ foreach ($requiredLibrary in @(
     'Auth.ps1',
     'Snapshot.ps1',
     'Classifier.ps1',
+    'Format.ps1',
     'Plan.ps1',
     'Init.ps1'
 )) {

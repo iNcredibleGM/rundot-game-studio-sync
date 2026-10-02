@@ -549,21 +549,6 @@ function Get-RundotSyncAdoptComparisons {
     return $rows.ToArray()
 }
 
-function Format-RundotSyncShortHash {
-    param($Value)
-
-    $text = [string]$Value
-    if ([string]::IsNullOrEmpty($text)) {
-        return '<none>'
-    }
-
-    if ($text.Length -le 16) {
-        return $text
-    }
-
-    return ($text.Substring(0, 8) + '...' + $text.Substring($text.Length - 4))
-}
-
 function Format-RundotSyncAdoptReport {
     param(
         [Parameter(Mandatory)]
@@ -610,8 +595,8 @@ function Format-RundotSyncAdoptReport {
             [void]$lines.Add(
                 ('  {0}  local={1}  remote={2}' -f `
                     $row.Path,
-                    (Format-RundotSyncShortHash -Value $row.LocalSha256),
-                    (Format-RundotSyncShortHash -Value $row.RemoteSha256))
+                    (Format-SyncShortHash -Value $row.LocalSha256),
+                    (Format-SyncShortHash -Value $row.RemoteSha256))
             )
         }
     }
@@ -621,7 +606,7 @@ function Format-RundotSyncAdoptReport {
         [void]$lines.Add('LOCAL-ONLY')
         foreach ($row in $localOnly) {
             [void]$lines.Add(
-                ('  {0}  local={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.LocalSha256))
+                ('  {0}  local={1}' -f $row.Path, (Format-SyncShortHash -Value $row.LocalSha256))
             )
         }
     }
@@ -631,7 +616,7 @@ function Format-RundotSyncAdoptReport {
         [void]$lines.Add('REMOTE-ONLY')
         foreach ($row in $remoteOnly) {
             [void]$lines.Add(
-                ('  {0}  remote={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.RemoteSha256))
+                ('  {0}  remote={1}' -f $row.Path, (Format-SyncShortHash -Value $row.RemoteSha256))
             )
         }
     }
