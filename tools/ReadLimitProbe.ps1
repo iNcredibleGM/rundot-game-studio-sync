@@ -32,6 +32,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\Paths.ps1')
 . (Join-Path $repoRoot 'lib\Hashing.ps1')
 . (Join-Path $repoRoot 'lib\Auth.ps1')
+. (Join-Path $repoRoot 'lib\AuthHost.ps1')
 
 $limit = Get-SyncStudioMaxReadableFileSize
 $runStamp = [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -242,7 +243,9 @@ if (-not [string]::IsNullOrWhiteSpace($AccessTokenPath)) {
 else {
     $auth = Get-RundotAccessToken `
         -StudioOrigin $StudioOrigin -ProjectId $ProjectId `
-        -AuthPath $AuthPath -RundotCliSessionPath $RundotCliSessionPath
+        -AuthPath $AuthPath -RundotCliSessionPath $RundotCliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} `
+        -ReadManualToken ${function:Read-RundotManualBearerToken}
     $token = [string]$auth.AccessToken
 }
 
