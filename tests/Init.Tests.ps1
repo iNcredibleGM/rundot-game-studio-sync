@@ -3,12 +3,12 @@
 #
 # SCOPE HAZARD: tests/Run-Tests.ps1 dot-sources every *.Tests.ps1 into one
 # scope, in filename order. This file sorts before Manifest.Tests.ps1,
-# RemoteApi.Tests.ps1, and Snapshot.Tests.ps1, so any remote helper stubbed
-# below stays overwritten for those files unless it is restored. The stub
-# region therefore ends by re-dot-sourcing lib/RemoteApi.ps1, and the tests
-# at the bottom of this file fail loudly if that restore stops working.
-# (Those downstream files re-dot-source their own libraries today, which
-# would mask a leak; the assertions keep the contract explicit anyway.)
+# RemoteApi.Tests.ps1, and Snapshot.Tests.ps1, so Enable-FakeRemoteProjectReads
+# from tests/TestHelpers.ps1 stays installed for those files unless it is
+# restored. The stub region therefore ends by re-dot-sourcing lib/RemoteApi.ps1,
+# and the tests at the bottom of this file fail loudly if that restore stops
+# working. (Those downstream files re-dot-source their own libraries today,
+# which would mask a leak; the assertions keep the contract explicit anyway.)
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Paths.ps1")
@@ -22,81 +22,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Format.ps1")
 . (Join-Path $repoRoot "lib\Init.ps1")
 
-$script:FakeListCalls = 0
-$script:FakeFileCalls = 0
-$script:FakeListQueue = @()
-$script:FakeFilePayloads = @{}
-$script:FakeFileErrors = @{}
-
-function Reset-FakeRemote {
-    param(
-        [object[]]$Lists = @(),
-        [hashtable]$Files = @{},
-        [hashtable]$FileErrors = @{}
-    )
-
-    $script:FakeListCalls = 0
-    $script:FakeFileCalls = 0
-    $script:FakeListQueue = @($Lists)
-    $script:FakeFilePayloads = @{}
-    if ($Files) {
-        $script:FakeFilePayloads = $Files
-    }
-
-    $script:FakeFileErrors = @{}
-    if ($FileErrors) {
-        $script:FakeFileErrors = $FileErrors
-    }
-}
-
-function Get-RemoteProjectFileList {
-    param(
-        [string]$StudioOrigin,
-        [string]$ProjectId,
-        [hashtable]$Headers
-    )
-
-    $script:FakeListCalls++
-    $index = $script:FakeListCalls - 1
-    if ($index -ge $script:FakeListQueue.Count) {
-        return $script:FakeListQueue[$script:FakeListQueue.Count - 1]
-    }
-
-    return $script:FakeListQueue[$index]
-}
-
-function Get-RemoteProjectFile {
-    param(
-        [string]$StudioOrigin,
-        [string]$ProjectId,
-        [string]$Path,
-        [hashtable]$Headers
-    )
-
-    $script:FakeFileCalls++
-    $lookup = $Path
-    if ($lookup.StartsWith('/')) {
-        $lookup = $lookup.Substring(1)
-    }
-
-    if ($script:FakeFileErrors.ContainsKey($Path)) {
-        throw $script:FakeFileErrors[$Path]
-    }
-
-    if ($script:FakeFileErrors.ContainsKey($lookup)) {
-        throw $script:FakeFileErrors[$lookup]
-    }
-
-    if ($script:FakeFilePayloads.ContainsKey($Path)) {
-        return $script:FakeFilePayloads[$Path]
-    }
-
-    if ($script:FakeFilePayloads.ContainsKey($lookup)) {
-        return $script:FakeFilePayloads[$lookup]
-    }
-
-    throw [System.InvalidOperationException]::new("No fake payload for '$Path'.")
-}
+Enable-FakeRemoteProjectReads
 
 # --------------------------------------------------------------------------
 # Init destination: empty except allowable metadata, or refuse
@@ -1380,5 +1306,5 @@ Assert-True `
     "Init.Tests must restore the real Get-RemoteProjectFile for later test files"
 
 Assert-True `
-    ($restoredFileDefinition -notmatch 'FakeFilePayloads') `
+    ($restoredFileDefinition -notmatch 'No fake payload') `
     "Init.Tests must not leak its fake remote into later test files"
