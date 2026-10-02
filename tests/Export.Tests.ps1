@@ -294,6 +294,10 @@ try {
             ($exportCliSource -match [regex]::Escape('lib\Export.ps1')) `
             "the exporter should load lib/Export.ps1"
 
+        Assert-True `
+            ($exportCliSource -match [regex]::Escape('lib\AuthHost.ps1')) `
+            "the exporter should load lib/AuthHost.ps1"
+
         $gateIndex = $exportCliSource.IndexOf('Assert-RundotExportDestination')
         $authIndex = $exportCliSource.IndexOf('Get-RundotAccessToken')
 
@@ -302,6 +306,13 @@ try {
         Assert-True `
             ($gateIndex -lt $authIndex) `
             "the destination gate must run before authentication"
+
+        Assert-True `
+            ($exportCliSource -match '-WriteStatus') `
+            "the exporter should pass -WriteStatus into Get-RundotAccessToken"
+        Assert-True `
+            ($exportCliSource -match '-ReadManualToken') `
+            "the exporter should pass -ReadManualToken into Get-RundotAccessToken"
 
         # Option B: no force flag may turn the refusal into a silent overwrite.
         Assert-True `

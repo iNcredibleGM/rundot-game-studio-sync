@@ -238,6 +238,7 @@ $script:TextCreateRouteFound = $null
 . (Join-Path $RepoRoot 'lib\RemoteApi.ps1')
 . (Join-Path $RepoRoot 'lib\Snapshot.ps1')
 . (Join-Path $RepoRoot 'lib\Auth.ps1')
+. (Join-Path $RepoRoot 'lib\AuthHost.ps1')
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $script:LogPath = Join-Path $OutDir ("probe-{0}.log" -f $Scenario)
@@ -1545,7 +1546,7 @@ else {
     $cliSessionPath = Join-Path $env:APPDATA '.rundot\prod.session.json'
 
     $cliSession = Get-RundotCliSession -RundotCliSessionPath $cliSessionPath
-    $savedAuth = Load-StudioAuth -AuthPath $savedAuthPath
+    $savedAuth = Load-StudioAuth -AuthPath $savedAuthPath -WriteStatus ${function:Write-RundotAuthStatusLine}
 
     $candidateToken = $null
     $cliFresh = $false

@@ -111,6 +111,7 @@ if ([string]::IsNullOrEmpty($ProjectId)) {
 . (Join-Path $repoRoot 'lib\Manifest.ps1')
 . (Join-Path $repoRoot 'lib\RemoteApi.ps1')
 . (Join-Path $repoRoot 'lib\Auth.ps1')
+. (Join-Path $repoRoot 'lib\AuthHost.ps1')
 . (Join-Path $repoRoot 'lib\Snapshot.ps1')
 . (Join-Path $repoRoot 'lib\Classifier.ps1')
 . (Join-Path $repoRoot 'lib\Journal.ps1')
@@ -379,7 +380,9 @@ try {
         -ProjectId $ProjectId `
         -AuthDir (Join-Path $env:APPDATA '.rundot') `
         -AuthPath (Join-Path $env:APPDATA '.rundot\studio-export.auth.json') `
-        -RundotCliSessionPath (Join-Path $env:APPDATA '.rundot\prod.session.json')
+        -RundotCliSessionPath (Join-Path $env:APPDATA '.rundot\prod.session.json') `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} `
+        -ReadManualToken ${function:Read-RundotManualBearerToken}
 }
 catch {
     Write-Host ''

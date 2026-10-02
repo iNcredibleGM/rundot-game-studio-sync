@@ -70,11 +70,10 @@ $OutDir = [System.IO.Path]::GetFullPath($OutDir)
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
-. (Join-Path $PSScriptRoot "lib\Auth.ps1")
+. (Join-Path $PSScriptRoot "lib\Auth.ps1"); . (Join-Path $PSScriptRoot "lib\AuthHost.ps1")
 . (Join-Path $PSScriptRoot "lib\Paths.ps1")
 . (Join-Path $PSScriptRoot "lib\Ignore.ps1")
 . (Join-Path $PSScriptRoot "lib\Export.ps1")
-
 
 # ============================================================================
 # Destination gate (before authentication)
@@ -284,7 +283,8 @@ $authResult = Get-RundotAccessToken `
     -ProjectId $ProjectId `
     -AuthDir $AuthDir `
     -AuthPath $AuthPath `
-    -RundotCliSessionPath $RundotCliSessionPath
+    -RundotCliSessionPath $RundotCliSessionPath `
+    -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
 $Token = $authResult.AccessToken
 $manifest = $authResult.Manifest

@@ -93,7 +93,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Workspace.ps1")
 . (Join-Path $PSScriptRoot "lib\Manifest.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
-. (Join-Path $PSScriptRoot "lib\Auth.ps1")
+. (Join-Path $PSScriptRoot "lib\Auth.ps1"); . (Join-Path $PSScriptRoot "lib\AuthHost.ps1")
 . (Join-Path $PSScriptRoot "lib\Snapshot.ps1")
 . (Join-Path $PSScriptRoot "lib\Classifier.ps1")
 . (Join-Path $PSScriptRoot "lib\Format.ps1")
@@ -255,12 +255,9 @@ function Invoke-SyncPlanCommand {
     # 2. Authenticate. GET-only: every call below reads.
     Write-Section "$SyncCommand - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -420,12 +417,9 @@ function Invoke-SyncPullCommand {
     # 2. Authenticate. GET-only: every call below reads.
     Write-Section "Pull - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -779,12 +773,9 @@ function Invoke-SyncPushCommand {
     # 2. Authenticate. Push reads REMOTE before each PUT and writes via PUT.
     Write-Section "Push - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -945,12 +936,9 @@ function Invoke-SyncInit {
 
     Write-Section "RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
