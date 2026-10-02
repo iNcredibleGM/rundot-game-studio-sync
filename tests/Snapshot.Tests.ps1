@@ -417,87 +417,7 @@ Assert-Throws {
 # Torn-read loop: injected fake remote (Get-StableRemoteSnapshot)
 # --------------------------------------------------------------------------
 
-$script:ListCallCount = 0
-$script:FileCallCount = 0
-$script:CapturedListAuth = $null
-$script:CapturedFileAuth = $null
-$script:ListQueue = @()
-$script:FilePayloads = @{}
-$script:FileErrors = @{}
-
-function Reset-FakeRemote {
-    param(
-        [object[]]$Lists,
-        [hashtable]$Files,
-        [hashtable]$FileErrors
-    )
-
-    $script:ListCallCount = 0
-    $script:FileCallCount = 0
-    $script:CapturedListAuth = $null
-    $script:CapturedFileAuth = $null
-    $script:ListQueue = @($Lists)
-    $script:FilePayloads = @{}
-    if ($Files) {
-        $script:FilePayloads = $Files
-    }
-
-    $script:FileErrors = @{}
-    if ($FileErrors) {
-        $script:FileErrors = $FileErrors
-    }
-}
-
-function Get-RemoteProjectFileList {
-    param(
-        [string]$StudioOrigin,
-        [string]$ProjectId,
-        [hashtable]$Headers
-    )
-
-    $script:ListCallCount++
-    $script:CapturedListAuth = $Headers.Authorization
-    $index = $script:ListCallCount - 1
-    if ($index -ge $script:ListQueue.Count) {
-        return $script:ListQueue[$script:ListQueue.Count - 1]
-    }
-
-    return $script:ListQueue[$index]
-}
-
-function Get-RemoteProjectFile {
-    param(
-        [string]$StudioOrigin,
-        [string]$ProjectId,
-        [string]$Path,
-        [hashtable]$Headers
-    )
-
-    $script:FileCallCount++
-    $script:CapturedFileAuth = $Headers.Authorization
-    $lookup = $Path
-    if ($lookup.StartsWith('/')) {
-        $lookup = $lookup.Substring(1)
-    }
-
-    if ($script:FileErrors.ContainsKey($Path)) {
-        throw $script:FileErrors[$Path]
-    }
-
-    if ($script:FileErrors.ContainsKey($lookup)) {
-        throw $script:FileErrors[$lookup]
-    }
-
-    if ($script:FilePayloads.ContainsKey($Path)) {
-        return $script:FilePayloads[$Path]
-    }
-
-    if ($script:FilePayloads.ContainsKey($lookup)) {
-        return $script:FilePayloads[$lookup]
-    }
-
-    throw [System.InvalidOperationException]::new("No fake payload for '$Path'.")
-}
+Enable-FakeRemoteProjectReads
 
 function Invoke-TestSnapshot {
     param([string]$WorkspaceRoot)
@@ -793,22 +713,7 @@ try {
     Assert-Equal 1 $script:ListCallCount "HTML from /files must not retry"
     Assert-Equal 0 $script:FileCallCount "HTML from /files must not download files"
 
-    function Get-RemoteProjectFileList {
-        param(
-            [string]$StudioOrigin,
-            [string]$ProjectId,
-            [hashtable]$Headers
-        )
-
-        $script:ListCallCount++
-        $script:CapturedListAuth = $Headers.Authorization
-        $index = $script:ListCallCount - 1
-        if ($index -ge $script:ListQueue.Count) {
-            return $script:ListQueue[$script:ListQueue.Count - 1]
-        }
-
-        return $script:ListQueue[$index]
-    }
+    Enable-FakeRemoteProjectReads
 
     Reset-FakeRemote `
         -Lists @($hiManifest, $hiManifest) `
@@ -841,39 +746,7 @@ try {
     Assert-Equal 1 $script:ListCallCount "HTML from /file must not GET ManifestAfter"
     Assert-Equal 1 $script:FileCallCount "HTML from /file aborts on the first file GET"
 
-    function Get-RemoteProjectFile {
-        param(
-            [string]$StudioOrigin,
-            [string]$ProjectId,
-            [string]$Path,
-            [hashtable]$Headers
-        )
-
-        $script:FileCallCount++
-        $script:CapturedFileAuth = $Headers.Authorization
-        $lookup = $Path
-        if ($lookup.StartsWith('/')) {
-            $lookup = $lookup.Substring(1)
-        }
-
-        if ($script:FileErrors.ContainsKey($Path)) {
-            throw $script:FileErrors[$Path]
-        }
-
-        if ($script:FileErrors.ContainsKey($lookup)) {
-            throw $script:FileErrors[$lookup]
-        }
-
-        if ($script:FilePayloads.ContainsKey($Path)) {
-            return $script:FilePayloads[$Path]
-        }
-
-        if ($script:FilePayloads.ContainsKey($lookup)) {
-            return $script:FilePayloads[$lookup]
-        }
-
-        throw [System.InvalidOperationException]::new("No fake payload for '$Path'.")
-    }
+    Enable-FakeRemoteProjectReads
 
     # 7. Bad base64 retries then aborts without a Files map
     Reset-FakeRemote `

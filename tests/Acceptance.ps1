@@ -46,6 +46,7 @@ $testRunner = Join-Path $PSScriptRoot "Run-Tests.ps1"
 . (Join-Path $repoRoot "lib\Manifest.ps1")
 . (Join-Path $repoRoot "lib\Backup.ps1")
 . (Join-Path $repoRoot "lib\Journal.ps1")
+. (Join-Path $PSScriptRoot "TestHelpers.ps1")
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -81,15 +82,6 @@ function Add-GateResult {
     if (-not [string]::IsNullOrEmpty($Detail)) {
         Write-Host ("         {0}" -f $Detail)
     }
-}
-
-function Write-Phase {
-    param([string]$Text)
-
-    Write-Host ""
-    Write-Host "=================================================="
-    Write-Host $Text
-    Write-Host "=================================================="
 }
 
 function Write-AcceptanceGateMap {
@@ -141,30 +133,6 @@ function Write-AcceptanceGateMap {
     }
 
     Write-Host ""
-}
-
-function Invoke-SyncCli {
-    # Runs the sync CLI in a child process and captures its exit code.
-    # Output is returned in memory only; it is never written to disk.
-    param(
-        [string[]]$CliArgs,
-        [switch]$NonInteractive
-    )
-
-    $psArgs = @('-NoProfile')
-    if ($NonInteractive) {
-        $psArgs += '-NonInteractive'
-    }
-    $psArgs += @('-File', $syncCli)
-    $psArgs += $CliArgs
-
-    $outputLines = & powershell @psArgs 2>&1
-    $code = $LASTEXITCODE
-    if ($null -eq $code) { $code = 0 }
-
-    $output = ($outputLines | Out-String)
-
-    return [pscustomobject]@{ Output = $output; ExitCode = [int]$code }
 }
 
 function Test-PushReportShowsMutation {
@@ -270,37 +238,6 @@ function Remove-AcceptanceStrayLocalCreates {
     }
 
     return $removed
-}
-
-function Get-PushBinaryRows {
-    param([string]$Output)
-
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    $lines = $Output -split "`n"
-    $inSection = $false
-
-    foreach ($line in $lines) {
-        $trimmed = $line.TrimEnd("`r")
-
-        if ($trimmed -eq 'BINARY') {
-            $inSection = $true
-            continue
-        }
-
-        if (-not $inSection) { continue }
-
-        if ($trimmed -match '^\s+(.+?)\s+\(binary (create|replace)\)\s*$') {
-            $rows.Add([pscustomobject]@{
-                Path = $matches[1].Trim()
-                Mode = $matches[2]
-            })
-            continue
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $trimmed -notmatch '^\s') { break }
-    }
-
-    return $rows.ToArray()
 }
 
 function Get-PlanSummaryCount {
@@ -432,14 +369,6 @@ function Test-AcceptanceJournalSafe {
 
     $raw = [System.IO.File]::ReadAllText($journalPath)
     return ($raw -notmatch '(?i)bearer|authoriz|access[_-]?token|refresh[_-]?token|"content"|stagingpath')
-}
-
-function Get-ShortHash {
-    param([string]$Hash)
-
-    if ([string]::IsNullOrEmpty($Hash)) { return "<none>" }
-    if ($Hash.Length -le 12) { return $Hash }
-    return $Hash.Substring(0, 12)
 }
 
 # ---------------------------------------------------------------------------

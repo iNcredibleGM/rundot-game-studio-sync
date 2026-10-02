@@ -117,6 +117,17 @@ if ([string]::IsNullOrEmpty($ProjectId)) {
 . (Join-Path $repoRoot 'lib\Journal.ps1')
 . (Join-Path $repoRoot 'lib\RemoteWrite.ps1')
 . (Join-Path $repoRoot 'lib\RemoteDelete.ps1')
+. (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+
+$restoredFileDefinition = (Get-Command Get-RemoteProjectFile -CommandType Function).Definition
+if ($restoredFileDefinition -notmatch 'EscapeDataString') {
+    throw 'tests/TestHelpers.ps1 must not shadow Get-RemoteProjectFile from lib/RemoteApi.ps1.'
+}
+
+$restoredTextDefinition = (Get-Command Invoke-Utf8TextGet -CommandType Function).Definition
+if ($restoredTextDefinition -notmatch 'Read-Utf8HttpResponseBody') {
+    throw 'tests/TestHelpers.ps1 must not shadow Invoke-Utf8TextGet from lib/RemoteApi.ps1.'
+}
 
 $script:Steps = New-Object 'System.Collections.Generic.List[object]'
 $script:WorkspaceCreated = $false
@@ -140,75 +151,12 @@ function Add-Step {
     }
 }
 
-function Write-Phase {
-    param([string]$Text)
-
-    Write-Host ''
-    Write-Host '=================================================='
-    Write-Host $Text
-    Write-Host '=================================================='
-}
-
-function Invoke-SyncCli {
-    param([string[]]$CliArgs, [switch]$NonInteractive)
-
-    $psArgs = @('-NoProfile')
-    if ($NonInteractive) { $psArgs += '-NonInteractive' }
-    $psArgs += @('-File', $syncCli)
-    $psArgs += $CliArgs
-
-    $lines = & powershell @psArgs 2>&1
-    $code = $LASTEXITCODE
-    if ($null -eq $code) { $code = 0 }
-
-    return [pscustomobject]@{ Output = ($lines | Out-String); ExitCode = [int]$code }
-}
-
 function Get-PlanCount {
     param([string]$Output, [string]$StatusName)
 
     $match = [regex]::Match($Output, ('(?m)^\s*' + [regex]::Escape($StatusName) + ':\s+(\d+)'))
     if ($match.Success) { return [int]$match.Groups[1].Value }
     return -1
-}
-
-function Get-PushBinaryRows {
-    # Parse the BINARY section of a Push report into path + create/replace rows.
-    param([string]$Output)
-
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    $inSection = $false
-
-    foreach ($line in ($Output -split "`n")) {
-        $trimmed = $line.TrimEnd("`r")
-
-        if ($trimmed -eq 'BINARY') {
-            $inSection = $true
-            continue
-        }
-
-        if (-not $inSection) { continue }
-
-        if ($trimmed -match '^\s+(.+?)\s+\(binary (create|replace)\)\s*$') {
-            $rows.Add([pscustomobject]@{
-                Path = $matches[1].Trim()
-                Mode = $matches[2]
-            })
-            continue
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $trimmed -notmatch '^\s') { break }
-    }
-
-    return $rows.ToArray()
-}
-
-function Get-ShortHash {
-    param([string]$Hash)
-
-    if ([string]::IsNullOrEmpty($Hash)) { return '<none>' }
-    if ($Hash.Length -le 12) { return $Hash }
-    return $Hash.Substring(0, 12)
 }
 
 function Get-RemoteFileContentSize {
