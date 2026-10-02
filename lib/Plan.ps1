@@ -112,21 +112,6 @@ function Test-SyncRemoteMutatingStatus {
     ) -contains [string]$Status
 }
 
-function Format-SyncPlanShortHash {
-    param($Value)
-
-    $text = [string]$Value
-    if ([string]::IsNullOrEmpty($text)) {
-        return '<none>'
-    }
-
-    if ($text.Length -le 16) {
-        return $text
-    }
-
-    return ($text.Substring(0, 8) + '...' + $text.Substring($text.Length - 4))
-}
-
 function Get-SyncPlanBaseMapFromResolution {
     # BASE identity comes from the resolver's manifest, not from a second
     # read. A missing or BASE-less resolution is the -AllowNoBase case.
@@ -699,9 +684,9 @@ function Format-SyncPlanOperationLine {
     $line = (
         '  {0}  base={1}  local={2}  remote={3}' -f `
             $Operation.path,
-            (Format-SyncPlanShortHash -Value $Operation.baseSha256),
-            (Format-SyncPlanShortHash -Value $Operation.localSha256),
-            (Format-SyncPlanShortHash -Value $Operation.remoteSha256)
+            (Format-SyncShortHash -Value $Operation.baseSha256),
+            (Format-SyncShortHash -Value $Operation.localSha256),
+            (Format-SyncShortHash -Value $Operation.remoteSha256)
     )
 
     if (-not [string]::IsNullOrEmpty([string]$Operation.reason)) {
@@ -715,12 +700,6 @@ function Format-SyncPlanOperationLine {
     }
 
     return $line
-}
-
-function Get-SyncPlanNonNoOpRows {
-    param([object[]]$Operations)
-
-    return @($Operations | Where-Object { -not (Test-SyncNoOpStatus -Status ([string]$_.status)) })
 }
 
 function Format-SyncPlanReport {
