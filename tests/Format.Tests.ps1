@@ -30,4 +30,8 @@ foreach ($removed in @(
 }
 
 Assert-True ($planSource -match 'Format-SyncShortHash') 'lib/Plan.ps1 should call Format-SyncShortHash'
-Assert-True ($initSource -match 'Format-SyncShortHash') 'lib/Init.ps1 should call Format-SyncShortHash'
+
+$formatSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot "lib\Format.ps1"))
+Assert-True ($formatSource -match 'Format-SyncShortHash') 'lib/Format.ps1 should define Format-SyncShortHash'
+Assert-True ($formatSource -match 'Format-RundotSyncAdoptReport') 'lib/Format.ps1 should define Format-RundotSyncAdoptReport'
+Assert-True ($initSource -notmatch 'function Format-RundotSyncAdoptReport') 'lib/Init.ps1 should not define Format-RundotSyncAdoptReport'

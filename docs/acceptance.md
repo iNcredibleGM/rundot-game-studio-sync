@@ -462,6 +462,7 @@ non-zero exit for the locked file.
 | Plan reports it under `UNVERIFIABLE` and counts it in the summary, never as `UNCHANGED` | `tests/SyncPlan.Tests.ps1` |
 | An oversize binary **create** (remote absent) still publishes via the `ETag` route | `tests/SyncEngine.Tests.ps1`, `tests/Push.Tests.ps1` |
 | An oversize binary **replace** stays refused with its own reason | `tests/Push.Tests.ps1`, `tests/SyncPlan.Tests.ps1` |
+| `Init -InitMode FromRemote` completes and leaves the oversized path out of BASE | `tests/Init.Tests.ps1` |
 
 **Live check:** on a project that already contains an oversize file, `Plan`
 completes and lists the path under `UNVERIFIABLE` with its size, `Pull` leaves it
@@ -469,6 +470,16 @@ untouched, and a `Push` of other paths in the same run still applies. The
 [#57](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/57) bug was
 observed exactly here: two 2,254,917-byte PNGs placed by an earlier `Push` made
 every later `Plan`/`Push` fail until they were captured as unverifiable.
+
+**Live check (#82):** after an oversize file exists on Studio (for example the
+oversize create in `tests/Live-RoundTrip.ps1`), `Init -InitMode FromRemote` into a
+**new empty directory** must exit 0, print that the oversize path was not
+downloaded and is not tracked in BASE, leave that path off disk and out of BASE,
+and must **not** throw `missing from staging`. `Plan` on that new workspace must
+list the path under `UNVERIFIABLE`. Offline regression for the same user path
+(`public/characters/hero/spellCasting.fbx` in the listing) is in
+`tests/Init.Tests.ps1` via `Initialize-RundotSyncFromRemote` against a faked
+stable snapshot.
 
 ### 18. A confirmed Push deletes one remote file, with a backup and no secret in the journal
 

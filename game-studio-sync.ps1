@@ -962,7 +962,11 @@ function Invoke-SyncInit {
 
             Write-Host ""
             Write-Host "Initialized a trusted workspace from REMOTE."
-            Write-Host "  Files verified and promoted: $($result.FileCount)"
+            foreach ($summaryLine in @(Get-RundotSyncInitFromRemoteSummaryLines `
+                -FileCount $result.FileCount `
+                -Unverifiable $result.Unverifiable)) {
+                Write-Host $summaryLine
+            }
             Write-Host "  Workspace: $WorkspaceRoot"
             Write-Host ""
             Write-Host "BASE was written only after every promoted file was re-verified."
