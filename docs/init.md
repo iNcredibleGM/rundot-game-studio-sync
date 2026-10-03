@@ -40,7 +40,7 @@ Builds a trusted local workspace from REMOTE.
    file that Studio allows `GET /file` to return into
    `.rundot-sync/temp/remote-snapshot/<attempt>/`, validates paths, and proves
    `ManifestBefore == ManifestAfter` ([remote-snapshot.md](remote-snapshot.md)).
-   A listed path over Studio's 2,000,000-byte read limit is captured as
+   A listed path over Studio's 2 MB (2,000,000-byte) read limit is captured as
    `Unverifiable` (path and size, no hash, no download) and does not fail the
    snapshot.
 3. **Staging verification.** Staging is re-hashed against the snapshot's own
@@ -196,6 +196,12 @@ prints file contents, access tokens, refresh tokens, or `Authorization`
 headers. Printing progress is best effort and never changes fail-closed
 behavior: a failed hash or download still aborts, and a progress write can
 never mask that error.
+
+## Limitation: files over Studio's read limit
+
+`GET /file` returns HTTP 413 `file too large to view` for any payload over **2 MB (2,000,000 bytes)**. Exactly 2,000,000 bytes still reads; 2,000,001 does not. No other read route is known, and the refusal is not changed by request headers or by `POST` on the same URL. `Init -InitMode FromRemote` therefore does not download those paths and does not write them into BASE. It reports each one by path and listed size and still records every file it could verify. `Init -InitMode Adopt` reports the same paths as `Unverifiable` and does not record them as identical.
+
+A later `Plan` lists them under `UNVERIFIABLE`. `Pull` does not download them. `Push` can publish a **new** binary over the limit (verified from the upload `ETag`) and refuses to replace one that is already over the limit. See [README](../README.md#large-files-studio-read-limit) and [protocol.md](protocol.md).
 
 ## Limitation: API hash fields
 

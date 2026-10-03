@@ -204,7 +204,7 @@ again.
 - Delete a path under `.git`, `.gitignore`, `.rundot-sync`, or `.rundot`, or a
   directory-shaped path
 - Publish a **binary replace** whose remote bytes exceed Studio's
-  2,000,000-byte read limit — the pre-overwrite backup and hash gate cannot read
+  2 MB (2,000,000-byte) read limit — the pre-overwrite backup and hash gate cannot read
   them, so the path is refused (a binary **create** over the limit is published)
 - Merge divergent text — `-LocalWins` replaces remote bytes with local bytes,
   and an unconfirmed `CONFLICT` is printed and skipped
@@ -446,6 +446,26 @@ escape hatch, but it states plainly that every sync direction is untrusted.
 That is the intended behavior. See
 [Raw export](#raw-export-new-or-empty-directories-only).
 
+## Large files (Studio read limit)
+
+Studio's file read route, `GET /file`, refuses any payload over **2 MB (2,000,000 bytes)** with HTTP 413 `file too large to view`. That limit is on the API, not the in-browser viewer. A file of exactly 2,000,000 bytes still reads; 2,000,001 does not. Range requests and other guessed download URLs do not return the bytes. Changing request headers or using `POST` on the same route does not either.
+
+This tool only records a path as synced when it has verified the exact bytes. It cannot download or re-check a file that is already on Studio above 2 MB.
+
+**What works**
+
+- Files at or under 2 MB sync in both directions.
+- A **new** binary over 2 MB can be published with `Push`. The upload is verified from the storage `ETag`, not by reading the file back.
+- `Init` and `Plan` still finish when the project contains a file over 2 MB. The path is reported as unverifiable, left off disk on a fresh `Init`, and left out of BASE. The rest of the project syncs.
+
+**What does not work**
+
+- Downloading an existing Studio file over 2 MB (`Init -InitMode FromRemote`, `Pull`).
+- Replacing an existing oversized remote file. The backup and the expected-hash check need the current remote bytes, which cannot be read.
+- Treating an oversized remote file as in sync. `Plan` lists it under `UNVERIFIABLE`.
+
+Keep large assets (for example a `.fbx` or `.glb` over that size) in the local tree or another store you already trust. Studio can hold a copy you uploaded, but this client cannot fetch that copy back.
+
 ## Not in this version
 
 Deliberately out of scope, so nothing here does them by accident:
@@ -462,6 +482,7 @@ Deliberately out of scope, so nothing here does them by accident:
   anchoring/`**` pattern surface
 - Newline or encoding normalization
 - File watching, device IDs, or a shared multi-machine BASE
+- Downloading or re-verifying a Studio file over 2 MB (2,000,000 bytes; see [Large files](#large-files-studio-read-limit))
 
 Direction is in [ROADMAP.md](ROADMAP.md); the acceptance evidence for this
 milestone is in [docs/acceptance.md](docs/acceptance.md).
