@@ -25,6 +25,17 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 The runner dot-sources every `tests/*.Tests.ps1` into one scope and exits
 non-zero if any assertion failed. It prints the pass and fail counts.
 
+### Continuous integration
+
+On every pull request, GitHub Actions runs the same two offline commands on a
+Windows runner (`.github/workflows/offline-gates.yml`). Live gates are not run
+in CI (no account, no Studio access):
+
+```powershell
+powershell -NoProfile -File .\tests\Run-Tests.ps1
+powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
+```
+
 ### Everything in one shot
 
 `tests/Test-All.ps1` is a thin orchestrator over the three entry points below.

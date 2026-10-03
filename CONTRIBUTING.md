@@ -40,6 +40,16 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 
 Tests must not require Pester to be installed.
 
+Every pull request runs the unit suite and offline acceptance gates on a
+Windows runner (Windows PowerShell 5.1) via
+[`.github/workflows/offline-gates.yml`](.github/workflows/offline-gates.yml).
+A non-zero exit from either command fails the **Offline gates** check:
+
+```powershell
+powershell -NoProfile -File .\tests\Run-Tests.ps1
+powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
+```
+
 ## File and function length
 
 Product PowerShell is budgeted at **500 lines per file** and **150 lines per function**. A file or function over budget is a refactoring target, not a place to add more.
