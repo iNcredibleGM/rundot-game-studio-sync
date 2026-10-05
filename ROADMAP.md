@@ -143,6 +143,8 @@ Milestone: [v0.3.1 - Honor .gitignore and hardening](https://github.com/iNcredib
 
 Deferred to a later milestone: nested `.gitignore` files, negation / re-include semantics, full anchoring and `**` pattern semantics, and the built-in-vs-`.gitignore` precedence question beyond "additive floor".
 
+Shipped on `main`.
+
 ## After v0.3.1
 
 - browser bootstrap / bookmarklet helper
