@@ -294,8 +294,9 @@ local file's MD5 against the `ETag` the presigned `PUT` returned, with no
 over 2,000,000 bytes.
 
 **#54 implements it for creates.** `Invoke-RemotePresignedObjectPut` returns the
-`ETag`, and the place sequence verifies an oversize payload against
-`Get-SyncLocalFileMd5Hex` instead of a read-back. The ETag is accepted **only**
+`ETag`, and the place sequence verifies an oversize payload by comparing that
+`ETag` against the MD5 of the uploaded bytes (`Get-SyncMd5HexFromBytes`, then
+`Assert-SyncEtagMatchesLocalMd5`) instead of a read-back. The ETag is accepted **only**
 alongside the checks that already passed: the adopt response's recorded path
 equalled the expected staging path, the move landed on the planned destination,
 and the recorded size equalled the uploaded byte count. A non-plain digest (a
