@@ -243,6 +243,8 @@ The declared size is **not enforced** against the bytes actually uploaded:
 | 0 | 71 | `400` | — | — | — |
 | 1 | 71 | `200` | `200` | `200` | `71` |
 | 1,000,000 | 71 | `200` | `200` | `200` | `71` |
+| 52,428,800 | 52,428,800 | `200` | `200` | `200` | `52428800` |
+| 52,428,801 | — | `413` | — | — | — |
 | 104,857,600 | 71 | `413` | — | — | — |
 
 Declaring 1 byte while uploading 71 succeeds, and adopt records the real size
@@ -250,6 +252,12 @@ of `71`. So a successful `upload-url` is **not** proof that the declared size
 was correct, and a client must not use it to validate a local file. The
 declaration appears to be a quota or reservation input: it is checked for being
 a positive integer, and a large value is refused before any bytes move.
+
+The exact ceiling is **52,428,800 bytes (50 MiB)**: 52,428,800 is accepted and
+52,428,801 is refused, both from the declaration alone. The refusal message
+names the limit (`That file is 100MB - the limit is 50MB.`). See
+[large-file-protocol.md](large-file-protocol.md) for the pinned boundary and for
+what a 50 MiB body does through the place sequence.
 
 ### Authentication
 
