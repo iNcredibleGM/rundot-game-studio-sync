@@ -93,9 +93,10 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Workspace.ps1")
 . (Join-Path $PSScriptRoot "lib\Manifest.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteApi.ps1")
-. (Join-Path $PSScriptRoot "lib\Auth.ps1")
+. (Join-Path $PSScriptRoot "lib\Auth.ps1"); . (Join-Path $PSScriptRoot "lib\AuthHost.ps1")
 . (Join-Path $PSScriptRoot "lib\Snapshot.ps1")
 . (Join-Path $PSScriptRoot "lib\Classifier.ps1")
+. (Join-Path $PSScriptRoot "lib\Format.ps1")
 . (Join-Path $PSScriptRoot "lib\Plan.ps1")
 . (Join-Path $PSScriptRoot "lib\Backup.ps1")
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
@@ -108,7 +109,6 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\RemoteBinaryPlace.ps1")
 . (Join-Path $PSScriptRoot "lib\Push.ps1")
 . (Join-Path $PSScriptRoot "lib\Init.ps1")
-
 
 # ============================================================================
 # Utility
@@ -255,12 +255,9 @@ function Invoke-SyncPlanCommand {
     # 2. Authenticate. GET-only: every call below reads.
     Write-Section "$SyncCommand - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -279,6 +276,9 @@ function Invoke-SyncPlanCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -417,12 +417,9 @@ function Invoke-SyncPullCommand {
     # 2. Authenticate. GET-only: every call below reads.
     Write-Section "Pull - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -448,6 +445,9 @@ function Invoke-SyncPullCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -773,12 +773,9 @@ function Invoke-SyncPushCommand {
     # 2. Authenticate. Push reads REMOTE before each PUT and writes via PUT.
     Write-Section "Push - RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -829,6 +826,9 @@ function Invoke-SyncPushCommand {
 
         $localManifest = Get-LocalManifest -WorkspaceRoot $WorkspaceRoot -ShowProgress
         Write-Host "LOCAL:  $($localManifest.Count) file(s) inventoried."
+        foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+            Write-Host $ignoreNoticeLine
+        }
 
         $snapshot = Get-StableRemoteSnapshot `
             -WorkspaceRoot $WorkspaceRoot `
@@ -936,12 +936,9 @@ function Invoke-SyncInit {
 
     Write-Section "RUN Studio authentication"
 
-    $authResult = Get-RundotAccessToken `
-        -StudioOrigin $Origin `
-        -ProjectId $StudioProjectId `
-        -AuthDir $SyncAuthDir `
-        -AuthPath $SyncAuthPath `
-        -RundotCliSessionPath $CliSessionPath
+    $authResult = Get-RundotAccessToken -StudioOrigin $Origin -ProjectId $StudioProjectId `
+        -AuthDir $SyncAuthDir -AuthPath $SyncAuthPath -RundotCliSessionPath $CliSessionPath `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} -ReadManualToken ${function:Read-RundotManualBearerToken}
 
     $script:Token = $authResult.AccessToken
     $script:RefreshToken = $authResult.RefreshToken
@@ -965,7 +962,11 @@ function Invoke-SyncInit {
 
             Write-Host ""
             Write-Host "Initialized a trusted workspace from REMOTE."
-            Write-Host "  Files verified and promoted: $($result.FileCount)"
+            foreach ($summaryLine in @(Get-RundotSyncInitFromRemoteSummaryLines `
+                -FileCount $result.FileCount `
+                -Unverifiable $result.Unverifiable)) {
+                Write-Host $summaryLine
+            }
             Write-Host "  Workspace: $WorkspaceRoot"
             Write-Host ""
             Write-Host "BASE was written only after every promoted file was re-verified."
@@ -982,6 +983,9 @@ function Invoke-SyncInit {
             Write-Host ""
             Write-Host $result.Report
             Write-Host ""
+            foreach ($ignoreNoticeLine in (Get-SyncIgnoreLayerNotice)) {
+                Write-Host $ignoreNoticeLine
+            }
             Write-Host "Attached sync metadata to the existing tree."
             Write-Host "  Paths recorded in BASE: $($result.BaseFileCount)"
             Write-Host "  Unresolved paths:       $($result.UnresolvedCount)"

@@ -28,7 +28,7 @@ Naming: `issue/<number>-<short-slug>` (example: `issue/64-gitignore-inventory`).
 
 Open each issue pull request with **base = the integration branch** (for v0.3.1 work, that is `v0.3.1`). When every issue on the milestone is merged and the milestone is ready to ship, follow [docs/releasing.md](docs/releasing.md): **one** pull request from the integration branch to `main`, then tag, GitHub Release, close the milestone, and cut the next integration branch.
 
-v0.3.0 (#37–#44) shipped through one PR from `v0.3.0` to `main`. Current milestone work is v0.3.1 (#64) on integration branch `v0.3.1`. Do not land v0.3.1 issues on `main` before that version ships.
+v0.3.0 (#37–#44) shipped through one PR from `v0.3.0` to `main`. Current milestone work is v0.3.1 (#64, #66–#75) on integration branch `v0.3.1`. Do not land v0.3.1 issues on `main` before that version ships.
 
 ## Tests
 
@@ -39,6 +39,22 @@ powershell -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
 Tests must not require Pester to be installed.
+
+Every pull request runs the unit suite and offline acceptance gates on a
+Windows runner (Windows PowerShell 5.1) via
+[`.github/workflows/offline-gates.yml`](.github/workflows/offline-gates.yml).
+A non-zero exit from either command fails the **Offline gates** check:
+
+```powershell
+powershell -NoProfile -File .\tests\Run-Tests.ps1
+powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive
+```
+
+## File and function length
+
+Product PowerShell is budgeted at **500 lines per file** and **150 lines per function**. A file or function over budget is a refactoring target, not a place to add more.
+
+`tests/FileLength.Tests.ps1` enforces the budget as a ratchet: anything already over budget is frozen in that test's allowlist at its current size, so it may shrink but never grow, and it must be removed from the allowlist once it drops under budget. Add new code to a focused file that fits the budget, or split the file you are touching.
 
 ## Safety
 

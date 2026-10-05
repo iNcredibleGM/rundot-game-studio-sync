@@ -78,8 +78,10 @@ foreach ($requiredLibrary in @(
     'Manifest.ps1',
     'RemoteApi.ps1',
     'Auth.ps1',
+    'AuthHost.ps1',
     'Snapshot.ps1',
     'Classifier.ps1',
+    'Format.ps1',
     'Plan.ps1',
     'Init.ps1'
 )) {
@@ -137,6 +139,21 @@ $initAuthIndex = $initFunctionText.IndexOf('Get-RundotAccessToken')
 Assert-True `
     ($preflightIndex -ge 0 -and $initAuthIndex -ge 0 -and $preflightIndex -lt $initAuthIndex) `
     "the Init destination pre-flight should run before requesting authentication"
+
+foreach ($authCommandFunction in @(
+    'Invoke-SyncPlanCommand',
+    'Invoke-SyncPullCommand',
+    'Invoke-SyncPushCommand',
+    'Invoke-SyncInit'
+)) {
+    $authCommandText = Get-SyncCliFunctionText -Source $syncCliSource -FunctionName $authCommandFunction
+    Assert-True `
+        ($authCommandText -match '-WriteStatus') `
+        "$authCommandFunction should pass -WriteStatus into Get-RundotAccessToken"
+    Assert-True `
+        ($authCommandText -match '-ReadManualToken') `
+        "$authCommandFunction should pass -ReadManualToken into Get-RundotAccessToken"
+}
 
 
 # --------------------------------------------------------------------------

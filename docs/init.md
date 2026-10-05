@@ -37,12 +37,17 @@ Builds a trusted local workspace from REMOTE.
    `.rundot-sync/` outright, because a raw re-dump over a workspace is the
    destructive case ([export.md](export.md)).
 2. **Stable snapshot.** `Get-StableRemoteSnapshot` downloads every listed
-   file into `.rundot-sync/temp/remote-snapshot/<attempt>/`, validates paths,
-   and proves `ManifestBefore == ManifestAfter`
-   ([remote-snapshot.md](remote-snapshot.md)).
+   file that Studio allows `GET /file` to return into
+   `.rundot-sync/temp/remote-snapshot/<attempt>/`, validates paths, and proves
+   `ManifestBefore == ManifestAfter` ([remote-snapshot.md](remote-snapshot.md)).
+   A listed path over Studio's 2 MB (2,000,000-byte) read limit is captured as
+   `Unverifiable` (path and size, no hash, no download) and does not fail the
+   snapshot.
 3. **Staging verification.** Staging is re-hashed against the snapshot's own
-   hashes. A listed path missing from staging, a staging file the snapshot
-   does not list, or any hash disagreement aborts.
+   hashes for every **verifiable** listed path. An unverifiable path must be
+   absent from staging; bytes there abort. A verifiable path missing from
+   staging, a staging file the snapshot does not list, or any hash disagreement
+   aborts.
 4. **Reserved-path check.** A remote path under `.git`, `.gitignore`, or
    `.rundot-sync` is refused, so retained local metadata and sync state are
    never overwritten.
@@ -50,8 +55,9 @@ Builds a trusted local workspace from REMOTE.
    not copy. There is no partial-copy window; a rename that fails midway rolls
    the already-moved entries back to staging.
 6. **Re-verification.** Every promoted file is re-hashed and compared to the
-   snapshot. BASE is built from the bytes now on disk, not from what was
-   expected to land.
+   snapshot. BASE is built from those bytes only. Unverifiable paths are
+   reported by path and listed size; they are not promoted and are not written
+   into BASE.
 7. **Atomic BASE.** `Save-BaseManifest` writes BASE last
    ([base-schema.md](base-schema.md)), then staging is cleared.
 
@@ -83,6 +89,7 @@ Adopt compares `LOCAL ∪ REMOTE` by canonical path and exact content hash:
 | present | same hash | `Identical` — the only BASE candidate |
 | present | different hash | `Conflict` |
 | present | absent | `LocalOnly` |
+| present or absent | present, over read limit | `Unverifiable` |
 | absent | present | `RemoteOnly` |
 | absent | present, but ignored | `IgnoredRemote` |
 
@@ -103,7 +110,7 @@ short local and remote hashes:
 Init Adopt unresolved paths
 ===========================
 IDENTICAL (BASE): 12      CONFLICT: 2      LOCAL-ONLY: 3
-REMOTE-ONLY: 1            IGNORED: 1
+REMOTE-ONLY: 1            IGNORED: 1            UNVERIFIABLE: 1
 
 CONFLICT
   src/edited.ts  local=d385701c...43be  remote=0709e9b0...eca2
@@ -111,6 +118,9 @@ CONFLICT
 LOCAL-ONLY
   notes.md  local=f15030cd...691e
 ...
+
+UNVERIFIABLE (over Studio read limit)
+  public/hero.fbx  size=3120444
 
 BASE records only path+hash-identical entries: 12 of 19 paths.
 Every path listed above is unresolved; it is not evidence of a safe sync direction.
@@ -186,6 +196,12 @@ prints file contents, access tokens, refresh tokens, or `Authorization`
 headers. Printing progress is best effort and never changes fail-closed
 behavior: a failed hash or download still aborts, and a progress write can
 never mask that error.
+
+## Limitation: files over Studio's read limit
+
+`GET /file` returns HTTP 413 `file too large to view` for any payload over **2 MB (2,000,000 bytes)**. Exactly 2,000,000 bytes still reads; 2,000,001 does not. No other read route is known, and the refusal is not changed by request headers or by `POST` on the same URL. `Init -InitMode FromRemote` therefore does not download those paths and does not write them into BASE. It reports each one by path and listed size and still records every file it could verify. `Init -InitMode Adopt` reports the same paths as `Unverifiable` and does not record them as identical.
+
+A later `Plan` lists them under `UNVERIFIABLE`. `Pull` does not download them. `Push` can publish a **new** binary over the limit (verified from the upload `ETag`) and refuses to replace one that is already over the limit. See [Known limitations](limitations.md), [README](../README.md#large-files-studio-read-limit), and [protocol.md](protocol.md).
 
 ## Limitation: API hash fields
 

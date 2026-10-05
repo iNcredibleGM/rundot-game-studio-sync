@@ -23,7 +23,10 @@ function Get-SyncTextCreatePathRefusalReason {
         [string]$CanonicalPath,
 
         [AllowNull()]
-        [string[]]$RemotePaths
+        [string[]]$RemotePaths,
+
+        [AllowNull()]
+        $AncestorDirectories
     )
 
     $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
@@ -33,7 +36,12 @@ function Get-SyncTextCreatePathRefusalReason {
         )
     }
 
-    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+    if (
+        Test-SyncDeletePathDirectoryShaped `
+            -CanonicalPath $CanonicalPath `
+            -RemotePaths $RemotePaths `
+            -AncestorDirectories $AncestorDirectories
+    ) {
         return (
             'Directory-shaped path: a text create must target a new file path, not a directory prefix.'
         )
@@ -48,7 +56,10 @@ function Get-SyncBinaryPlacePathRefusalReason {
         [string]$CanonicalPath,
 
         [AllowNull()]
-        [string[]]$RemotePaths
+        [string[]]$RemotePaths,
+
+        [AllowNull()]
+        $AncestorDirectories
     )
 
     $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
@@ -58,7 +69,12 @@ function Get-SyncBinaryPlacePathRefusalReason {
         )
     }
 
-    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+    if (
+        Test-SyncDeletePathDirectoryShaped `
+            -CanonicalPath $CanonicalPath `
+            -RemotePaths $RemotePaths `
+            -AncestorDirectories $AncestorDirectories
+    ) {
         return (
             'Directory-shaped path: a binary place must target a file path, not a directory prefix.'
         )
@@ -94,21 +110,6 @@ function Test-SyncRemoteMutatingStatus {
         $script:SyncStatusDeleteRemoteCandidate
         'DELETE'
     ) -contains [string]$Status
-}
-
-function Format-SyncPlanShortHash {
-    param($Value)
-
-    $text = [string]$Value
-    if ([string]::IsNullOrEmpty($text)) {
-        return '<none>'
-    }
-
-    if ($text.Length -le 16) {
-        return $text
-    }
-
-    return ($text.Substring(0, 8) + '...' + $text.Substring($text.Length - 4))
 }
 
 function Get-SyncPlanBaseMapFromResolution {
@@ -186,6 +187,11 @@ function Get-SyncPlanOperationRows {
 
     $rows = New-Object 'System.Collections.Generic.List[object]'
 
+    # Build the ancestor-directory set once. The directory-shaped checks below
+    # are then set lookups rather than a scan of the whole remote list per row.
+    $ancestorDirectories = Get-SyncRemoteAncestorDirectories `
+        -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+
     foreach ($change in @($Changes)) {
         $path = [string]$change.Path
         $baseEntry = Get-SyncMapEntry -Map $Base -Path $path
@@ -196,7 +202,6 @@ function Get-SyncPlanOperationRows {
         $localKind = [string](Get-SyncEntryKind -Entry $localEntry)
         $remoteKind = [string](Get-SyncEntryKind -Entry $remoteEntry)
         $remoteMutating = Test-SyncRemoteMutatingStatus -Status $status
-        $remotePathsList = @(Get-SyncPlanRemotePaths -Remote $Remote)
         $localSize = Get-SyncEntryProperty -Entry $localEntry -Names @('Size', 'size')
         $localSizeValue = 0
         if ($null -ne $localSize) {
@@ -212,7 +217,7 @@ function Get-SyncPlanOperationRows {
                 if ($localKind -eq 'binary') {
                     $placeRefusal = Get-SyncBinaryPlacePathRefusalReason `
                         -CanonicalPath $path `
-                        -RemotePaths $remotePathsList
+                        -AncestorDirectories $ancestorDirectories
 
                     if ($localSizeValue -le 0) {
                         $applicable = $false
@@ -254,7 +259,7 @@ function Get-SyncPlanOperationRows {
                     if ([string]::IsNullOrEmpty($remoteSha)) {
                         $createRefusal = Get-SyncTextCreatePathRefusalReason `
                             -CanonicalPath $path `
-                            -RemotePaths $remotePathsList
+                            -AncestorDirectories $ancestorDirectories
 
                         if ([string]::IsNullOrEmpty($createRefusal)) {
                             $applicable = $true
@@ -277,7 +282,7 @@ function Get-SyncPlanOperationRows {
                 # Plan and Push share one predicate so they cannot drift.
                 $refusal = Get-SyncDeletePathRefusalReason `
                     -CanonicalPath $path `
-                    -RemotePaths @(Get-SyncPlanRemotePaths -Remote $Remote)
+                    -AncestorDirectories $ancestorDirectories
 
                 if ([string]::IsNullOrEmpty($refusal) -and -not [string]::IsNullOrEmpty($remoteSha)) {
                     $applicable = $true
@@ -679,9 +684,9 @@ function Format-SyncPlanOperationLine {
     $line = (
         '  {0}  base={1}  local={2}  remote={3}' -f `
             $Operation.path,
-            (Format-SyncPlanShortHash -Value $Operation.baseSha256),
-            (Format-SyncPlanShortHash -Value $Operation.localSha256),
-            (Format-SyncPlanShortHash -Value $Operation.remoteSha256)
+            (Format-SyncShortHash -Value $Operation.baseSha256),
+            (Format-SyncShortHash -Value $Operation.localSha256),
+            (Format-SyncShortHash -Value $Operation.remoteSha256)
     )
 
     if (-not [string]::IsNullOrEmpty([string]$Operation.reason)) {
@@ -695,12 +700,6 @@ function Format-SyncPlanOperationLine {
     }
 
     return $line
-}
-
-function Get-SyncPlanNonNoOpRows {
-    param([object[]]$Operations)
-
-    return @($Operations | Where-Object { -not (Test-SyncNoOpStatus -Status ([string]$_.status)) })
 }
 
 function Format-SyncPlanReport {

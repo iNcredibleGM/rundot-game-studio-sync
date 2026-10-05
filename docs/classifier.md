@@ -159,6 +159,12 @@ The ignore check runs **before** the decision table. A path matching
 
 This is why `.rundot-sync/` can never be an upload candidate.
 
+The set consulted here includes a present **root** `.gitignore` as an additive
+floor (#64, [path-safety.md](path-safety.md)). Because the check still runs
+first, a path hidden only by a `.gitignore` rule is `ignored` too — so honoring
+it can never manufacture a `deleteRemoteCandidate` from a remote path that a
+local rule hides.
+
 ## Post-processing
 
 After the table, a row is adjusted in three ways.

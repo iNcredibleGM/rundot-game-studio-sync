@@ -2,6 +2,13 @@
 
 Unofficial tool for syncing a RUN Game Studio project with a local directory.
 
+> **Read this before trusting a fresh `Init` or `Pull`.** Studio will not serve
+> a file over **2 MB**, so this tool cannot download or re-verify one. Those
+> paths are reported and skipped — which means **a synced local tree can be
+> incomplete**, and nothing about the folder says so. On a 3D project that is
+> often an `.fbx` or `.glb`. See **[Known limitations](docs/limitations.md)**
+> for the full list, with the evidence behind each one.
+
 > This project is not affiliated with or endorsed by RUN, RUN.game, Series, Inc., or the maintainers of the official `rundot` CLI.
 
 ## What it does
@@ -204,7 +211,7 @@ again.
 - Delete a path under `.git`, `.gitignore`, `.rundot-sync`, or `.rundot`, or a
   directory-shaped path
 - Publish a **binary replace** whose remote bytes exceed Studio's
-  2,000,000-byte read limit — the pre-overwrite backup and hash gate cannot read
+  2 MB (2,000,000-byte) read limit — the pre-overwrite backup and hash gate cannot read
   them, so the path is refused (a binary **create** over the limit is published)
 - Merge divergent text — `-LocalWins` replaces remote bytes with local bytes,
   and an unconfirmed `CONFLICT` is printed and skipped
@@ -329,6 +336,22 @@ like project files that were deleted:
 There is **no `.rundotignore`** in this version. The list above is fixed and
 documented in [docs/path-safety.md](docs/path-safety.md).
 
+### Root `.gitignore`
+
+A `.gitignore` at the workspace root is also honored, as an **additive floor**
+over the fixed list above ([#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)).
+It can only **add** ignores — it can never re-include or override a built-in
+entry, so a `!.git/` line cannot make `.git/` a candidate. This version does
+not obey negation (`!pattern`); a negation line is reported in the run output
+but ignored, and nested per-directory `.gitignore` files are not read.
+
+Each run reports how many rules it added, so the ignore set is never a silent
+skip. A `.gitignore` that cannot be parsed fails the whole run closed rather
+than being skipped, and a gitignored path is classified `ignored` — it never
+becomes an upload candidate and never turns a remote file into a
+`deleteRemoteCandidate`. `.gitignore` itself is not in the built-in set, so it
+is still inventoried.
+
 One important asymmetry: the **raw exporter does not apply these ignores**. It
 downloads everything Studio lists. The ignore set applies to the local
 inventory that `Plan` and `Pull` compare.
@@ -430,6 +453,28 @@ escape hatch, but it states plainly that every sync direction is untrusted.
 That is the intended behavior. See
 [Raw export](#raw-export-new-or-empty-directories-only).
 
+## Large files (Studio read limit)
+
+Studio's file read route, `GET /file`, refuses any payload over **2 MB (2,000,000 bytes)** with HTTP 413 `file too large to view`. That limit is on the API, not the in-browser viewer. A file of exactly 2,000,000 bytes still reads; 2,000,001 does not. Range requests and other guessed download URLs do not return the bytes. Changing request headers or using `POST` on the same route does not either.
+
+This tool only records a path as synced when it has verified the exact bytes. It cannot download or re-check a file that is already on Studio above 2 MB.
+
+**What works**
+
+- Files at or under 2 MB sync in both directions.
+- A **new** binary over 2 MB can be published with `Push`. The upload is verified from the storage `ETag`, not by reading the file back.
+- `Init` and `Plan` still finish when the project contains a file over 2 MB. The path is reported as unverifiable, left off disk on a fresh `Init`, and left out of BASE. The rest of the project syncs.
+
+**What does not work**
+
+- Downloading an existing Studio file over 2 MB (`Init -InitMode FromRemote`, `Pull`).
+- Replacing an existing oversized remote file. The backup and the expected-hash check need the current remote bytes, which cannot be read.
+- Treating an oversized remote file as in sync. `Plan` lists it under `UNVERIFIABLE`.
+
+Keep large assets (for example a `.fbx` or `.glb` over that size) in the local tree or another store you already trust. Studio can hold a copy you uploaded, but this client cannot fetch that copy back.
+
+This section is the user-facing summary. The consolidated list — read limit, write limits, sync semantics, and platform — is in **[Known limitations](docs/limitations.md)**.
+
 ## Not in this version
 
 Deliberately out of scope, so nothing here does them by accident:
@@ -440,9 +485,13 @@ Deliberately out of scope, so nothing here does them by accident:
   as a confirmed create plus delete
 - Deleting anything automatically, locally or remotely — a remote delete is
   applied only through a confirmed `Push`
-- `.rundotignore` custom patterns
+- `.rundotignore` custom patterns (a root `.gitignore` **is** honored, as an
+  additive floor; see [Default ignores](#default-ignores))
+- Nested per-directory `.gitignore` files, `.gitignore` negation, and the full
+  anchoring/`**` pattern surface
 - Newline or encoding normalization
 - File watching, device IDs, or a shared multi-machine BASE
+- Downloading or re-verifying a Studio file over 2 MB (2,000,000 bytes; see [Large files](#large-files-studio-read-limit))
 
 Direction is in [ROADMAP.md](ROADMAP.md); the acceptance evidence for this
 milestone is in [docs/acceptance.md](docs/acceptance.md).

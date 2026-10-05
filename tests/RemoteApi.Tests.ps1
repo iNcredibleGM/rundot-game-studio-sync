@@ -118,16 +118,7 @@ Assert-True `
 $script:CapturedTextUri = $null
 $script:CapturedTextHeaders = $null
 
-function Invoke-Utf8TextGet {
-    param(
-        [string]$Uri,
-        [hashtable]$Headers
-    )
-
-    $script:CapturedTextUri = $Uri
-    $script:CapturedTextHeaders = $Headers
-    return '{"ok":true,"count":1}'
-}
+Set-Utf8TextGetStub -ResponseText '{"ok":true,"count":1}'
 
 $jsonHeaders = @{
     Accept = "*/*"
@@ -142,16 +133,7 @@ Assert-Equal "*/*" $script:CapturedTextHeaders.Accept "Invoke-Utf8JsonGet should
 Assert-Equal $true $jsonResult.ok "Invoke-Utf8JsonGet should parse JSON"
 Assert-Equal 1 $jsonResult.count "Invoke-Utf8JsonGet should preserve JSON numbers"
 
-function Invoke-Utf8TextGet {
-    param(
-        [string]$Uri,
-        [hashtable]$Headers
-    )
-
-    $script:CapturedTextUri = $Uri
-    $script:CapturedTextHeaders = $Headers
-    return '<!DOCTYPE html><html>login</html>'
-}
+Set-Utf8TextGetStub -ResponseText '<!DOCTYPE html><html>login</html>'
 
 Assert-Throws {
     Invoke-Utf8JsonGet -Uri "https://example.test/login" -Headers $jsonHeaders

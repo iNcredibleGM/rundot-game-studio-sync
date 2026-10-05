@@ -124,6 +124,47 @@ function Get-RundotSyncSnapshotFilePaths {
     return @($Snapshot.Files.Keys)
 }
 
+function Test-RundotSyncSnapshotEntryUnverifiable {
+    param($Entry)
+
+    if ($null -eq $Entry) {
+        return $false
+    }
+
+    return ($Entry.Unverifiable -eq $true)
+}
+
+function Get-RundotSyncVerifiableSnapshotFilePaths {
+    param($Snapshot)
+
+    $verifiable = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($path in @(Get-RundotSyncSnapshotFilePaths -Snapshot $Snapshot)) {
+        $entry = $Snapshot.Files[$path]
+        if (-not (Test-RundotSyncSnapshotEntryUnverifiable -Entry $entry)) {
+            [void]$verifiable.Add([string]$path)
+        }
+    }
+
+    return $verifiable.ToArray()
+}
+
+function Get-RundotSyncUnverifiableSnapshotEntries {
+    param($Snapshot)
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in @(Get-RundotSyncSnapshotFilePaths -Snapshot $Snapshot)) {
+        $entry = $Snapshot.Files[$path]
+        if (Test-RundotSyncSnapshotEntryUnverifiable -Entry $entry) {
+            [void]$rows.Add([pscustomobject]@{
+                Path = [string]$path
+                Size = [int64](Get-SyncEntrySizeValue -Entry $entry)
+            })
+        }
+    }
+
+    return $rows.ToArray()
+}
+
 function Get-RundotSyncStagingFileIndex {
     param(
         [Parameter(Mandatory)]
@@ -169,13 +210,24 @@ function Test-RundotSyncStagingIntegrity {
     $staged = Get-RundotSyncStagingFileIndex -StagingRoot $stagingRoot
 
     foreach ($path in $paths) {
+        $entry = $Snapshot.Files[$path]
+
+        if (Test-RundotSyncSnapshotEntryUnverifiable -Entry $entry) {
+            if ($staged.ContainsKey($path)) {
+                throw [System.InvalidOperationException]::new(
+                    "Remote snapshot marked '$path' unverifiable, but staging contains bytes for it."
+                )
+            }
+
+            continue
+        }
+
         if (-not $staged.ContainsKey($path)) {
             throw [System.InvalidOperationException]::new(
                 "Remote snapshot listed '$path', but it is missing from staging."
             )
         }
 
-        $entry = $Snapshot.Files[$path]
         $stagedPath = $staged[$path]
         $identity = Get-LocalFileIdentity -LiteralPath $stagedPath
 
@@ -330,6 +382,8 @@ function Import-RundotRemoteSnapshot {
     )
 
     $paths = @(Get-RundotSyncSnapshotFilePaths -Snapshot $Snapshot)
+    $verifiablePaths = @(Get-RundotSyncVerifiableSnapshotFilePaths -Snapshot $Snapshot)
+    $unverifiable = @(Get-RundotSyncUnverifiableSnapshotEntries -Snapshot $Snapshot)
 
     # Defense in depth: a file may have appeared since the pre-flight check.
     Assert-RundotSyncInitDestination -LocalDir $LocalDir
@@ -349,7 +403,7 @@ function Import-RundotRemoteSnapshot {
         # claim rather than an assumption.
         $files = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
 
-        foreach ($path in $paths) {
+        foreach ($path in $verifiablePaths) {
             $localPath = ConvertTo-LocalFullPath `
                 -WorkspaceRoot $LocalDir `
                 -CanonicalPath $path
@@ -403,8 +457,9 @@ function Import-RundotRemoteSnapshot {
     Clear-RemoteSnapshotTemp -WorkspaceRoot $LocalDir
 
     return [pscustomobject]@{
-        FileCount  = $files.Count
-        StagingRoot = $Snapshot.StagingRoot
+        FileCount     = $files.Count
+        StagingRoot   = $Snapshot.StagingRoot
+        Unverifiable  = $unverifiable
     }
 }
 
@@ -455,6 +510,7 @@ $script:RundotSyncAdoptConflict = 'Conflict'
 $script:RundotSyncAdoptLocalOnly = 'LocalOnly'
 $script:RundotSyncAdoptRemoteOnly = 'RemoteOnly'
 $script:RundotSyncAdoptIgnoredRemote = 'IgnoredRemote'
+$script:RundotSyncAdoptUnverifiable = 'Unverifiable'
 
 function Get-RundotSyncAdoptComparisons {
     param(
@@ -499,6 +555,19 @@ function Get-RundotSyncAdoptComparisons {
         }
 
         $remoteEntry = $remoteFiles[$canonical]
+
+        if (Test-RundotSyncSnapshotEntryUnverifiable -Entry $remoteEntry) {
+            $rows.Add([pscustomobject]@{
+                Path         = $canonical
+                Status       = $script:RundotSyncAdoptUnverifiable
+                LocalSha256  = $localSha
+                RemoteSha256 = $null
+                LocalEntry   = $localEntry
+                RemoteEntry  = $remoteEntry
+            })
+            continue
+        }
+
         $remoteSha = [string](Get-BaseFileEntryProperty `
             -Entry $remoteEntry `
             -Names @('Sha256', 'sha256'))
@@ -527,13 +596,20 @@ function Get-RundotSyncAdoptComparisons {
         }
 
         $remoteEntry = $remoteFiles[$path]
-        $remoteSha = [string](Get-BaseFileEntryProperty `
-            -Entry $remoteEntry `
-            -Names @('Sha256', 'sha256'))
 
         $status = $script:RundotSyncAdoptRemoteOnly
         if (Test-IgnoredSyncPath -CanonicalPath $path) {
             $status = $script:RundotSyncAdoptIgnoredRemote
+        }
+        elseif (Test-RundotSyncSnapshotEntryUnverifiable -Entry $remoteEntry) {
+            $status = $script:RundotSyncAdoptUnverifiable
+        }
+
+        $remoteSha = $null
+        if ([string]$status -eq $script:RundotSyncAdoptRemoteOnly) {
+            $remoteSha = [string](Get-BaseFileEntryProperty `
+                -Entry $remoteEntry `
+                -Names @('Sha256', 'sha256'))
         }
 
         $rows.Add([pscustomobject]@{
@@ -547,119 +623,6 @@ function Get-RundotSyncAdoptComparisons {
     }
 
     return $rows.ToArray()
-}
-
-function Format-RundotSyncShortHash {
-    param($Value)
-
-    $text = [string]$Value
-    if ([string]::IsNullOrEmpty($text)) {
-        return '<none>'
-    }
-
-    if ($text.Length -le 16) {
-        return $text
-    }
-
-    return ($text.Substring(0, 8) + '...' + $text.Substring($text.Length - 4))
-}
-
-function Format-RundotSyncAdoptReport {
-    param(
-        [Parameter(Mandatory)]
-        $Comparisons,
-
-        [Parameter(Mandatory)]
-        [int]$BaseFileCount
-    )
-
-    $identical = New-Object 'System.Collections.Generic.List[object]'
-    $conflicts = New-Object 'System.Collections.Generic.List[object]'
-    $localOnly = New-Object 'System.Collections.Generic.List[object]'
-    $remoteOnly = New-Object 'System.Collections.Generic.List[object]'
-    $ignored = New-Object 'System.Collections.Generic.List[object]'
-
-    foreach ($row in @($Comparisons)) {
-        switch ([string]$row.Status) {
-            $script:RundotSyncAdoptIdentical { [void]$identical.Add($row) }
-            $script:RundotSyncAdoptConflict { [void]$conflicts.Add($row) }
-            $script:RundotSyncAdoptLocalOnly { [void]$localOnly.Add($row) }
-            $script:RundotSyncAdoptRemoteOnly { [void]$remoteOnly.Add($row) }
-            $script:RundotSyncAdoptIgnoredRemote { [void]$ignored.Add($row) }
-        }
-    }
-
-    $total = @($Comparisons).Count
-    $unresolved = $conflicts.Count + $localOnly.Count + $remoteOnly.Count + $ignored.Count
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    [void]$lines.Add('Init Adopt unresolved paths')
-    [void]$lines.Add('===========================')
-    [void]$lines.Add(
-        ('IDENTICAL (BASE): {0}      CONFLICT: {1}      LOCAL-ONLY: {2}' -f `
-            $identical.Count, $conflicts.Count, $localOnly.Count)
-    )
-    [void]$lines.Add(
-        ('REMOTE-ONLY: {0}            IGNORED: {1}' -f $remoteOnly.Count, $ignored.Count)
-    )
-
-    if ($conflicts.Count -gt 0) {
-        [void]$lines.Add('')
-        [void]$lines.Add('CONFLICT')
-        foreach ($row in $conflicts) {
-            [void]$lines.Add(
-                ('  {0}  local={1}  remote={2}' -f `
-                    $row.Path,
-                    (Format-RundotSyncShortHash -Value $row.LocalSha256),
-                    (Format-RundotSyncShortHash -Value $row.RemoteSha256))
-            )
-        }
-    }
-
-    if ($localOnly.Count -gt 0) {
-        [void]$lines.Add('')
-        [void]$lines.Add('LOCAL-ONLY')
-        foreach ($row in $localOnly) {
-            [void]$lines.Add(
-                ('  {0}  local={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.LocalSha256))
-            )
-        }
-    }
-
-    if ($remoteOnly.Count -gt 0) {
-        [void]$lines.Add('')
-        [void]$lines.Add('REMOTE-ONLY')
-        foreach ($row in $remoteOnly) {
-            [void]$lines.Add(
-                ('  {0}  remote={1}' -f $row.Path, (Format-RundotSyncShortHash -Value $row.RemoteSha256))
-            )
-        }
-    }
-
-    if ($ignored.Count -gt 0) {
-        [void]$lines.Add('')
-        [void]$lines.Add('IGNORED (matches the default ignore set)')
-        foreach ($row in $ignored) {
-            [void]$lines.Add(('  {0}' -f $row.Path))
-        }
-    }
-
-    [void]$lines.Add('')
-    [void]$lines.Add(
-        ('BASE records only path+hash-identical entries: {0} of {1} paths.' -f `
-            $BaseFileCount, $total)
-    )
-
-    if ($unresolved -gt 0) {
-        [void]$lines.Add('Every path listed above is unresolved; it is not evidence of a safe sync direction.')
-    }
-
-    if ($BaseFileCount -eq 0) {
-        [void]$lines.Add('')
-        [void]$lines.Add('WARNING: no proven-identical paths. Synchronization direction is untrusted for every path.')
-    }
-
-    return ($lines.ToArray() -join "`n")
 }
 
 function Assert-RundotSyncAdoptDestination {

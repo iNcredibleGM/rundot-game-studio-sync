@@ -58,38 +58,68 @@ function Get-SyncDeletePathReservedRoot {
     return $null
 }
 
+function Get-SyncRemoteAncestorDirectories {
+    # Every ancestor directory the remote tree implies, as one set. A path that
+    # appears here is directory-shaped: some listed file sits under it. Built
+    # once per plan so the per-candidate check is a set lookup instead of a
+    # scan of the whole remote list (#69).
+    #
+    # The comparison is ordinal, matching the StartsWith the per-row scan used:
+    # 'src/dir' is an ancestor of 'src/dir/a.ts' but not of 'src/dir2/a.ts'.
+    param(
+        [AllowNull()]
+        [string[]]$RemotePaths
+    )
+
+    $directories = New-Object 'System.Collections.Generic.HashSet[string]' (
+        [System.StringComparer]::Ordinal
+    )
+
+    foreach ($remotePath in @($RemotePaths)) {
+        $text = [string]$remotePath
+        if ([string]::IsNullOrEmpty($text)) {
+            continue
+        }
+
+        $segments = $text.Split(@('/'), [System.StringSplitOptions]::None)
+        for ($i = 1; $i -lt $segments.Length; $i++) {
+            [void]$directories.Add([string]::Join('/', $segments[0..($i - 1)]))
+        }
+    }
+
+    # The leading comma stops PowerShell unrolling the HashSet into its
+    # elements, so an empty remote list still returns an empty set rather than
+    # $null and the caller can always call .Contains.
+    return ,$directories
+}
+
 function Test-SyncDeletePathDirectoryShaped {
-    # True when the path is a prefix of a listed remote file, which means it
-    # names a directory rather than a leaf. A delete of such a path returns the
-    # same 404 as an absent path and removes nothing, so it is refused rather
-    # than attempted.
+    # True when the path is an ancestor directory the remote tree implies, which
+    # means it names a directory rather than a leaf. A delete of such a path
+    # returns the same 404 as an absent path and removes nothing, so it is
+    # refused rather than attempted.
+    #
+    # -AncestorDirectories is the precomputed set from
+    # Get-SyncRemoteAncestorDirectories. When it is omitted the set is built
+    # from -RemotePaths, so the check stays usable on its own.
     param(
         [Parameter(Mandatory)]
         [string]$CanonicalPath,
 
         [AllowNull()]
-        [string[]]$RemotePaths
+        [string[]]$RemotePaths,
+
+        [AllowNull()]
+        $AncestorDirectories
     )
 
     $canonical = ConvertTo-CanonicalSyncPath -Path $CanonicalPath
-    $prefix = $canonical + '/'
 
-    foreach ($remotePath in @($RemotePaths)) {
-        if ([string]::IsNullOrEmpty([string]$remotePath)) {
-            continue
-        }
-
-        if (
-            ([string]$remotePath).StartsWith(
-                $prefix,
-                [System.StringComparison]::Ordinal
-            )
-        ) {
-            return $true
-        }
+    if ($null -eq $AncestorDirectories) {
+        $AncestorDirectories = Get-SyncRemoteAncestorDirectories -RemotePaths $RemotePaths
     }
 
-    return $false
+    return $AncestorDirectories.Contains($canonical)
 }
 
 function Get-SyncDeletePathRefusalReason {
@@ -101,7 +131,10 @@ function Get-SyncDeletePathRefusalReason {
         [string]$CanonicalPath,
 
         [AllowNull()]
-        [string[]]$RemotePaths
+        [string[]]$RemotePaths,
+
+        [AllowNull()]
+        $AncestorDirectories
     )
 
     $reservedRoot = Get-SyncDeletePathReservedRoot -CanonicalPath $CanonicalPath
@@ -111,7 +144,12 @@ function Get-SyncDeletePathRefusalReason {
         )
     }
 
-    if (Test-SyncDeletePathDirectoryShaped -CanonicalPath $CanonicalPath -RemotePaths $RemotePaths) {
+    if (
+        Test-SyncDeletePathDirectoryShaped `
+            -CanonicalPath $CanonicalPath `
+            -RemotePaths $RemotePaths `
+            -AncestorDirectories $AncestorDirectories
+    ) {
         return (
             'Directory-shaped path: this route deletes exactly one file and a directory-shaped path is not a recursive delete.'
         )
@@ -126,12 +164,16 @@ function Assert-SyncDeletePathAllowed {
         [string]$CanonicalPath,
 
         [AllowNull()]
-        [string[]]$RemotePaths
+        [string[]]$RemotePaths,
+
+        [AllowNull()]
+        $AncestorDirectories
     )
 
     $reason = Get-SyncDeletePathRefusalReason `
         -CanonicalPath $CanonicalPath `
-        -RemotePaths $RemotePaths
+        -RemotePaths $RemotePaths `
+        -AncestorDirectories $AncestorDirectories
 
     if (-not [string]::IsNullOrEmpty($reason)) {
         throw [System.InvalidOperationException]::new(

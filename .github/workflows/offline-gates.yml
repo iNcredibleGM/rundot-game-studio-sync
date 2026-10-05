@@ -1,0 +1,42 @@
+name: Offline gates
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-gates:
+    name: Offline gates
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Hosted runners often set TEMP to a short path (RUNNER~1). Tests compare
+      # paths from Join-Path under TEMP with GetFullPath-normalized sync paths.
+      - name: Use long-path temp directory
+        run: |
+          $tempDir = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '_ci-temp'))
+          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$tempDir"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$tempDir"
+
+      - name: Confirm Windows PowerShell 5.1
+        run: |
+          $v = $PSVersionTable.PSVersion
+          Write-Host ("Windows PowerShell {0}" -f $v)
+          if ($v.Major -ne 5 -or $v.Minor -lt 1) { exit 1 }
+
+      - name: Unit suite
+        run: powershell -NoProfile -File .\tests\Run-Tests.ps1
+
+      - name: Offline acceptance gates
+        run: powershell -NoProfile -File .\tests\Acceptance.ps1 -SkipLive

@@ -115,17 +115,35 @@ Done when a stranger, on a disposable project, can confirm one publish that over
 
 Shipped on `main`.
 
-## v0.3.1 - Honor .gitignore
+## v0.3.1 - Honor .gitignore and hardening
 
-Patch on v0.3.0. The v0.3.0 production publish showed the fixed ignore set still treating gitignored paths as sync candidates — 70 paths (~946 MB) in an 18,642-file tree, including a `.env.local` secret ([#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)). This version honors a present **root** `.gitignore` during local sync inventory so those paths are not upload candidates.
+Patch on v0.3.0, expanded by the full-project review. Two halves: one shipped behavior fix, and the refactoring, performance, hygiene, and safety-net follow-ups the review surfaced.
+
+**Half one — honor a present `.gitignore`.** The v0.3.0 production publish showed the fixed ignore set still treating gitignored paths as sync candidates — 70 paths (~946 MB) in an 18,642-file tree, including a `.env.local` secret ([#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)). This version honors a present **root** `.gitignore` during local sync inventory so those paths are not upload candidates.
 
 **Scope is deliberately narrow:** `.gitignore` is an **additive floor** over the fixed built-in set — it never re-includes or overrides a built-in entry. No negation (`!pattern`) and no nested per-directory files. The ignore set stays deterministic and reported, a parse failure fails closed, and an ignore rule must never manufacture a `deleteRemoteCandidate`. No new Studio write route.
 
-Milestone: [v0.3.1 - Honor .gitignore](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/5)
+**Half two — hardening from the project review.** Measured findings, not guesses: an O(rows x remote files) delete-path check worth **22.1x**, a per-row array rebuild worth **1.8x**, a 3,233-line `Push.ps1` that needs splitting, duplicated helpers, one dead function, a layering leak in `Auth.ps1`, and the fact that the repository has **no CI and no branch protection** at all.
 
-1. Honor a present `.gitignore` during local sync inventory — [#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64)
+Milestone: [v0.3.1 - Honor .gitignore and hardening](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/5)
+
+1. Honor a present `.gitignore` during local sync inventory — [#64](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/64) — shipped in `lib/Ignore.ps1`
+2. Precompute the ancestor-directory set for delete-path applicability — [#69](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/69)
+3. Hoist the remote path list out of the per-row plan loop — [#66](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/66)
+4. Add a regression guard for the binary place manifest reuse — [#75](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/75)
+5. Split `Push.ps1` into focused publish-mode libraries — [#70](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/70)
+6. Remove dead function and deduplicate the short-hash formatter — [#68](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/68)
+7. Stop `lib/Auth.ps1` writing to the console — [#67](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/67)
+8. Deduplicate shared test helpers — [#73](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/73)
+9. Add CI that runs the unit suite and offline gates on every pull request — [#71](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/71)
+10. Protect `main` and require the offline gates before merge — [#72](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/72)
+11. Fix the stale `Get-SyncLocalFileMd5Hex` reference in `binary-place-protocol.md` — [#74](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/74)
+
+**Done when** the suite is green, the two performance fixes are in with their measured gains, CI runs the offline gates on every PR, `Push.ps1` is split with no behavior change, and the mutation grep is still green.
 
 Deferred to a later milestone: nested `.gitignore` files, negation / re-include semantics, full anchoring and `**` pattern semantics, and the built-in-vs-`.gitignore` precedence question beyond "additive floor".
+
+Shipped on `main`.
 
 ## After v0.3.1
 
@@ -135,3 +153,9 @@ Deferred to a later milestone: nested `.gitignore` files, negation / re-include 
 - content merge of a conflict
 - publish a detected rename as `POST /move` when delete-plus-create is the wrong shape
 - distributed / multi-machine BASE
+- large binary replace up to 50 MiB — delete-then-place with the upload `ETag` as the post-place identity, and the `GET /files` size as the only pre-replace guard. Trades the backup and the `expectedRemoteHash` gate for the ability to replace at all ([large-file-protocol.md](docs/large-file-protocol.md))
+- a named refusal for text over 2,000,000 bytes, stating that the path would be write-once ([large-file-protocol.md](docs/large-file-protocol.md))
+
+The 2 MB read limit itself is not on this list: no route was found that returns
+the bytes, so a file already on Studio over 2 MB stays unverifiable. See
+[docs/limitations.md](docs/limitations.md).

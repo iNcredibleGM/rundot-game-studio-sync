@@ -115,10 +115,28 @@ function Save-StudioAuth {
 }
 
 
+function Write-RundotAuthStatus {
+    param(
+        $WriteStatus,
+
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [ValidateSet('Host', 'Warning')]
+        [string]$Kind = 'Host'
+    )
+
+    if ($null -eq $WriteStatus) { return }
+    & $WriteStatus -Text $Text -Kind $Kind
+}
+
+
 function Load-StudioAuth {
     param(
         [Parameter(Mandatory)]
-        [string]$AuthPath
+        [string]$AuthPath,
+
+        [scriptblock]$WriteStatus = $null
     )
 
     if (-not (Test-Path $AuthPath)) {
@@ -145,8 +163,8 @@ function Load-StudioAuth {
         }
     }
     catch {
-        Write-Warning "Saved Studio authentication could not be loaded."
-        Write-Warning $_.Exception.Message
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Saved Studio authentication could not be loaded." -Kind Warning
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text $_.Exception.Message -Kind Warning
         return $null
     }
 }
@@ -250,30 +268,105 @@ function Get-StudioManifestWithToken {
 }
 
 
-function Read-ManualBearerToken {
-    Write-Host ""
-    Write-Host "No usable automatic Studio authentication was found."
-    Write-Host ""
-    Write-Host "You can paste a fresh Studio bearer token."
-    Write-Host "The token will not be displayed."
-    Write-Host ""
+function Resolve-RundotBootstrapAccessToken {
+    param(
+        [string]$StudioOrigin,
+        [string]$ProjectId,
+        [string]$AuthDir,
+        [string]$AuthPath,
+        $Clipboard,
+        $WriteStatus
+    )
 
-    $secureToken = Read-Host "Bearer token" -AsSecureString
-    if ($null -eq $secureToken) {
+    $bootstrapAuth = Get-BootstrapAuthFromText $Clipboard
+    if (-not $bootstrapAuth) { return $null }
+
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Found RUN Studio bootstrap credentials in clipboard."
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Refreshing Studio token..."
+    $refreshed = Get-FreshStudioToken -ApiKey $bootstrapAuth.ApiKey -RefreshToken $bootstrapAuth.RefreshToken
+    if (-not $refreshed) {
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Bootstrap refresh token could not be refreshed."
         return $null
     }
 
-    $plainText = [System.Net.NetworkCredential]::new("", $secureToken).Password
-    if ([string]::IsNullOrWhiteSpace($plainText)) {
+    $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $refreshed.AccessToken
+    if (-not $candidateManifest) {
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Bootstrap credentials produced a token,"
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "but Studio rejected it."
         return $null
     }
 
-    $parsedToken = Get-TokenFromText $plainText
-    if ($parsedToken) {
-        return $parsedToken
+    Save-StudioAuth -AuthDir $AuthDir -AuthPath $AuthPath -ApiKey $bootstrapAuth.ApiKey -RefreshToken $refreshed.RefreshToken
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Studio bootstrap authentication accepted."
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Refresh credentials saved securely for future exports."
+    return @{
+        AccessToken  = $refreshed.AccessToken
+        Manifest     = $candidateManifest
+        RefreshToken = $refreshed.RefreshToken
+    }
+}
+
+
+function Resolve-RundotClipboardBearerAccessToken {
+    param(
+        [string]$StudioOrigin,
+        [string]$ProjectId,
+        $Clipboard,
+        $WriteStatus
+    )
+
+    $clipboardToken = Get-TokenFromText $Clipboard
+    if (-not $clipboardToken) { return $null }
+
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Found Studio bearer token in clipboard."
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Testing it against Studio..."
+    $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $clipboardToken
+    if (-not $candidateManifest) {
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Clipboard bearer token was rejected or expired."
+        return $null
     }
 
-    return $plainText.Trim()
+    Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Clipboard authentication accepted."
+    return @{
+        AccessToken  = $clipboardToken
+        Manifest     = $candidateManifest
+        RefreshToken = $null
+    }
+}
+
+
+function Resolve-RundotManualAccessToken {
+    param(
+        [string]$StudioOrigin,
+        [string]$ProjectId,
+        $ReadManualToken,
+        $WriteStatus
+    )
+
+    if ($null -eq $ReadManualToken) {
+        throw "No Studio authentication was supplied."
+    }
+
+    while ($true) {
+        $manualToken = & $ReadManualToken
+        if ([string]::IsNullOrWhiteSpace($manualToken)) {
+            throw "No Studio authentication was supplied."
+        }
+
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Testing manually supplied token..."
+        $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $manualToken
+        if ($candidateManifest) {
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Manual Studio authentication accepted."
+            return @{
+                AccessToken  = $manualToken
+                Manifest     = $candidateManifest
+                RefreshToken = $null
+            }
+        }
+
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Studio rejected that bearer token." -Kind Warning
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "It may be expired. Try a fresh token." -Kind Warning
+    }
 }
 
 
@@ -283,7 +376,9 @@ function Get-RundotAccessToken {
         [Parameter(Mandatory)][string]$ProjectId,
         [string]$AuthDir = (Join-Path $env:APPDATA ".rundot"),
         [string]$AuthPath = (Join-Path $env:APPDATA ".rundot\studio-export.auth.json"),
-        [string]$RundotCliSessionPath = (Join-Path $env:APPDATA ".rundot\prod.session.json")
+        [string]$RundotCliSessionPath = (Join-Path $env:APPDATA ".rundot\prod.session.json"),
+        [scriptblock]$WriteStatus = $null,
+        [scriptblock]$ReadManualToken = $null
     )
 
     $token = $null
@@ -293,31 +388,31 @@ function Get-RundotAccessToken {
 
     if ($rundotCliSession) {
         if (Test-RundotCliTokenFresh -AccessToken $rundotCliSession.AccessToken -ExpiresAtUnixTimeMs $rundotCliSession.ExpiresAtUnixTimeMs) {
-            Write-Host "Found RUNdot CLI session."
-            Write-Host "Testing fresh CLI authentication against Studio..."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Found RUNdot CLI session."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Testing fresh CLI authentication against Studio..."
             $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $rundotCliSession.AccessToken
             if ($candidateManifest) {
                 $token = $rundotCliSession.AccessToken
                 $manifest = $candidateManifest
-                Write-Host "RUNdot CLI authentication accepted."
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "RUNdot CLI authentication accepted."
             }
             else {
-                Write-Host "RUNdot CLI authentication was rejected."
-                Write-Host "Trying other authentication methods..."
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "RUNdot CLI authentication was rejected."
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Trying other authentication methods..."
             }
         }
         else {
-            Write-Host "Found RUNdot CLI session, but its access token is expired or near expiry."
-            Write-Host "Run ``rundot login`` to refresh it."
-            Write-Host "Trying other authentication methods..."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Found RUNdot CLI session, but its access token is expired or near expiry."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Run ``rundot login`` to refresh it."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Trying other authentication methods..."
         }
     }
 
     # Preserve v0.1.0 control flow: saved credentials are tried even after CLI success.
-    $savedAuth = Load-StudioAuth -AuthPath $AuthPath
+    $savedAuth = Load-StudioAuth -AuthPath $AuthPath -WriteStatus $WriteStatus
     if ($savedAuth) {
-        Write-Host "Found saved RUN Studio authentication."
-        Write-Host "Refreshing Studio token..."
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Found saved RUN Studio authentication."
+        Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Refreshing Studio token..."
         $refreshed = Get-FreshStudioToken -ApiKey $savedAuth.ApiKey -RefreshToken $savedAuth.RefreshToken
         if ($refreshed) {
             $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $refreshed.AccessToken
@@ -326,15 +421,15 @@ function Get-RundotAccessToken {
                 $refreshToken = $refreshed.RefreshToken
                 $manifest = $candidateManifest
                 Save-StudioAuth -AuthDir $AuthDir -AuthPath $AuthPath -ApiKey $savedAuth.ApiKey -RefreshToken $refreshed.RefreshToken
-                Write-Host "Saved Studio authentication accepted."
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Saved Studio authentication accepted."
             }
             else {
-                Write-Host "Saved Studio authentication was refreshed,"
-                Write-Host "but Studio rejected the resulting token."
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Saved Studio authentication was refreshed,"
+                Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "but Studio rejected the resulting token."
             }
         }
         else {
-            Write-Host "Saved Studio authentication could not be refreshed."
+            Write-RundotAuthStatus -WriteStatus $WriteStatus -Text "Saved Studio authentication could not be refreshed."
         }
     }
 
@@ -344,58 +439,26 @@ function Get-RundotAccessToken {
     }
 
     if (-not $token) {
-        $bootstrapAuth = Get-BootstrapAuthFromText $clipboard
-        if ($bootstrapAuth) {
-            Write-Host "Found RUN Studio bootstrap credentials in clipboard."
-            Write-Host "Refreshing Studio token..."
-            $refreshed = Get-FreshStudioToken -ApiKey $bootstrapAuth.ApiKey -RefreshToken $bootstrapAuth.RefreshToken
-            if ($refreshed) {
-                $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $refreshed.AccessToken
-                if ($candidateManifest) {
-                    $token = $refreshed.AccessToken
-                    $refreshToken = $refreshed.RefreshToken
-                    $manifest = $candidateManifest
-                    Save-StudioAuth -AuthDir $AuthDir -AuthPath $AuthPath -ApiKey $bootstrapAuth.ApiKey -RefreshToken $refreshed.RefreshToken
-                    Write-Host "Studio bootstrap authentication accepted."
-                    Write-Host "Refresh credentials saved securely for future exports."
-                }
-                else {
-                    Write-Host "Bootstrap credentials produced a token,"
-                    Write-Host "but Studio rejected it."
-                }
-            }
-            else { Write-Host "Bootstrap refresh token could not be refreshed." }
+        $bootstrapResult = Resolve-RundotBootstrapAccessToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AuthDir $AuthDir -AuthPath $AuthPath -Clipboard $clipboard -WriteStatus $WriteStatus
+        if ($bootstrapResult) {
+            $token = $bootstrapResult.AccessToken
+            $manifest = $bootstrapResult.Manifest
+            $refreshToken = $bootstrapResult.RefreshToken
         }
     }
 
     if (-not $token) {
-        $clipboardToken = Get-TokenFromText $clipboard
-        if ($clipboardToken) {
-            Write-Host "Found Studio bearer token in clipboard."
-            Write-Host "Testing it against Studio..."
-            $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $clipboardToken
-            if ($candidateManifest) {
-                $token = $clipboardToken
-                $manifest = $candidateManifest
-                Write-Host "Clipboard authentication accepted."
-            }
-            else { Write-Host "Clipboard bearer token was rejected or expired." }
+        $clipboardResult = Resolve-RundotClipboardBearerAccessToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -Clipboard $clipboard -WriteStatus $WriteStatus
+        if ($clipboardResult) {
+            $token = $clipboardResult.AccessToken
+            $manifest = $clipboardResult.Manifest
         }
     }
 
-    while (-not $token) {
-        $manualToken = Read-ManualBearerToken
-        if (-not $manualToken) { throw "No Studio authentication was supplied." }
-        Write-Host "Testing manually supplied token..."
-        $candidateManifest = Get-StudioManifestWithToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -AccessToken $manualToken
-        if ($candidateManifest) {
-            $token = $manualToken
-            $manifest = $candidateManifest
-            Write-Host "Manual Studio authentication accepted."
-            break
-        }
-        Write-Warning "Studio rejected that bearer token."
-        Write-Warning "It may be expired. Try a fresh token."
+    if (-not $token) {
+        $manualResult = Resolve-RundotManualAccessToken -StudioOrigin $StudioOrigin -ProjectId $ProjectId -ReadManualToken $ReadManualToken -WriteStatus $WriteStatus
+        $token = $manualResult.AccessToken
+        $manifest = $manualResult.Manifest
     }
 
     return @{ AccessToken = $token; Manifest = $manifest; RefreshToken = $refreshToken }

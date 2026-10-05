@@ -19,7 +19,8 @@
 #
 # Phases: setup -> up (create, overwrite) -> down (pull) -> restore from backup
 # -> push-backup evidence -> delete (confirmed remote delete + backup + journal)
-# -> binary create/replace -> fail-closed -> teardown.
+# -> binary create/replace -> Init #82 with oversize on Studio -> fail-closed
+# -> teardown.
 #
 # Named Live-RoundTrip.ps1, not *.Tests.ps1, so tests/Run-Tests.ps1 does not
 # pick it up: it needs a real account and network.
@@ -111,11 +112,23 @@ if ([string]::IsNullOrEmpty($ProjectId)) {
 . (Join-Path $repoRoot 'lib\Manifest.ps1')
 . (Join-Path $repoRoot 'lib\RemoteApi.ps1')
 . (Join-Path $repoRoot 'lib\Auth.ps1')
+. (Join-Path $repoRoot 'lib\AuthHost.ps1')
 . (Join-Path $repoRoot 'lib\Snapshot.ps1')
 . (Join-Path $repoRoot 'lib\Classifier.ps1')
 . (Join-Path $repoRoot 'lib\Journal.ps1')
 . (Join-Path $repoRoot 'lib\RemoteWrite.ps1')
 . (Join-Path $repoRoot 'lib\RemoteDelete.ps1')
+. (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+
+$restoredFileDefinition = (Get-Command Get-RemoteProjectFile -CommandType Function).Definition
+if ($restoredFileDefinition -notmatch 'EscapeDataString') {
+    throw 'tests/TestHelpers.ps1 must not shadow Get-RemoteProjectFile from lib/RemoteApi.ps1.'
+}
+
+$restoredTextDefinition = (Get-Command Invoke-Utf8TextGet -CommandType Function).Definition
+if ($restoredTextDefinition -notmatch 'Read-Utf8HttpResponseBody') {
+    throw 'tests/TestHelpers.ps1 must not shadow Invoke-Utf8TextGet from lib/RemoteApi.ps1.'
+}
 
 $script:Steps = New-Object 'System.Collections.Generic.List[object]'
 $script:WorkspaceCreated = $false
@@ -139,75 +152,12 @@ function Add-Step {
     }
 }
 
-function Write-Phase {
-    param([string]$Text)
-
-    Write-Host ''
-    Write-Host '=================================================='
-    Write-Host $Text
-    Write-Host '=================================================='
-}
-
-function Invoke-SyncCli {
-    param([string[]]$CliArgs, [switch]$NonInteractive)
-
-    $psArgs = @('-NoProfile')
-    if ($NonInteractive) { $psArgs += '-NonInteractive' }
-    $psArgs += @('-File', $syncCli)
-    $psArgs += $CliArgs
-
-    $lines = & powershell @psArgs 2>&1
-    $code = $LASTEXITCODE
-    if ($null -eq $code) { $code = 0 }
-
-    return [pscustomobject]@{ Output = ($lines | Out-String); ExitCode = [int]$code }
-}
-
 function Get-PlanCount {
     param([string]$Output, [string]$StatusName)
 
     $match = [regex]::Match($Output, ('(?m)^\s*' + [regex]::Escape($StatusName) + ':\s+(\d+)'))
     if ($match.Success) { return [int]$match.Groups[1].Value }
     return -1
-}
-
-function Get-PushBinaryRows {
-    # Parse the BINARY section of a Push report into path + create/replace rows.
-    param([string]$Output)
-
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    $inSection = $false
-
-    foreach ($line in ($Output -split "`n")) {
-        $trimmed = $line.TrimEnd("`r")
-
-        if ($trimmed -eq 'BINARY') {
-            $inSection = $true
-            continue
-        }
-
-        if (-not $inSection) { continue }
-
-        if ($trimmed -match '^\s+(.+?)\s+\(binary (create|replace)\)\s*$') {
-            $rows.Add([pscustomobject]@{
-                Path = $matches[1].Trim()
-                Mode = $matches[2]
-            })
-            continue
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and $trimmed -notmatch '^\s') { break }
-    }
-
-    return $rows.ToArray()
-}
-
-function Get-ShortHash {
-    param([string]$Hash)
-
-    if ([string]::IsNullOrEmpty($Hash)) { return '<none>' }
-    if ($Hash.Length -le 12) { return $Hash }
-    return $Hash.Substring(0, 12)
 }
 
 function Get-RemoteFileContentSize {
@@ -379,7 +329,9 @@ try {
         -ProjectId $ProjectId `
         -AuthDir (Join-Path $env:APPDATA '.rundot') `
         -AuthPath (Join-Path $env:APPDATA '.rundot\studio-export.auth.json') `
-        -RundotCliSessionPath (Join-Path $env:APPDATA '.rundot\prod.session.json')
+        -RundotCliSessionPath (Join-Path $env:APPDATA '.rundot\prod.session.json') `
+        -WriteStatus ${function:Write-RundotAuthStatusLine} `
+        -ReadManualToken ${function:Read-RundotManualBearerToken}
 }
 catch {
     Write-Host ''
@@ -1012,6 +964,79 @@ if (-not $script:Aborted) {
                 -Detail ("no REFUSED row in the report; exit={0}, binary rows={1}, listed={2}, listed size={3}" -f `
                     $oversizePush.ExitCode, $oversizeRows.Count, $oversizeListed, $oversizeListedSize)
         }
+    }
+
+    # ---------------------------------------------------------------------
+    # Init FromRemote with an oversize file already on Studio (#82). The
+    # reporter's failure was Init aborting after a successful snapshot when
+    # spellCasting.fbx (or any >2 MB file) was listed but never staged.
+    # ---------------------------------------------------------------------
+    if ($oversizeOk) {
+        $init82Dir = Join-Path $scratchRoot 'init-82-oversize-remote'
+        if (Test-Path -LiteralPath $init82Dir) {
+            Remove-Item -LiteralPath $init82Dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Force -Path $init82Dir | Out-Null
+
+        $init82Result = Invoke-SyncCli -CliArgs @(
+            '-ProjectId', $ProjectId, '-LocalDir', $init82Dir,
+            '-Command', 'Init', '-InitMode', 'FromRemote'
+        )
+        $init82Output = [string]$init82Result.Output
+        $init82BasePath = Join-Path $init82Dir '.rundot-sync\base-manifest.json'
+        $init82OversizeLocal = ConvertTo-LocalFullPath `
+            -WorkspaceRoot $init82Dir `
+            -CanonicalPath $oversizeCanonical
+
+        $init82Base = $null
+        $init82BaseHasOversize = $false
+        if (Test-Path -LiteralPath $init82BasePath) {
+            $init82Base = Read-BaseManifest -WorkspaceRoot $init82Dir
+            if ($null -ne $init82Base -and $null -ne $init82Base.files) {
+                foreach ($prop in @($init82Base.files.PSObject.Properties)) {
+                    if ([string]$prop.Name -eq $oversizeCanonical) {
+                        $init82BaseHasOversize = $true
+                    }
+                }
+            }
+        }
+
+        $init82Ok = ($init82Result.ExitCode -eq 0) `
+            -and ($null -ne $init82Base) `
+            -and ($init82Output -notmatch 'missing from staging') `
+            -and ($init82Output -match '(?i)not downloaded') `
+            -and ($init82Output -match '(?i)not tracked in BASE') `
+            -and ($init82Output -match [regex]::Escape($oversizeCanonical)) `
+            -and (-not (Test-Path -LiteralPath $init82OversizeLocal)) `
+            -and (-not $init82BaseHasOversize)
+
+        Add-Step -Name 'Init FromRemote into fresh dir with oversize on Studio (#82)' `
+            -Status $(if ($init82Ok) { 'PASS' } else { 'FAIL' }) `
+            -Detail ("exit={0}, BASE={1}, oversize local={2}, oversize in BASE={3}" -f `
+                $init82Result.ExitCode, `
+                ($(if ($null -ne $init82Base) { 'yes' } else { 'no' })), `
+                (Test-Path -LiteralPath $init82OversizeLocal), `
+                $init82BaseHasOversize)
+
+        $plan82Result = Invoke-SyncCli -CliArgs @(
+            '-ProjectId', $ProjectId, '-LocalDir', $init82Dir, '-Command', 'Plan'
+        )
+        $plan82Unverifiable = Get-PlanCount -Output $plan82Result.Output -StatusName 'unverifiable'
+        $plan82Ok = ($plan82Result.ExitCode -eq 0) `
+            -and ($plan82Unverifiable -ge 1) `
+            -and ($plan82Result.Output -match [regex]::Escape($oversizeCanonical))
+
+        Add-Step -Name 'Plan on #82 workspace lists oversize as unverifiable (#57)' `
+            -Status $(if ($plan82Ok) { 'PASS' } else { 'FAIL' }) `
+            -Detail ("exit={0}, unverifiable={1}" -f $plan82Result.ExitCode, $plan82Unverifiable)
+    }
+    else {
+        Add-Step -Name 'Init FromRemote into fresh dir with oversize on Studio (#82)' `
+            -Status 'SKIP' `
+            -Detail 'oversize create did not succeed'
+        Add-Step -Name 'Plan on #82 workspace lists oversize as unverifiable (#57)' `
+            -Status 'SKIP' `
+            -Detail 'oversize create did not succeed'
     }
 }
 

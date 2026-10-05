@@ -5,6 +5,13 @@
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "Assert.ps1")
+. (Join-Path $PSScriptRoot "TestHelpers.ps1")
+
+foreach ($shadowName in @('Invoke-Utf8TextGet', 'Get-RemoteProjectFileList', 'Get-RemoteProjectFile')) {
+    if (Get-Command $shadowName -ErrorAction SilentlyContinue) {
+        throw "tests/TestHelpers.ps1 must not define $shadowName at file scope; it would shadow lib/RemoteApi.ps1."
+    }
+}
 
 $testFiles = @(
     Get-ChildItem `
