@@ -55,7 +55,7 @@ below.
 
 ## Studio's read limit (2,000,000 bytes)
 
-**Disclaimer.** A file already on Studio over 2 MB (2,000,000 bytes) cannot be downloaded or verified by this tool. Publishing a new binary over 2 MB is supported. Replacing one is not. The user-facing summary is in the [README](../README.md#large-files-studio-read-limit).
+**Disclaimer.** A file already on Studio over 2 MB (2,000,000 bytes) cannot be downloaded or verified by this tool. Publishing a new binary over 2 MB is supported. Replacing one is not. The user-facing summary is in the [README](../README.md#large-files-studio-read-limit) and the consolidated list is in [Known limitations](limitations.md).
 
 `GET /file` refuses any payload over **2,000,000 bytes** with HTTP 413
 `file too large to view`. That is a property of the read route, not of the place

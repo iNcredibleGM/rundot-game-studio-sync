@@ -316,7 +316,10 @@ Two limits remain, and they are read-side:
    pre-overwrite backup and the `expectedRemoteHash` gate, so an oversize
    **replace** stays refused. The refusal is now specific about which of the two
    it is (`Get-SyncOversizeReplaceRefusalReason`), so a create is never turned
-   away for a replace-only reason.
+   away for a replace-only reason. The replace sequence itself has no size
+   obstacle up to the upload ceiling, and what a replace *can* prove without
+   the old bytes is measured in
+   [large-file-protocol.md](large-file-protocol.md).
 
 MD5 is weaker than the SHA-256 used everywhere else, so adopting it trades
 collision resistance for the ability to verify at all. That trade belongs in an

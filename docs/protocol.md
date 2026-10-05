@@ -136,3 +136,15 @@ flow strips) and any nested path, but the server does not uniformly guard
 reserved paths (`/.rundot-sync/…` and `/.rundot/…` returned `200` while
 `/.git/…` returned `404`), so the client-side rule stays load-bearing. Nothing
 in the product calls these routes.
+
+## Large files and the upload ceiling
+
+Status: measured in [large-file-protocol.md](large-file-protocol.md). The
+`upload-url` declaration is capped at **52,428,800 bytes (50 MiB)** — one byte
+over is `413 FILE_TOO_LARGE` before any byte moves — so a 200 MB upload is not
+possible on this route. A full 50 MiB body places successfully and its presigned
+`PUT` `ETag` is still a plain MD5 of the stored bytes, so the #54 ETag verify
+extends to the whole ceiling. Above Studio's 2,000,000-byte **read** limit,
+`GET /file` stays `413` and the `PUT /file` limit is checked against the
+**stored** file rather than the incoming body, which makes a text file placed
+over 2,000,000 bytes un-editable in place.

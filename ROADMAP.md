@@ -151,3 +151,9 @@ Deferred to a later milestone: nested `.gitignore` files, negation / re-include 
 - content merge of a conflict
 - publish a detected rename as `POST /move` when delete-plus-create is the wrong shape
 - distributed / multi-machine BASE
+- large binary replace up to 50 MiB — delete-then-place with the upload `ETag` as the post-place identity, and the `GET /files` size as the only pre-replace guard. Trades the backup and the `expectedRemoteHash` gate for the ability to replace at all ([large-file-protocol.md](docs/large-file-protocol.md))
+- a named refusal for text over 2,000,000 bytes, stating that the path would be write-once ([large-file-protocol.md](docs/large-file-protocol.md))
+
+The 2 MB read limit itself is not on this list: no route was found that returns
+the bytes, so a file already on Studio over 2 MB stays unverifiable. See
+[docs/limitations.md](docs/limitations.md).
