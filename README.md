@@ -2,6 +2,13 @@
 
 Unofficial tool for syncing a RUN Game Studio project with a local directory.
 
+> **Read this before trusting a fresh `Init` or `Pull`.** Studio will not serve
+> a file over **2 MB**, so this tool cannot download or re-verify one. Those
+> paths are reported and skipped — which means **a synced local tree can be
+> incomplete**, and nothing about the folder says so. On a 3D project that is
+> often an `.fbx` or `.glb`. See **[Known limitations](docs/limitations.md)**
+> for the full list, with the evidence behind each one.
+
 > This project is not affiliated with or endorsed by RUN, RUN.game, Series, Inc., or the maintainers of the official `rundot` CLI.
 
 ## What it does
@@ -465,6 +472,8 @@ This tool only records a path as synced when it has verified the exact bytes. It
 - Treating an oversized remote file as in sync. `Plan` lists it under `UNVERIFIABLE`.
 
 Keep large assets (for example a `.fbx` or `.glb` over that size) in the local tree or another store you already trust. Studio can hold a copy you uploaded, but this client cannot fetch that copy back.
+
+This section is the user-facing summary. The consolidated list — read limit, write limits, sync semantics, and platform — is in **[Known limitations](docs/limitations.md)**.
 
 ## Not in this version
 

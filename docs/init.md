@@ -201,7 +201,7 @@ never mask that error.
 
 `GET /file` returns HTTP 413 `file too large to view` for any payload over **2 MB (2,000,000 bytes)**. Exactly 2,000,000 bytes still reads; 2,000,001 does not. No other read route is known, and the refusal is not changed by request headers or by `POST` on the same URL. `Init -InitMode FromRemote` therefore does not download those paths and does not write them into BASE. It reports each one by path and listed size and still records every file it could verify. `Init -InitMode Adopt` reports the same paths as `Unverifiable` and does not record them as identical.
 
-A later `Plan` lists them under `UNVERIFIABLE`. `Pull` does not download them. `Push` can publish a **new** binary over the limit (verified from the upload `ETag`) and refuses to replace one that is already over the limit. See [README](../README.md#large-files-studio-read-limit) and [protocol.md](protocol.md).
+A later `Plan` lists them under `UNVERIFIABLE`. `Pull` does not download them. `Push` can publish a **new** binary over the limit (verified from the upload `ETag`) and refuses to replace one that is already over the limit. See [Known limitations](limitations.md), [README](../README.md#large-files-studio-read-limit), and [protocol.md](protocol.md).
 
 ## Limitation: API hash fields
 
