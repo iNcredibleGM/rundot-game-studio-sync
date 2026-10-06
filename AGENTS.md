@@ -4,7 +4,7 @@ Before changing this repository, **read [CONTRIBUTING.md](CONTRIBUTING.md) and f
 
 ## Must follow
 
-- Branch from the current **milestone integration branch** (`v0.3.1` for issues #64, #66–#75). Never branch milestone work from `main` while that milestone is in progress.
+- Branch from the current **milestone integration branch** (`v0.3.2` for issues #90–#93). Never branch milestone work from `main` while that milestone is in progress.
 - Name issue branches `issue/<number>-<short-slug>`. Open pull requests against the integration branch, not `main`.
 - Ship a completed milestone per [docs/releasing.md](docs/releasing.md): one PR `vX.Y.Z` → `main`, then tag, GitHub Release, close the milestone, cut the next integration branch. Do not land unfinished milestone work on `main`. Do not tag `main` before the ship PR merges.
 - Windows PowerShell 5.1 is the compatibility baseline.

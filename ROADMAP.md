@@ -145,7 +145,31 @@ Deferred to a later milestone: nested `.gitignore` files, negation / re-include 
 
 Shipped on `main`.
 
-## After v0.3.1
+## v0.3.2 - Pull parity and follow-ups
+
+Patch on v0.3.1. Two directions of work: make `Pull` match `Push`, and be honest about large files.
+
+**Pull parity** ([#90](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/90)). `Pull` is deliberately narrow — it applies only clean remote-only rows and reports everything else. That is the right default, but it leaves two gaps against `Push`:
+
+1. A `conflict` row has no direction, so a local file that also changed in Studio can never be brought up to Studio's bytes. `Pull -RemoteWins` adds the confirmed replace mode that mirrors `Push -LocalWins` — backup first, concurrent-edit guard before each write, and defined BASE-update and rollback semantics. It never deletes and never rebuilds the tree; `Init -InitMode FromRemote` stays the only reset path.
+2. `Push` gates on the last `Plan` artifact (`.rundot-sync/last-plan.json`); `Pull` does not. `Pull` reads and re-verifies the same artifact, so a pull changelist can be previewed, confirmed, and applied against one fingerprint set.
+
+Neither ask mutates Studio. Both stay GET-only toward Studio.
+
+**Large-file honesty.** Two follow-ups carved out of the tracked read-limit gap ([#87](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/87)):
+
+3. A **named refusal for text over 2,000,000 bytes** ([#91](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/91)) — states that the path would be write-once, instead of an opaque 413.
+4. **Large binary replace up to 50 MiB** ([#92](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/92)) — confirmed, opt-in delete-then-place with the upload `ETag` as the post-place identity and the `GET /files` size as the only pre-replace guard. It trades the backup and the `expectedRemoteHash` gate for the ability to replace at all, so it is never the default.
+
+The 2 MB read limit itself is **not** addressed: no route returns the bytes. [#87](https://github.com/iNcredibleGM/rundot-game-studio-sync/issues/87) stays open as the tracked capability gap.
+
+**Hard ban:** no new Studio write route. `Pull` adds no mutation, and #92 composes the existing delete route and the proven place-at-path sequence.
+
+Milestone: [v0.3.2 - Pull parity and follow-ups](https://github.com/iNcredibleGM/rundot-game-studio-sync/milestone/6)
+
+**Done when** a workspace with a conflict can preview and apply a pull that replaces the local bytes with Studio's and backs the original up first; `Pull` refuses or warns on a missing, expired, or drifted `last-plan.json`, matching `Push`'s gate; text over 2 MB is refused with a named write-once reason; a confirmed large-binary replace between 2 MB and 50 MiB places and verifies from the `ETag`; and the mutation grep and `NoRemoteMutation.Tests.ps1` are still green.
+
+## After v0.3.2
 
 - browser bootstrap / bookmarklet helper
 - official `rundot` CLI refresh-token handling beyond the current fresh-access-token path
