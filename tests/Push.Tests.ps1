@@ -26,6 +26,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\RemoteUpload.ps1")
 . (Join-Path $repoRoot "lib\RemoteMove.ps1")
 . (Join-Path $repoRoot "lib\RemoteTextCreate.ps1")
+. (Join-Path $repoRoot "lib\RemoteBinaryPlace.ps1")
 . (Join-Path $repoRoot "lib\Push.ps1")
 
 $pushTestShaA = 'a' * 64
@@ -1647,6 +1648,121 @@ try {
         -Local $lwLocal `
         -Remote $lwRemote
     Assert-Equal 0 $defaultStill.Actions.Count 'default Push must still refuse conflict overwrites'
+
+    # --------------------------------------------------------------------------
+    # Binary remote delete (#95): a delete row must carry the remote kind so a
+    # binary path backs up and re-reads through the binary reader, never the
+    # utf8 one that hard-refuses non-utf8 content.
+    # --------------------------------------------------------------------------
+
+    $binDeleteWorkspace = New-PushTestWorkspace -Root $pushTestRoot
+    $binDeletePath = 'public/stale.png'
+    $binDeleteBytes = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0x10, 0x7F)
+    $binDeleteStaging = Join-Path $pushTestRoot ("bin-del-" + [Guid]::NewGuid().ToString('N') + '.bin')
+    Write-PushTestBytes -LiteralPath $binDeleteStaging -Bytes $binDeleteBytes
+    $binDeleteSha = (Get-LocalFileIdentity -LiteralPath $binDeleteStaging).Sha256
+    $binDeleteBase64 = [Convert]::ToBase64String($binDeleteBytes)
+
+    $binBase = @{ $binDeletePath = (New-PushTestBaseEntry -Sha256 $binDeleteSha -Kind 'binary') }
+    $binLocal = @{}
+    $binRemote = @{ $binDeletePath = (New-PushTestRemoteEntry -Sha256 $binDeleteSha -Kind 'binary' -Encoding 'base64') }
+
+    Save-BaseManifest `
+        -WorkspaceRoot $binDeleteWorkspace `
+        -ProjectId $pushTestProjectId `
+        -Files $binBase
+
+    $binArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $binDeleteWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local $binLocal) `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path $binDeletePath `
+                -Status 'deleteRemoteCandidate' `
+                -Applicable $true `
+                -LocalSha256 $null `
+                -RemoteSha256 $binDeleteSha `
+                -ExpectedRemoteHash $binDeleteSha `
+                -Kind 'binary')
+        )
+
+    # Default Push: the delete action must carry the binary kind, taken from the
+    # live remote entry. Without it the backup reader falls back to utf8 and the
+    # whole push aborts (#95).
+    $binSelection = Get-SyncPushSelection `
+        -Artifact $binArtifact `
+        -Base $binBase `
+        -Local $binLocal `
+        -Remote $binRemote
+    Assert-Equal 1 $binSelection.DeleteActions.Count 'a binary delete candidate must select one delete action'
+    Assert-Equal 'binary' ([string]$binSelection.DeleteActions[0].Kind) 'a binary delete action must carry the binary kind (#95)'
+
+    # Local-wins: a remote-only binary path offered for deletion must carry the
+    # binary kind too, so the same reader selection applies.
+    $binRemoteOnlyPath = 'public/remote-only.png'
+    $binLwArtifact = New-PushTestArtifact `
+        -WorkspaceRoot $binDeleteWorkspace `
+        -LocalManifestHash (Get-SyncLocalManifestFingerprint -Local @{}) `
+        -Operations @(
+            (New-PushTestPlanOperation `
+                -Path $binRemoteOnlyPath `
+                -Status 'download' `
+                -Applicable $true `
+                -LocalSha256 $null `
+                -RemoteSha256 $binDeleteSha `
+                -ExpectedRemoteHash $binDeleteSha `
+                -Kind 'binary')
+        )
+    $binLwSelection = Get-SyncPushLocalWinsSelection `
+        -Artifact $binLwArtifact `
+        -Base @{} `
+        -Local @{} `
+        -Remote @{ $binRemoteOnlyPath = (New-PushTestRemoteEntry -Sha256 $binDeleteSha -Kind 'binary' -Encoding 'base64') }
+    $binLwDelete = @($binLwSelection.DeleteActions | Where-Object { [string]$_.Path -eq $binRemoteOnlyPath })
+    Assert-Equal 1 $binLwDelete.Count 'local-wins must offer a remote-only binary path for deletion'
+    Assert-Equal 'binary' ([string]$binLwDelete[0].Kind) 'a local-wins binary delete must carry the binary kind (#95)'
+
+    # Apply: a binary delete must back up the exact remote bytes through the
+    # binary reader, send DELETE, and prove the path gone.
+    $script:PushTestBinDeleteCalls = 0
+    $binApplyResult = Invoke-RundotSyncPushApply `
+        -WorkspaceRoot $binDeleteWorkspace `
+        -Actions @() `
+        -DeleteActions @(
+            [pscustomobject]@{
+                Path               = $binDeletePath
+                Kind               = 'binary'
+                ExpectedRemoteHash = $binDeleteSha
+                RemoteSha256       = $binDeleteSha
+            }
+        ) `
+        -StudioOrigin $pushTestOrigin `
+        -ProjectId $pushTestProjectId `
+        -Headers $headers `
+        -GetRemoteFile {
+            param($Origin, $Id, $ApiPath, $Hdr)
+            return [pscustomobject]@{ encoding = 'base64'; content = $binDeleteBase64 }
+        } `
+        -DeleteRemoteFile {
+            param($Origin, $Id, $Canonical, $Hdr)
+            $script:PushTestBinDeleteCalls++
+            return [pscustomobject]@{ success = $true }
+        } `
+        -GetRemoteFileList {
+            param($Origin, $Id, $Hdr)
+            return [pscustomobject]@{ files = @() }
+        }
+
+    Assert-Equal 1 $script:PushTestBinDeleteCalls 'a binary delete must send DELETE'
+    Assert-Equal 1 $binApplyResult.Deleted 'a binary delete must count as deleted'
+    $binBackupPath = Join-Path $binApplyResult.BackupSet.Path ($binDeletePath.Replace('/', '\'))
+    Assert-True `
+        (Test-Path -LiteralPath $binBackupPath -PathType Leaf) `
+        'a binary delete must back up the remote original before DELETE'
+    Assert-Equal `
+        $binDeleteBytes `
+        (Get-PushTestBytes -LiteralPath $binBackupPath) `
+        'the binary delete backup must hold the exact remote bytes'
 
     # --------------------------------------------------------------------------
     # Oversized binaries at Push: create allowed, replace refused (#51, #54)

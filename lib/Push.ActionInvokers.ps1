@@ -257,14 +257,28 @@ function Invoke-RundotSyncDeleteAction {
 
     # Re-read the remote bytes and compare to expectedRemoteHash immediately
     # before the request. This is the only guard a delete can have: If-Match is
-    # ignored, so the server cannot refuse a stale delete for us.
-    $null = Get-SyncPushVerifiedRemoteResponse `
-        -Path $path `
-        -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
-        -StudioOrigin $StudioOrigin `
-        -ProjectId $ProjectId `
-        -Headers $Headers `
-        -GetRemoteFile $GetRemoteFile
+    # ignored, so the server cannot refuse a stale delete for us. A binary
+    # remote path must use the binary reader, which accepts base64; the utf8
+    # reader hard-refuses it (#95).
+    $kind = [string]$Action.Kind
+    if ($kind -eq 'binary') {
+        $null = Get-SyncPushVerifiedBinaryRemoteResponse `
+            -Path $path `
+            -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile
+    }
+    else {
+        $null = Get-SyncPushVerifiedRemoteResponse `
+            -Path $path `
+            -ExpectedRemoteHash ([string]$Action.ExpectedRemoteHash) `
+            -StudioOrigin $StudioOrigin `
+            -ProjectId $ProjectId `
+            -Headers $Headers `
+            -GetRemoteFile $GetRemoteFile
+    }
 
     if ($null -eq $DeleteRemoteFile) {
         $DeleteRemoteFile = {
