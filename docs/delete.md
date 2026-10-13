@@ -92,10 +92,21 @@ paths are offered for deletion; it never weakens the check before one is sent.
 
 ## Refused paths
 
-Two path shapes are refused before any request. Neither is a server-side
+Two path **shapes** are refused before any request. Neither is a server-side
 protection: the protocol record shows a directory-shaped path returns the same
 `404` as an absent path, and the server accepted a move onto `/.rundot-sync/`
 and `/.rundot/`, so the reserved-path rule is load-bearing.
+
+These two shapes are the only delete-specific refusals. **Remote content is not
+a refusal.** A delete row carries the remote `kind`, so a binary remote path
+(e.g. a `.png` or a vendored `.tgz`) backs up and re-reads through the binary
+reader — `Get-SyncPushVerifiedBinaryRemoteResponse`, which accepts a `base64`
+payload — instead of the utf8 reader, which hard-refuses any non-utf8 content.
+Before #95 a delete row carried no `kind`, so every delete took the utf8 reader
+and one binary path aborted the whole push with `remote content is not utf8`.
+That reader is bounded by Studio's 2,000,000-byte read limit like any other
+read, so a binary remote **over** that limit is classified `unverifiable` and is
+never offered for deletion ([limitations.md](limitations.md)).
 
 | Path shape | Why it is refused |
 | --- | --- |

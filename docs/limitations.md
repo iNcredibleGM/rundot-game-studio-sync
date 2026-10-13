@@ -60,6 +60,11 @@ assets in the local tree or another store you already trust.
   `Push -LocalWins` replaces remote bytes with local bytes; it does not merge.
 - **No automatic deletion.** `deleteLocalCandidate` leaves the local file in
   place. A remote delete happens only through a confirmed `Push`.
+- **A remote delete is kind-aware.** A delete row carries the remote `kind`, so
+  a binary remote path backs up and re-reads through the binary reader rather
+  than the utf8 one (#95); binary remote content is not a refusal. Studio's
+  2,000,000-byte read limit still bounds it, so a binary remote over that limit
+  is `unverifiable` and is never offered for deletion.
 - **One workspace belongs to one project and one folder.** There is no
   multi-machine BASE.
 - **`Push` consumes the last `Plan` artifact.** A plan is a point-in-time

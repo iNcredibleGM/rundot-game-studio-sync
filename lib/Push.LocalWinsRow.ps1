@@ -37,6 +37,7 @@ function Get-SyncPushLocalWinsStandardDeleteRow {
         -Status $Status `
         -ExpectedRemoteSha $ExpectedRemoteSha `
         -LiveRemoteSha $liveRemoteSha `
+        -Kind ([string](Get-SyncEntryKind -Entry $RemoteEntry)) `
         -RemotePaths $RemotePaths)
 }
 

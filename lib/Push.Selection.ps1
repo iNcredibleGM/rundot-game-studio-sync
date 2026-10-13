@@ -120,16 +120,15 @@ function Add-SyncPushDeleteSelectionRow {
         )
     }
 
-    # Defense in depth: the plan already refused a reserved or
-    # directory-shaped path, and the engine refuses it again against
-    # the live remote list rather than trusting the artifact.
-    Assert-SyncDeletePathAllowed `
-        -CanonicalPath $Path `
-        -RemotePaths $RemotePaths
+    # Defense in depth: the plan already refused a reserved or directory-shaped
+    # path, and the engine refuses it again against the live remote list.
+    Assert-SyncDeletePathAllowed -CanonicalPath $Path -RemotePaths $RemotePaths
 
+    # Carry the remote kind: a binary delete takes the binary reader (#95).
     [void]$DeletesList.Add([pscustomobject]@{
         Path               = $Path
         Status             = $Status
+        Kind               = [string](Get-SyncEntryKind -Entry $RemoteEntry)
         ExpectedRemoteHash = $expectedRemoteSha
         RemoteSha256       = $liveRemoteSha
         RemotePaths        = @($RemotePaths)

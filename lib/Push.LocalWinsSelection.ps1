@@ -44,6 +44,7 @@ function Add-SyncPushLocalWinsDeleteAction {
         [string]$Status,
         [string]$ExpectedRemoteSha,
         [string]$LiveRemoteSha,
+        [string]$Kind,
         [object[]]$RemotePaths
     )
 
@@ -62,9 +63,11 @@ function Add-SyncPushLocalWinsDeleteAction {
         return ("REMOTE for '{0}' no longer matches expectedRemoteHash. Re-run Plan." -f $Path)
     }
 
+    # Carry the remote kind: a binary delete takes the binary reader (#95).
     [void]$DeletesList.Add([pscustomobject]@{
         Path               = $Path
         Status             = $Status
+        Kind               = $Kind
         ExpectedRemoteHash = $ExpectedRemoteSha
         RemoteSha256       = $LiveRemoteSha
         RemotePaths        = @($RemotePaths)
@@ -105,6 +108,7 @@ function Get-SyncPushLocalWinsRemoteOnlyDownloadRow {
         -Status $status `
         -ExpectedRemoteSha $expectedRemoteSha `
         -LiveRemoteSha $liveRemoteSha `
+        -Kind ([string](Get-SyncEntryKind -Entry $remoteEntry)) `
         -RemotePaths $RemotePaths)
 }
 
