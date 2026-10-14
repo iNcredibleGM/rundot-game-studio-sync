@@ -9,7 +9,7 @@
 # Manifest.ps1, Snapshot.ps1, and Classifier.ps1 first.
 
 $script:SyncPlanArtifactSchemaVersion = 1
-$script:SyncPlanDefaultTtlMinutes = 20
+$script:SyncPlanDefaultTtlMinutes = if ($env:RUNDOT_SYNC_PLAN_TTL_MINUTES) { [double]$env:RUNDOT_SYNC_PLAN_TTL_MINUTES } else { 20 }
 
 # Push consumes plan fingerprints but a plan is never permission to write.
 # Applicability for text overwrites, text creates, binary places, and remote
@@ -350,7 +350,7 @@ function New-RundotSyncPlanArtifact {
         [Parameter(Mandatory)]
         $Snapshot,
 
-        [double]$TtlMinutes = 20
+        [double]$TtlMinutes = $script:SyncPlanDefaultTtlMinutes
     )
 
     $baseMap = Get-SyncPlanBaseMapFromResolution -Resolution $Resolution
@@ -877,7 +877,7 @@ function New-RundotSyncPlanAnalysis {
 
         [switch]$PersistArtifact,
 
-        [double]$TtlMinutes = 20,
+        [double]$TtlMinutes = $script:SyncPlanDefaultTtlMinutes,
 
         [object[]]$Changes = $null
     )
