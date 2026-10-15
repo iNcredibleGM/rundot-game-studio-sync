@@ -9,7 +9,28 @@
 # Manifest.ps1, Snapshot.ps1, and Classifier.ps1 first.
 
 $script:SyncPlanArtifactSchemaVersion = 1
-$script:SyncPlanDefaultTtlMinutes = if ($env:RUNDOT_SYNC_PLAN_TTL_MINUTES) { [double]$env:RUNDOT_SYNC_PLAN_TTL_MINUTES } else { 20 }
+$script:SyncPlanBuiltInTtlMinutes = 20
+
+function Get-SyncPlanDefaultTtlMinutes {
+    # The plan TTL default, overridable through RUNDOT_SYNC_PLAN_TTL_MINUTES so one
+    # large publish can fit one pass (#100). Validated, not cast: this library is
+    # dot-sourced, so a bad value must refuse by name, not abort every command.
+    $raw = [string]$env:RUNDOT_SYNC_PLAN_TTL_MINUTES
+    if ([string]::IsNullOrWhiteSpace($raw)) { return [double]$script:SyncPlanBuiltInTtlMinutes }
+    $parsed = 0.0
+    $ok = [double]::TryParse(
+        $raw.Trim(),
+        [System.Globalization.NumberStyles]::Float,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$parsed
+    )
+    if (-not $ok -or $parsed -le 0 -or [double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {
+        throw [System.InvalidOperationException]::new(
+            ("RUNDOT_SYNC_PLAN_TTL_MINUTES must be a positive number of minutes; got '{0}'." -f $raw)
+        )
+    }
+    return [double]$parsed
+}
 
 # Push consumes plan fingerprints but a plan is never permission to write.
 # Applicability for text overwrites, text creates, binary places, and remote
@@ -350,7 +371,7 @@ function New-RundotSyncPlanArtifact {
         [Parameter(Mandatory)]
         $Snapshot,
 
-        [double]$TtlMinutes = $script:SyncPlanDefaultTtlMinutes
+        [double]$TtlMinutes = (Get-SyncPlanDefaultTtlMinutes)
     )
 
     $baseMap = Get-SyncPlanBaseMapFromResolution -Resolution $Resolution
@@ -877,7 +898,7 @@ function New-RundotSyncPlanAnalysis {
 
         [switch]$PersistArtifact,
 
-        [double]$TtlMinutes = $script:SyncPlanDefaultTtlMinutes,
+        [double]$TtlMinutes = (Get-SyncPlanDefaultTtlMinutes),
 
         [object[]]$Changes = $null
     )
