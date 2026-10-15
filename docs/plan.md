@@ -187,6 +187,12 @@ console header. The TTL is an engine parameter, not a command-line flag. An
 expired plan is stale: REMOTE is a point-in-time observation, and a future
 `Apply` must re-check rather than trust it.
 
+The default is overridable with the `RUNDOT_SYNC_PLAN_TTL_MINUTES` environment
+variable (a positive number of minutes) so one large publish can fit a single
+pass. A malformed, zero, or negative value is refused with a named message. The
+override changes only how long a plan stays fresh; `Push` still re-verifies every
+fingerprint below before any write, so a longer window never skips a check.
+
 ### Plan artifact evidence
 
 `Push` consumes this artifact and re-verifies every fingerprint before any

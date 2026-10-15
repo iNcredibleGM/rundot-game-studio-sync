@@ -319,6 +319,55 @@ try {
         "the default plan TTL must be 20 minutes"
     Assert-True ($expiresAt -gt $createdAt) "expiresAt must be after createdAt"
 
+    # The default TTL is overridable through RUNDOT_SYNC_PLAN_TTL_MINUTES (#100).
+    # A valid override flows into a plan built without an explicit TtlMinutes.
+    $savedTtlOverride = $env:RUNDOT_SYNC_PLAN_TTL_MINUTES
+    try {
+        $env:RUNDOT_SYNC_PLAN_TTL_MINUTES = '90'
+        Assert-Equal 90 (Get-SyncPlanDefaultTtlMinutes) `
+            "a valid override must be read as minutes"
+
+        $overridden = New-RundotSyncPlanArtifact `
+            -WorkspaceRoot $artifactWorkspace `
+            -ProjectId 'proj-test-1' `
+            -Resolution $resolution `
+            -Local $localMap `
+            -Remote $remoteMap `
+            -Snapshot $snapshot
+        Assert-Equal `
+            90 `
+            ([math]::Round(
+                ([System.DateTime]::Parse($overridden.expiresAt) - [System.DateTime]::Parse($overridden.createdAt)).TotalMinutes,
+                3)) `
+            "the override must control the default expiresAt"
+
+        # A malformed or non-positive value is a configuration error, refused by
+        # name rather than surfaced as a raw cast failure at load time.
+        foreach ($badValue in @('twenty', '', '   ', '0', '-5', 'NaN', 'Infinity')) {
+            $env:RUNDOT_SYNC_PLAN_TTL_MINUTES = $badValue
+            $refused = $false
+            try {
+                $null = Get-SyncPlanDefaultTtlMinutes
+            }
+            catch {
+                $refused = $true
+                Assert-True `
+                    ([string]$_.Exception.Message -match 'RUNDOT_SYNC_PLAN_TTL_MINUTES') `
+                    "a bad TTL value must refuse by name (got '$badValue')"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($badValue)) {
+                Assert-True (-not $refused) "an empty TTL override must fall back to the default"
+            }
+            else {
+                Assert-True $refused "a TTL override of '$badValue' must be refused"
+            }
+        }
+    }
+    finally {
+        $env:RUNDOT_SYNC_PLAN_TTL_MINUTES = $savedTtlOverride
+    }
+
     $shortTtl = New-RundotSyncPlanArtifact `
         -WorkspaceRoot $artifactWorkspace `
         -ProjectId 'proj-test-1' `
