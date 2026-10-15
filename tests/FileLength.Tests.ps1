@@ -20,7 +20,7 @@ $fileAllowlist = @{
     'lib/Init.ps1'               = 719
     'lib/Plan.ps1'               = 948
     'lib/Pull.ps1'               = 1082
-    'lib/RemoteBinaryPlace.ps1'  = 848
+    'lib/RemoteBinaryPlace.ps1'  = 821
     'lib/Snapshot.ps1'           = 603
     'game-studio-export.ps1'     = 779
     'game-studio-sync.ps1'       = 1124
@@ -31,8 +31,8 @@ $functionAllowlist = @{
     'lib/Plan.ps1::Get-SyncPlanOperationRows'          = 152
     'lib/Pull.ps1::Invoke-RundotSyncPullApply'         = 216
     'lib/Pull.ps1::Invoke-RundotSyncPull'              = 256
-    'lib/RemoteBinaryPlace.ps1::Assert-RemoteBinaryPlaceStepGate' = 155
-    'lib/RemoteBinaryPlace.ps1::Invoke-RemoteBinaryPlaceSequence' = 286
+    'lib/RemoteBinaryPlace.ps1::Assert-RemoteBinaryPlaceStepGate' = 154
+    'lib/RemoteBinaryPlace.ps1::Invoke-RemoteBinaryPlaceSequence' = 260
     'game-studio-sync.ps1::Invoke-SyncPushCommand'     = 172
 }
 
