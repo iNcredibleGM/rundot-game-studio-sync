@@ -825,13 +825,10 @@ function Format-SyncPullReport {
 }
 
 function Invoke-RundotSyncPull {
-    # Pull entrypoint. Selects clean downloads, confirms any overwrite, applies
-    # them with backups, verifies the result, and only then updates BASE.
-    #
-    # -ConfirmOverwrite is called with the overwrite count and paths and must
-    # return $true to proceed. -Force skips that call but never the backup.
-    # With overwrites to make and neither -Force nor a confirm callback, this
-    # fails closed: it aborts rather than writing without consent.
+    # Pull entrypoint. Selects the run's actions (clean downloads, or the
+    # confirmed replaces -RemoteWins adds), confirms any overwrite, applies them
+    # with backups, verifies the result, and only then updates BASE.
+    # -Force skips the prompt but never the backup; with neither, it fails closed.
     param(
         [Parameter(Mandatory)]
         [string]$WorkspaceRoot,
@@ -852,10 +849,13 @@ function Invoke-RundotSyncPull {
 
         [switch]$Force,
 
-        [string]$BackupSetPath
+        [string]$BackupSetPath,
+
+        [switch]$RemoteWins
     )
 
-    $selection = Get-SyncPullSelection `
+    $selection = Get-SyncPullRemoteWinsSelectionForRun `
+        -RemoteWins:$RemoteWins `
         -Base (Get-SyncPlanBaseMapFromResolution -Resolution $Resolution) `
         -Local $Local `
         -Remote $Remote

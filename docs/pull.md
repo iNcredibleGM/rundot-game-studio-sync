@@ -10,7 +10,34 @@ after the result is verified.
 ```powershell
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull
 .\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull -ForcePull
+.\game-studio-sync.ps1 -ProjectId <id> -LocalDir <dir> -Command Pull -RemoteWins
 ```
+
+## -RemoteWins
+
+By default `Pull` applies exactly one classification: a clean remote-only change
+(`BASE=A LOCAL=A REMOTE=B`). A **conflict** (`BASE=A LOCAL=B REMOTE=C`) has no
+direction, so a local file that also changed in Studio can never be brought up
+to Studio's bytes. `-RemoteWins` is the confirmed replace mode for exactly that
+row — the mirror of `Push -LocalWins`, in the opposite direction.
+
+It is a *pull*, not a *reset*:
+
+- It replaces LOCAL with REMOTE bytes for a conflict whose **both sides are
+  present** and whose kind did not change. That is the only in-scope status.
+- It **never deletes** a local-only file, or anything else, locally or remotely.
+  A local-only change (`upload`) is reported and left alone.
+- It does **not** rebuild the tree. `Init -InitMode FromRemote` remains the only
+  reset path.
+- Every replaced local file is **backed up** to `.rundot-sync/backups/<timestamp>/`
+  before it is written, the **concurrent-edit guard** still runs immediately
+  before each write, and a declined prompt changes nothing.
+- It prints one combined list and confirms once, matching `Push -LocalWins`.
+- It never mutates Studio. Like plain `Pull`, it is GET-only.
+
+BASE moves for a replaced path only after the written bytes are re-verified,
+exactly as for a clean download. A path that is out of scope keeps its existing
+BASE entry untouched.
 
 ## What a run does
 

@@ -28,7 +28,11 @@ param(
     [switch]$ConfirmPush,
 
     # Push only: publish local bytes over conflicts and remote-only paths.
-    [switch]$LocalWins
+    [switch]$LocalWins,
+
+    # Pull only: replace the local copy of a both-changed path with Studio's
+    # bytes, after a backup. Never deletes; never rebuilds the tree.
+    [switch]$RemoteWins
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,6 +106,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.PlanGate.ps1")
+. (Join-Path $PSScriptRoot "lib\Pull.RemoteWinsSelection.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteDelete.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteUpload.ps1")
@@ -369,7 +374,6 @@ function Read-RundotSyncPullConfirmation {
     Write-Host ""
     Write-Host "Each one is copied into .rundot-sync/backups before it is replaced."
     Write-Host "Type 'yes' to continue. Anything else cancels the pull."
-
     $answer = $null
     try {
         $answer = Read-Host "Overwrite $OverwriteCount local file(s)?"
@@ -391,6 +395,7 @@ function Invoke-SyncPullCommand {
         [string]$WorkspaceRoot,
         [string]$StudioProjectId,
         [bool]$Force,
+        [bool]$RemoteWins,
         [string]$Origin,
         [string]$SyncAuthDir,
         [string]$SyncAuthPath,
@@ -476,6 +481,7 @@ function Invoke-SyncPullCommand {
             -Remote $snapshot.Files `
             -Snapshot $snapshot `
             -ConfirmOverwrite $ConfirmOverwrite `
+            -RemoteWins:$RemoteWins `
             -Force:$Force
 
         Write-Host ""
@@ -1044,7 +1050,6 @@ if ($Command -eq 'Init') {
         -RequestedInitMode $InitMode `
         -FromRemoteAlias ([bool]$FromRemote) `
         -InitModeSpecified $initModeSpecified
-
     Invoke-SyncInit `
         -WorkspaceRoot $LocalDir `
         -StudioProjectId $ProjectId `
@@ -1071,6 +1076,7 @@ if ($Command -eq 'Pull') {
         -WorkspaceRoot $LocalDir `
         -StudioProjectId $ProjectId `
         -Force ([bool]$ForcePull) `
+        -RemoteWins ([bool]$RemoteWins) `
         -Origin $StudioOrigin `
         -SyncAuthDir $AuthDir `
         -SyncAuthPath $AuthPath `
@@ -1096,21 +1102,13 @@ if ($Command -eq 'Push') {
         -CliSessionPath $RundotCliSessionPath
 }
 
-if ($ForcePull) {
-    Stop-WithUsageError "-ForcePull applies to Pull only."
-}
-
-if ($ForcePush) {
-    Stop-WithUsageError "-ForcePush applies to Push only."
-}
-
-if ($ConfirmPush) {
-    Stop-WithUsageError "-ConfirmPush applies to Push only."
-}
-
-if ($LocalWins) {
-    Stop-WithUsageError "-LocalWins applies to Push only."
-}
+foreach ($guard in @(
+    @{ Set = [bool]$ForcePull;   Message = '-ForcePull applies to Pull only.' },
+    @{ Set = [bool]$ForcePush;   Message = '-ForcePush applies to Push only.' },
+    @{ Set = [bool]$ConfirmPush; Message = '-ConfirmPush applies to Push only.' },
+    @{ Set = [bool]$LocalWins;   Message = '-LocalWins applies to Push only.' },
+    @{ Set = [bool]$RemoteWins;  Message = '-RemoteWins applies to Pull only.' }
+)) { if ($guard.Set) { Stop-WithUsageError $guard.Message } }
 
 Invoke-SyncPlanCommand `
     -SyncCommand $Command `
