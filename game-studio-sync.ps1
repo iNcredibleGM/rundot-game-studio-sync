@@ -101,6 +101,7 @@ $LocalDir = [System.IO.Path]::GetFullPath($LocalDir)
 . (Join-Path $PSScriptRoot "lib\Backup.ps1")
 . (Join-Path $PSScriptRoot "lib\Journal.ps1")
 . (Join-Path $PSScriptRoot "lib\Pull.ps1")
+. (Join-Path $PSScriptRoot "lib\Pull.PlanGate.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteWrite.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteDelete.ps1")
 . (Join-Path $PSScriptRoot "lib\RemoteUpload.ps1")
@@ -457,6 +458,13 @@ function Invoke-SyncPullCommand {
             -ShowProgress
 
         Write-Host "REMOTE: $($snapshot.Files.Count) file(s) captured."
+
+        # Plan artifact: advisory for Pull (#90, Ask 2). Named when it agrees;
+        # stated when stale/absent/unreadable, and the pull proceeds.
+        $planGateLine = Format-SyncPullPlanGateLine -WorkspaceRoot $WorkspaceRoot `
+            -ProjectId $StudioProjectId -Resolution $resolution `
+            -Local $localManifest -Remote $snapshot.Files -Snapshot $snapshot
+        if ($planGateLine) { Write-Host $planGateLine }
 
         # 4. Select, confirm, apply, verify, and update BASE. The engine
         #    aborts before writing if any overwrite cannot be confirmed.

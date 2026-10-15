@@ -23,6 +23,13 @@ after the result is verified.
    snapshot ([remote-snapshot.md](remote-snapshot.md)). The staged bytes it
    verified are what Pull writes.
 5. **Select.** Only a clean download may be applied (see below).
+   A **plan artifact** (`.rundot-sync/last-plan.json`) is advisory here, unlike
+   `Push` where it is a hard gate. When one is present and agrees with this run
+   — same project, workspace, BASE, and manifest hashes, and not expired — the
+   header names it. When it is absent, stale, or unreadable, the header says so
+   and the pull proceeds, so `Init` → `Pull` needs no fresh `Plan`. Pull's
+   staged bytes are verified by the snapshot independently, so a stale artifact
+   never widens what a pull may write.
 6. **Confirm.** If an existing local file would be replaced, Pull prints the
    count and requires confirmation.
 7. **Back up.** Every original that will be replaced is copied into a backup
