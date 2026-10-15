@@ -146,11 +146,10 @@ function Get-RemoteBinaryPlaceVerifiedRemoteResponse {
 }
 
 function Assert-RemoteBinaryPlaceStepGate {
-    # Re-verified immediately before every mutating step of a place. $LiveLocalManifest
-    # is the local manifest the caller already computed for this run; when it is
-    # supplied the gate fingerprints it instead of re-hashing the whole workspace
-    # (#59). The per-file drift check below still re-reads the one file being
-    # published, so a file that changed mid-run is still refused.
+    # Re-verified before the first mutating step and again just before the move.
+    # $LiveLocalManifest, when supplied, is the run's manifest; the gate
+    # fingerprints it instead of re-hashing the workspace (#59). The remote probe
+    # runs only for 'create'/'replaceBeforeDelete' (#97).
     param(
         [Parameter(Mandatory)]
         $Artifact,
@@ -171,7 +170,7 @@ function Assert-RemoteBinaryPlaceStepGate {
         [string]$LocalSha256,
 
         [Parameter(Mandatory)]
-        [ValidateSet('create', 'replaceBeforeDelete', 'replaceAfterDelete')]
+        [ValidateSet('create', 'replaceBeforeDelete', 'replaceAfterDelete', 'none')]
         [string]$RemoteCheck,
 
         [string]$ExpectedRemoteHash = $null,
@@ -488,19 +487,27 @@ function Invoke-RemoteBinaryPlaceSequence {
     $moveApplied = $false
 
     try {
-        Assert-RemoteBinaryPlaceStepGate `
-            -Artifact $Artifact `
-            -Resolution $Resolution `
-            -WorkspaceRoot $WorkspaceRoot `
-            -ProjectId $ProjectId `
-            -CanonicalPath $CanonicalPath `
-            -LocalSha256 $LocalSha256 `
-            -RemoteCheck 'create' `
-            -StudioOrigin $StudioOrigin `
-            -ProjectIdForRemote $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -LiveLocalManifest $LiveLocalManifest
+        # One splat for the four step gates below. Identity, freshness, and the
+        # local checks run at every gate; only the remote probe varies. The
+        # destination is proven absent once (pre-upload) and again just before the
+        # move, the only step that can collide — so the two mid-sequence probes are
+        # skipped as redundant (#97); the pre-move gate and the 409 still catch a
+        # destination that appears meanwhile.
+        $stepGate = @{
+            Artifact           = $Artifact
+            Resolution         = $Resolution
+            WorkspaceRoot      = $WorkspaceRoot
+            ProjectId          = $ProjectId
+            CanonicalPath      = $CanonicalPath
+            LocalSha256        = $LocalSha256
+            StudioOrigin       = $StudioOrigin
+            ProjectIdForRemote = $ProjectId
+            Headers            = $Headers
+            GetRemoteFile      = $GetRemoteFile
+            LiveLocalManifest  = $LiveLocalManifest
+        }
+
+        Assert-RemoteBinaryPlaceStepGate @stepGate -RemoteCheck 'create'
 
         $uploadUrlResponse = Invoke-RemoteUploadUrl `
             -StudioOrigin $StudioOrigin `
@@ -508,19 +515,7 @@ function Invoke-RemoteBinaryPlaceSequence {
             -DeclaredSize $bytes.Length `
             -Headers $Headers
 
-        Assert-RemoteBinaryPlaceStepGate `
-            -Artifact $Artifact `
-            -Resolution $Resolution `
-            -WorkspaceRoot $WorkspaceRoot `
-            -ProjectId $ProjectId `
-            -CanonicalPath $CanonicalPath `
-            -LocalSha256 $LocalSha256 `
-            -RemoteCheck 'create' `
-            -StudioOrigin $StudioOrigin `
-            -ProjectIdForRemote $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -LiveLocalManifest $LiveLocalManifest
+        Assert-RemoteBinaryPlaceStepGate @stepGate -RemoteCheck 'none'
 
         $minted = Get-RemoteUploadUrlResponseFields -Response $uploadUrlResponse
 
@@ -541,19 +536,9 @@ function Invoke-RemoteBinaryPlaceSequence {
             $localMd5 = Get-SyncMd5HexFromBytes -Bytes $bytes
         }
 
-        Assert-RemoteBinaryPlaceStepGate `
-            -Artifact $Artifact `
-            -Resolution $Resolution `
-            -WorkspaceRoot $WorkspaceRoot `
-            -ProjectId $ProjectId `
-            -CanonicalPath $CanonicalPath `
-            -LocalSha256 $LocalSha256 `
-            -RemoteCheck 'create' `
-            -StudioOrigin $StudioOrigin `
-            -ProjectIdForRemote $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -LiveLocalManifest $LiveLocalManifest
+        # The staging PUT wrote an /uploads object, never the destination, so
+        # the destination is still absent for the same reason as above.
+        Assert-RemoteBinaryPlaceStepGate @stepGate -RemoteCheck 'none'
 
         $adoptResponse = Invoke-RemoteUploadAdopt `
             -StudioOrigin $StudioOrigin `
@@ -576,19 +561,7 @@ function Invoke-RemoteBinaryPlaceSequence {
             )
         }
 
-        Assert-RemoteBinaryPlaceStepGate `
-            -Artifact $Artifact `
-            -Resolution $Resolution `
-            -WorkspaceRoot $WorkspaceRoot `
-            -ProjectId $ProjectId `
-            -CanonicalPath $CanonicalPath `
-            -LocalSha256 $LocalSha256 `
-            -RemoteCheck 'create' `
-            -StudioOrigin $StudioOrigin `
-            -ProjectIdForRemote $ProjectId `
-            -Headers $Headers `
-            -GetRemoteFile $GetRemoteFile `
-            -LiveLocalManifest $LiveLocalManifest
+        Assert-RemoteBinaryPlaceStepGate @stepGate -RemoteCheck 'create'
 
         try {
             $moveResponse = Invoke-RemoteMove `

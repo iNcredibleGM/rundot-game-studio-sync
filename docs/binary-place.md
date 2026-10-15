@@ -14,9 +14,13 @@ name as success.
 
 ## What a place does
 
-For each selected path, immediately before every mutating step the engine
-re-verifies plan fingerprints and the live remote hash (or absence) for that
-path.
+For each selected path the engine re-verifies plan fingerprints and the live
+local file immediately before every mutating step. The destination's absence is
+proven once before the upload and again immediately before the move — the only
+step that can collide — and a destination that appears in between is caught by
+that pre-move check and by the move's own `409`. The redundant mid-sequence
+re-probes were removed for throughput (#97); identity, freshness, and the local
+checks still run at every step.
 
 **Create** (`BASE=— LOCAL=A REMOTE=—`):
 
