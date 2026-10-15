@@ -29,6 +29,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Backup.ps1")
 . (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\Pull.ps1")
+. (Join-Path $repoRoot "lib\Pull.PlanGate.ps1")
 
 $pullTestShaA = 'a' * 64
 $pullTestShaB = 'b' * 64
@@ -2085,5 +2086,127 @@ try {
 finally {
     if (Test-Path -LiteralPath $pullApplyRoot) {
         Remove-Item -LiteralPath $pullApplyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Plan artifact consumption: advisory, never fatal (#90, Ask 2)
+# ---------------------------------------------------------------------------
+#
+# Push hard-gates on the artifact. Pull's staged bytes are verified by the
+# snapshot independently, and Init -> Pull is a normal sequence with no plan on
+# disk, so Pull reports the artifact and proceeds. These assertions pin that:
+# absent is silent, present-and-agreeing is named, and stale/unreadable is
+# stated rather than fatal.
+
+$planGateRoot = Join-Path $env:TEMP ("rundot-pull-plangate-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $planGateRoot | Out-Null
+
+try {
+    $gateWorkspace = New-PullTestWorkspace -Root $planGateRoot
+    $gateBytes = $pullApplyUtf8.GetBytes("gate text`n")
+    $gatePath = Join-Path $gateWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $gatePath -Bytes $gateBytes
+
+    $gateLocal = @{ 'src/a.ts' = (New-PullTestLocalManifestEntry -LiteralPath $gatePath) }
+    $gateBase = @{ 'src/a.ts' = (Get-PullTestBaseEntryForLocal -LiteralPath $gatePath) }
+    $gateResolution = [pscustomobject]@{
+        Base        = [pscustomobject]@{ capturedAt = '2026-09-14T12:00:00.0000000Z'; files = $gateBase }
+        BasePresent = $true
+        Untrusted   = $false
+    }
+    $gateSnapshot = [pscustomobject]@{
+        RemoteManifestHashBefore = ('a' * 64)
+        RemoteManifestHashAfter  = ('a' * 64)
+    }
+
+    # Absent: silent, and never fatal.
+    $absentGate = Get-SyncPullPlanGate `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $gateSnapshot
+
+    Assert-Equal $false ([bool]$absentGate.Present) "an absent artifact must report Present = false"
+    Assert-Equal $false ([bool]$absentGate.Usable) "an absent artifact must report Usable = false"
+    Assert-Equal $null (Format-SyncPullPlanGateLine -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' -Resolution $gateResolution -Local $gateLocal `
+        -Remote @{} -Snapshot $gateSnapshot) `
+        "an absent artifact must print nothing, so Init -> Pull stays quiet"
+
+    # Present and agreeing: named.
+    $null = New-RundotSyncPlanAnalysis `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $gateSnapshot `
+        -Command 'Plan' `
+        -PersistArtifact
+
+    $matchingGate = Get-SyncPullPlanGate `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $gateSnapshot
+
+    Assert-Equal $true ([bool]$matchingGate.Present) "a persisted artifact must be read"
+    Assert-Equal $true ([bool]$matchingGate.Usable) "an artifact that agrees with the run must be usable"
+    $matchingLine = Format-SyncPullPlanGateLine -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' -Resolution $gateResolution -Local $gateLocal `
+        -Remote @{} -Snapshot $gateSnapshot
+    Assert-True ($matchingLine -match [regex]::Escape([string]$matchingGate.Artifact.planId)) `
+        "a usable artifact must be named by planId"
+
+    # A different project is reported, not fatal.
+    $otherProjectGate = Get-SyncPullPlanGate `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-other' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $gateSnapshot
+    Assert-Equal $false ([bool]$otherProjectGate.Usable) "an artifact for another project must not be usable"
+    $otherLine = Format-SyncPullPlanGateLine -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-other' -Resolution $gateResolution -Local $gateLocal `
+        -Remote @{} -Snapshot $gateSnapshot
+    Assert-True ($otherLine -match '(?i)ignored') "a mismatched artifact must be reported as ignored"
+
+    # A drifted REMOTE is reported, not fatal.
+    $driftedSnapshot = [pscustomobject]@{
+        RemoteManifestHashBefore = ('f' * 64)
+        RemoteManifestHashAfter  = ('f' * 64)
+    }
+    $driftedGate = Get-SyncPullPlanGate `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $driftedSnapshot
+    Assert-Equal $false ([bool]$driftedGate.Usable) "a drifted REMOTE must make the artifact unusable"
+
+    # A malformed artifact is reported, never fatal.
+    [System.IO.File]::WriteAllText((Get-PlanArtifactPath -WorkspaceRoot $gateWorkspace), '{ not json')
+    $brokenGate = Get-SyncPullPlanGate `
+        -WorkspaceRoot $gateWorkspace `
+        -ProjectId 'proj-pull-gate' `
+        -Resolution $gateResolution `
+        -Local $gateLocal `
+        -Remote @{} `
+        -Snapshot $gateSnapshot
+    Assert-Equal $true ([bool]$brokenGate.Present) "a malformed artifact must still report Present = true"
+    Assert-Equal $false ([bool]$brokenGate.Usable) "a malformed artifact must not be usable"
+    Assert-True ([string]$brokenGate.Reason -match '(?i)could not be read') `
+        "a malformed artifact must be reported as unreadable"
+}
+finally {
+    if (Test-Path -LiteralPath $planGateRoot) {
+        Remove-Item -LiteralPath $planGateRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
