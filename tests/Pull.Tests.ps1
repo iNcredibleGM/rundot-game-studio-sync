@@ -30,6 +30,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "lib\Journal.ps1")
 . (Join-Path $repoRoot "lib\Pull.ps1")
 . (Join-Path $repoRoot "lib\Pull.PlanGate.ps1")
+. (Join-Path $repoRoot "lib\Pull.RemoteWinsSelection.ps1")
 
 $pullTestShaA = 'a' * 64
 $pullTestShaB = 'b' * 64
@@ -2208,5 +2209,158 @@ try {
 finally {
     if (Test-Path -LiteralPath $planGateRoot) {
         Remove-Item -LiteralPath $planGateRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# -RemoteWins selection: confirmed replace of a both-changed path (#90)
+# ---------------------------------------------------------------------------
+#
+# The exact mirror of Push -LocalWins, in the opposite direction. In scope is
+# one status only: a conflict with both sides present and no kind change. It
+# must never delete a local-only file, never delete anything at all, and never
+# rebuild the tree.
+
+$remoteWinsBase = @{ 'src/a.ts' = (New-PullTestBaseEntry -Sha256 $pullTestShaA) }
+$remoteWinsLocal = @{ 'src/a.ts' = (New-PullTestLocalEntry -Sha256 $pullTestShaB) }
+$remoteWinsRemote = @{
+    'src/a.ts' = (New-PullTestRemoteEntry -Sha256 $pullTestShaC -StagingPath 'C:\staging\a.ts')
+}
+
+$remoteWinsSelection = Get-SyncPullRemoteWinsSelection `
+    -Base $remoteWinsBase `
+    -Local $remoteWinsLocal `
+    -Remote $remoteWinsRemote
+
+Assert-Equal 1 @($remoteWinsSelection.Actions).Count `
+    "a both-changed conflict must be in scope for -RemoteWins"
+Assert-Equal 0 @($remoteWinsSelection.Excluded).Count `
+    "a both-changed conflict must not be excluded"
+Assert-Equal $true ([bool]$remoteWinsSelection.RemoteWins) `
+    "the selection must mark itself as remote-wins"
+Assert-Equal $true ([bool]@($remoteWinsSelection.Actions)[0].IsOverwrite) `
+    "a remote-wins replace is always an overwrite, so it is always backed up"
+Assert-Equal $pullTestShaC ([string]@($remoteWinsSelection.Actions)[0].RemoteSha256) `
+    "the action must carry the REMOTE hash the apply layer verifies against"
+
+# A local-only change is never in scope: -RemoteWins is a pull, not a reset.
+$remoteWinsLocalOnly = @{ 'src/local.ts' = (New-PullTestLocalEntry -Sha256 $pullTestShaB) }
+$remoteWinsLocalOnlySelection = Get-SyncPullRemoteWinsSelection `
+    -Base @{} `
+    -Local $remoteWinsLocalOnly `
+    -Remote @{}
+
+Assert-Equal 0 @($remoteWinsLocalOnlySelection.Actions).Count `
+    "a local-only file must never be in scope for -RemoteWins"
+Assert-Equal 1 @($remoteWinsLocalOnlySelection.Excluded).Count `
+    "a local-only file must be reported as excluded"
+Assert-True `
+    ([string]@($remoteWinsLocalOnlySelection.Excluded)[0].Reason -match '(?i)never deletes') `
+    "the local-only exclusion must say -RemoteWins never deletes a local file"
+
+# A clean remote-only download is out of scope: plain Pull already applies it.
+$remoteWinsDownload = Get-SyncPullRemoteWinsSelection `
+    -Base @{ 'src/a.ts' = (New-PullTestBaseEntry -Sha256 $pullTestShaA) } `
+    -Local @{ 'src/a.ts' = (New-PullTestLocalEntry -Sha256 $pullTestShaA) } `
+    -Remote $remoteWinsRemote
+
+Assert-Equal 0 @($remoteWinsDownload.Actions).Count `
+    "a clean download must not be in scope for -RemoteWins; plain Pull applies it"
+
+# A kind change is refused with the shared reason.
+$remoteWinsKindLocal = @{ 'src/a.ts' = (New-PullTestLocalEntry -Sha256 $pullTestShaB -Kind 'binary') }
+$remoteWinsKindSelection = Get-SyncPullRemoteWinsSelection `
+    -Base $remoteWinsBase `
+    -Local $remoteWinsKindLocal `
+    -Remote $remoteWinsRemote
+
+Assert-Equal 0 @($remoteWinsKindSelection.Actions).Count `
+    "a kind change must never be in scope for -RemoteWins"
+Assert-Equal $script:SyncKindChangeReason ([string]@($remoteWinsKindSelection.Excluded)[0].Reason) `
+    "a kind change must carry the shared kind-change reason"
+
+# The default path is untouched when -RemoteWins is not set.
+$defaultSelection = Get-SyncPullRemoteWinsSelectionForRun `
+    -Base $remoteWinsBase `
+    -Local $remoteWinsLocal `
+    -Remote $remoteWinsRemote
+Assert-Equal 0 @($defaultSelection.Actions).Count `
+    "without -RemoteWins a conflict must still be excluded from a plain pull"
+
+$remoteWinsRunSelection = Get-SyncPullRemoteWinsSelectionForRun `
+    -RemoteWins `
+    -Base $remoteWinsBase `
+    -Local $remoteWinsLocal `
+    -Remote $remoteWinsRemote
+Assert-Equal 1 @($remoteWinsRunSelection.Actions).Count `
+    "with -RemoteWins the same conflict must be in scope"
+
+# End to end: -RemoteWins replaces the local bytes, backs the original up,
+# and leaves a local-only file alone.
+$remoteWinsRoot = Join-Path $env:TEMP ("rundot-pull-remotewins-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $remoteWinsRoot | Out-Null
+
+try {
+    $rwWorkspace = New-PullTestWorkspace -Root $remoteWinsRoot
+    $rwLocalBytes = $pullApplyUtf8.GetBytes("local edit`n")
+    $rwRemoteBytes = $pullApplyUtf8.GetBytes("studio edit`n")
+    $rwPath = Join-Path $rwWorkspace "src\a.ts"
+    Write-PullTestBytes -LiteralPath $rwPath -Bytes $rwLocalBytes
+
+    $rwLocalOnlyPath = Join-Path $rwWorkspace "src\local-only.ts"
+    $rwLocalOnlyBytes = $pullApplyUtf8.GetBytes("local only`n")
+    Write-PullTestBytes -LiteralPath $rwLocalOnlyPath -Bytes $rwLocalOnlyBytes
+
+    $rwStagingSource = Join-Path $remoteWinsRoot "rw-remote.ts"
+    Write-PullTestBytes -LiteralPath $rwStagingSource -Bytes $rwRemoteBytes
+
+    $rwLocalMap = @{
+        'src/a.ts'        = (New-PullTestLocalManifestEntry -LiteralPath $rwPath)
+        'src/local-only.ts' = (New-PullTestLocalManifestEntry -LiteralPath $rwLocalOnlyPath)
+    }
+    # BASE must hold a third, distinct hash or this classifies as a clean
+    # download rather than the both-changed conflict -RemoteWins exists for.
+    $rwBaseMap = @{ 'src/a.ts' = (New-PullTestBaseEntry -Sha256 $pullTestShaA) }
+    $rwRemoteMap = @{
+        'src/a.ts' = (New-PullTestRemoteIdentityEntry `
+            -StagingPath $rwStagingSource `
+            -WorkspaceStagingRoot $rwWorkspace `
+            -CanonicalPath 'src/a.ts')
+    }
+    $rwSnapshot = New-PullTestSnapshotFixture -WorkspaceRoot $rwWorkspace -RemoteEntries $rwRemoteMap
+    $rwResolution = [pscustomobject]@{
+        Base        = [pscustomobject]@{ capturedAt = '2026-09-14T12:00:00.0000000Z'; files = $rwBaseMap }
+        BasePresent = $true
+        Untrusted   = $false
+    }
+
+    $rwResult = Invoke-RundotSyncPull `
+        -WorkspaceRoot $rwWorkspace `
+        -ProjectId 'proj-rw' `
+        -Resolution $rwResolution `
+        -Local $rwLocalMap `
+        -Remote $rwSnapshot.Files `
+        -Snapshot $rwSnapshot `
+        -RemoteWins `
+        -Force
+
+    Assert-Equal 1 $rwResult.Applied "-RemoteWins must apply the one both-changed path"
+    Assert-Equal $rwRemoteBytes (Get-PullTestBytes -LiteralPath $rwPath) `
+        "-RemoteWins must write Studio's bytes over the local edit"
+    Assert-Equal $rwLocalOnlyBytes (Get-PullTestBytes -LiteralPath $rwLocalOnlyPath) `
+        "-RemoteWins must leave a local-only file untouched"
+    Assert-True (Test-Path -LiteralPath $rwLocalOnlyPath -PathType Leaf) `
+        "-RemoteWins must never delete a local-only file"
+
+    $rwBackupFile = Join-Path (Get-RundotSyncBackupSetPath `
+        -WorkspaceRoot $rwWorkspace -Name $rwResult.BackupSetName) 'src\a.ts'
+    Assert-True (Test-Path -LiteralPath $rwBackupFile -PathType Leaf) `
+        "-RemoteWins must back up the replaced local file first"
+    Assert-Equal $rwLocalBytes (Get-PullTestBytes -LiteralPath $rwBackupFile) `
+        "the backup must hold the original local bytes, so the replace is reversible"
+}
+finally {
+    if (Test-Path -LiteralPath $remoteWinsRoot) {
+        Remove-Item -LiteralPath $remoteWinsRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
